@@ -1,98 +1,144 @@
-# Sujeeth Foundation Wiki MCP Server
+# Sujeeth Foundation MCP Server — Local Test Package
 
-## Project Overview
+This package runs the Sujeeth Foundation MCP server locally and connects it to:
 
-The Sujeeth Foundation Wiki MCP Server is a Model Context Protocol (MCP)-based service that enables AI assistants and intelligent applications to discover, search, and retrieve information from the Sujeeth Foundation knowledge base.
+- the deployed Azure Wiki Search Function App;
+- LangSearch Web Search, using ontology-matched website domains;
+- the local Foundation ontology JSON file.
 
-Built on the existing Wiki Search API, the project aims to make the foundation's documentation accessible to AI-powered workflows through a standardized interface. By implementing MCP, the server will provide a consistent integration layer between the foundation's knowledge resources and compatible AI clients, including ChatGPT, Claude, and Microsoft Copilot Studio, subject to each platform's integration capabilities.
+## 1. Requirements
 
-## Project Objectives
+- Python 3.10 or newer (Python 3.11 or 3.12 is a good choice).
+- A LangSearch API key.
+- A newly rotated Azure Function key for the Wiki Search endpoint.
 
-- **Centralized Knowledge Access:** Provide a unified interface for accessing information stored in the Sujeeth Foundation wiki.
-- **Semantic and Keyword Search:** Enable AI assistants to find relevant documentation using keyword search and, in future iterations, semantic search powered by LangSearch.
-- **AI Assistant Integration:** Support MCP-compatible AI clients through standardized tools and resource access.
-- **Reliable Information Retrieval:** Retrieve relevant wiki pages, snippets, source references, and URLs to support accurate, context-aware responses.
-- **Extensible Architecture:** Establish a foundation for integrating ontology models, structured knowledge relationships, and advanced retrieval capabilities.
-- **Cloud Deployment:** Host the service on Microsoft Azure using a scalable, maintainable architecture.
+The MCP server uses the official Python MCP SDK's `FastMCP` interface.
 
-## Core Capabilities
+## 2. Configure secrets
 
-### 1. Wiki Search
-Connect to the Sujeeth Foundation wiki and identify relevant pages based on user queries. The existing Wiki Search API provides keyword-based relevance scoring, snippets, source URLs, and configurable result limits.
+Copy `.env.example` to `.env` and fill in the two API keys:
 
-### 2. MCP Tool Interface
-Expose wiki search and related knowledge-retrieval operations as MCP tools, allowing compatible AI clients to request information through a standardized protocol.
+```bash
+cp .env.example .env
+```
 
-### 3. Knowledge Retrieval
-Return relevant content alongside page titles, source paths, and links, allowing AI assistants to ground their responses in the foundation's documentation.
+On Windows PowerShell:
 
-### 4. Cache and Refresh
-Reuse cached wiki content to reduce unnecessary retrieval operations and provide a refresh mechanism for loading updated documentation.
+```powershell
+Copy-Item .env.example .env
+```
 
-### 5. Future Semantic Search
-Integrate LangSearch or another suitable retrieval service to improve results for conceptual queries, synonyms, and questions whose wording differs from the original wiki content.
+Edit `.env` and replace the placeholder values. Do not commit `.env` to GitHub. Both keys were previously shared in chat/URLs, so rotate them before using them for testing.
 
-### 6. Ontology-Driven Knowledge Discovery
-Introduce an ontology model to represent concepts, entities, relationships, and domain-specific terminology associated with the foundation. This can help AI assistants retrieve information based on meaning and relationships rather than keyword matches alone.
+`WIKI_SEARCH_URL` should be the endpoint only, without `?q=...` or `&code=...`. The server adds `q`, `limit`, and `code` as request parameters.
 
-## Proposed Architecture
+## 3. Create a virtual environment and install packages
 
-The solution will use a modular architecture:
+### macOS / Linux
 
-1. **Knowledge Source:** The Sujeeth Foundation GitHub wiki.
-2. **Search Layer:** The existing Python-based Wiki Search API, deployed as an Azure Function App.
-3. **MCP Server:** A separate Python service that exposes search and knowledge-retrieval functionality through MCP tools.
-4. **Retrieval and Intelligence Layer:** LangSearch and ontology-based retrieval capabilities, introduced as future enhancements.
-5. **AI Clients:** Compatible assistants and applications, including ChatGPT, Claude, and Microsoft Copilot Studio, depending on their respective MCP or connector support.
-6. **Hosting and Operations:** Microsoft Azure for deployment, configuration, monitoring, and operational management.
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+pip install -r requirements-dev.txt
+```
 
-## Technology Stack
+### Windows PowerShell
 
-- **Programming Language:** Python
-- **API Hosting:** Azure Functions
-- **Knowledge Source:** GitHub Wiki
-- **Search API:** Python HTTP endpoints
-- **Integration Protocol:** Model Context Protocol (MCP)
-- **AI Integration Targets:** ChatGPT, Claude, and Microsoft Copilot Studio
-- **Future Retrieval Enhancement:** LangSearch
-- **Knowledge Modeling:** Ontology-based representation
-- **Version Control and CI/CD:** GitHub and GitHub Actions
+```powershell
+py -3 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements-dev.txt
+```
 
-## Security and Reliability
+## 4. Run the ontology tests
 
-The MCP server will be designed to protect access to the knowledge services and support reliable operation. Planned considerations include secure credential management, appropriate authentication and authorization, request validation, error handling, logging, and controlled access to connected tools.
+```bash
+pytest -q
+```
 
-Public wiki content can be retrieved without a GitHub token when anonymous access is sufficient. Credentials should be stored in Azure configuration or an appropriate secrets-management service rather than committed to source control.
+These tests run locally and do not call Azure or LangSearch.
 
-## Implementation Roadmap
+## 5. Start the MCP server
 
-**Phase 1 — Wiki Search API**
-- Deploy the existing Python Wiki Search API to Azure.
-- Support keyword-based search, result snippets, caching, and content refresh.
-- Validate search results against the public wiki.
+```bash
+python mcp_server.py
+```
 
-**Phase 2 — MCP Server**
-- Develop a standalone MCP server as a separate Azure-hosted service.
-- Expose wiki search and page-retrieval operations as MCP tools.
-- Add secure connectivity to the existing search API.
+The server listens at `http://127.0.0.1:8000/mcp` by default. Leave the terminal running.
 
-**Phase 3 — AI Client Integration**
-- Configure supported AI clients to connect to the MCP server.
-- Validate tool discovery, query execution, result handling, and source attribution.
-- Document client-specific configuration and authentication requirements.
+To change the local host or port, edit `MCP_HOST` and `MCP_PORT` in `.env` before starting the server.
 
-**Phase 4 — Advanced Retrieval**
-- Evaluate LangSearch or an equivalent semantic retrieval service.
-- Develop an ontology model for the foundation's knowledge domain.
-- Combine keyword, semantic, and ontology-based retrieval where appropriate.
+## 6. Connect an MCP client
 
-**Phase 5 — Production Readiness**
-- Improve monitoring, error reporting, performance, and security.
-- Add automated tests and deployment checks.
-- Evaluate search quality and establish ongoing maintenance procedures.
+For a local MCP Inspector, start it in another terminal using the MCP SDK tooling or the MCP Inspector package, then connect using the Streamable HTTP transport URL:
 
-## Expected Outcome
+```text
+http://127.0.0.1:8000/mcp
+```
 
-The project will establish a reusable AI integration layer for the Sujeeth Foundation knowledge base. It will allow compatible AI assistants to search and retrieve foundation documentation through a standardized MCP interface, while creating a path toward semantic search, ontology-driven discovery, and more sophisticated knowledge-based AI applications.
+The ontology models a **Partnership as hosting a collection of Circles**; each Circle belongs to exactly one Partnership. The Partner institution is related to the Partnership, rather than directly hosting Circles in this model.
 
-The long-term goal is to make the foundation's knowledge easier to discover, interpret, and use across multiple AI platforms without duplicating the underlying documentation or maintaining a separate knowledge integration for every client.
+Both `search_sujeeth_wiki` and `search_sujeeth_web` are capped at **5 results per call**. A caller may request fewer, but requests above 5 are clamped to 5; LangSearch results are also sliced locally as a safeguard.
+
+The MCP server exposes these tools:
+
+- `search_sujeeth_wiki`
+- `match_ontology_websites`
+- `search_sujeeth_web`
+- `get_ontology_summary`
+- `find_knowledge_by_concept`
+- `get_ontology_class`
+- `get_ontology_relationships`
+- `get_ontology_rules`
+- `get_program_structure`
+- `get_dataverse_mappings`
+- `get_ontology_schema_gaps`
+- `get_preferred_terminology`
+
+## 7. Suggested smoke tests
+
+Use these tool inputs in your MCP client:
+
+1. `get_ontology_summary` — should return ontology version and counts. This does not need API keys.
+2. `get_ontology_class` with `name="Partnership"` — should return its definition and mappings.
+3. `match_ontology_websites` with `query="Week 4 networking strategies"` — should return matching concepts and domains. This does not need API keys.
+4. `search_sujeeth_wiki` with `query="Career Circle"` — calls the deployed Azure Function and requires a valid `WIKI_SEARCH_FUNCTION_KEY`.
+5. `search_sujeeth_web` with `query="Week 4 networking strategies"` — calls LangSearch and requires a valid `LANGSEARCH_API_KEY`.
+
+## 8. Troubleshooting
+
+- **HTTP 401 from Wiki Search:** check that `WIKI_SEARCH_FUNCTION_KEY` is a current key for the `wikisearch` Function App and that the endpoint is correct.
+- **LangSearch authentication error:** check that `LANGSEARCH_API_KEY` is valid and active.
+- **No website domains matched:** the web search still runs unrestricted by domain; inspect `match_ontology_websites` and extend `website_sources` in `ontology/ontology.json` if needed.
+- **MCP connection error:** confirm the server process is running and the client URL is exactly `http://127.0.0.1:8000/mcp`.
+- **Import error for `mcp`:** activate the virtual environment and run `pip install -r requirements-dev.txt`.
+
+## Security
+
+Never put API keys in Python files, JSON files, screenshots, or Git commits. Keep `.env` local and rotate any key that has been exposed.
+
+
+## Preview live search results (agent-facing tool output)
+
+After configuring `.env`, run:
+
+```powershell
+python preview_search.py "Career Circle"
+```
+
+This calls the same search functions registered as MCP tools and prints their
+structured JSON responses. This is the content an MCP-connected agent receives
+from the tool calls.
+
+Run one service at a time:
+
+```powershell
+python preview_search.py "Career Circle" --wiki-only
+python preview_search.py "networking strategies" --web-only
+```
+
+These are live integration checks and require the corresponding API credentials
+and network access. They are separate from `pytest -q`, which tests local
+ontology behavior without calling external services.
