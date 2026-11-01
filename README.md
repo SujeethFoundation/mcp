@@ -1,144 +1,116 @@
-# Sujeeth Foundation MCP Server — Local Test Package
+# Sujeeth Foundation MCP Server
 
-This package runs the Sujeeth Foundation MCP server locally and connects it to:
+A local Model Context Protocol (MCP) server that lets AI assistants search and read Sujeeth Foundation knowledge. It sits in front of three Azure Function Apps and adds no search logic of its own beyond combining results and flagging weak ones:
 
-- the deployed Azure Wiki Search Function App;
-- LangSearch Web Search, using ontology-matched website domains;
-- the local Foundation ontology JSON file.
+| Backend | Repo | What it provides |
+|---|---|---|
+| Web Search | `websearch` | Ontology-gated hybrid search and page text for approved Foundation and partner websites |
+| Wiki Search | `wikisearch` | Keyword search and page text for the GitHub wiki |
+| Ontology | `ontology` | Concepts, relationships, and which domains are approved |
 
-## 1. Requirements
+The server runs locally over Streamable HTTP at `http://127.0.0.1:8000/mcp`. It is not hosted anywhere yet (see Status).
 
-- Python 3.10 or newer (Python 3.11 or 3.12 is a good choice).
-- A LangSearch API key.
-- A newly rotated Azure Function key for the Wiki Search endpoint.
+## Tools
 
-The MCP server uses the official Python MCP SDK's `FastMCP` interface.
+| Tool | Use it to |
+|---|---|
+| `search_sujeeth_foundation` | The main tool. Resolves the question through the ontology, searches website and wiki, de-duplicates by URL, and reports whether the answer needs clarification or a service failed |
+| `get_document` | Read more of a result. Pass the `url` or `chunk_id` exactly as returned. Foundation sites and the wiki return page text; third-party sites return a short excerpt only |
+| `search_website` | Search ontology-approved websites only |
+| `search_wiki` | Search the GitHub wiki only |
+| `resolve_ontology` | See which concepts and domains a question maps to |
+| `get_ontology_context` | Read terminology and relationships for a concept |
+| `check_services` | Health check of all three backends |
 
-## 2. Configure secrets
+### What the results tell the agent
 
-Copy `.env.example` to `.env` and fill in the two API keys:
+- `needs_clarification` and `suggested_question`: set when no concept matched, no domain was approved, nothing useful came back, or two weaker concept matches are nearly tied. Explicit matches (both "Sujeeth Foundation" and "donation" named in the question) are not treated as ambiguity.
+- `service_degraded` and `service_errors`: set when a backend failed. The agent is told results may be incomplete, and not to treat missing results as proof that nothing exists.
+- `agent_instructions`: every result tells the agent to cite URLs, never to search outside ontology-approved domains, and never to quote program statistics (counts, rates, placement or engagement figures) from these results. Current numbers come from sujeeth.org.
+- Results carry `source`, `url`, `snippet`, `score`, `domain`, `concepts`, and `chunk_id`. Scores come from different engines for website and wiki results and cannot be compared.
 
-```bash
-cp .env.example .env
-```
+### What is never returned
 
-On Windows PowerShell:
+- Wiki pages about recorded circle sessions (recording links, meeting summaries). They are filtered here and in `wikisearch`.
+- Full text from third-party sites. `get_document` returns only a short excerpt for them, with a note to link to the source.
 
-```powershell
-Copy-Item .env.example .env
-```
+## Setup (Windows PowerShell)
 
-Edit `.env` and replace the placeholder values. Do not commit `.env` to GitHub. Both keys were previously shared in chat/URLs, so rotate them before using them for testing.
-
-`WIKI_SEARCH_URL` should be the endpoint only, without `?q=...` or `&code=...`. The server adds `q`, `limit`, and `code` as request parameters.
-
-## 3. Create a virtual environment and install packages
-
-### macOS / Linux
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
-pip install -r requirements-dev.txt
-```
-
-### Windows PowerShell
+Requirements: Python 3.10 or newer.
 
 ```powershell
-py -3 -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -r requirements-dev.txt
+git clone https://github.com/SujeethFoundation/mcp.git
+cd mcp
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
-## 4. Run the ontology tests
+If `pip.exe` fails with "Access is denied", run it through Python as shown (`python -m pip`).
 
-```bash
-pytest -q
-```
+## Configure
 
-These tests run locally and do not call Azure or LangSearch.
-
-## 5. Start the MCP server
-
-```bash
-python mcp_server.py
-```
-
-The server listens at `http://127.0.0.1:8000/mcp` by default. Leave the terminal running.
-
-To change the local host or port, edit `MCP_HOST` and `MCP_PORT` in `.env` before starting the server.
-
-## 6. Connect an MCP client
-
-For a local MCP Inspector, start it in another terminal using the MCP SDK tooling or the MCP Inspector package, then connect using the Streamable HTTP transport URL:
-
-```text
-http://127.0.0.1:8000/mcp
-```
-
-The ontology models a **Partnership as hosting a collection of Circles**; each Circle belongs to exactly one Partnership. The Partner institution is related to the Partnership, rather than directly hosting Circles in this model.
-
-Both `search_sujeeth_wiki` and `search_sujeeth_web` are capped at **5 results per call**. A caller may request fewer, but requests above 5 are clamped to 5; LangSearch results are also sliced locally as a safeguard.
-
-The MCP server exposes these tools:
-
-- `search_sujeeth_wiki`
-- `match_ontology_websites`
-- `search_sujeeth_web`
-- `get_ontology_summary`
-- `find_knowledge_by_concept`
-- `get_ontology_class`
-- `get_ontology_relationships`
-- `get_ontology_rules`
-- `get_program_structure`
-- `get_dataverse_mappings`
-- `get_ontology_schema_gaps`
-- `get_preferred_terminology`
-
-## 7. Suggested smoke tests
-
-Use these tool inputs in your MCP client:
-
-1. `get_ontology_summary` — should return ontology version and counts. This does not need API keys.
-2. `get_ontology_class` with `name="Partnership"` — should return its definition and mappings.
-3. `match_ontology_websites` with `query="Week 4 networking strategies"` — should return matching concepts and domains. This does not need API keys.
-4. `search_sujeeth_wiki` with `query="Career Circle"` — calls the deployed Azure Function and requires a valid `WIKI_SEARCH_FUNCTION_KEY`.
-5. `search_sujeeth_web` with `query="Week 4 networking strategies"` — calls LangSearch and requires a valid `LANGSEARCH_API_KEY`.
-
-## 8. Troubleshooting
-
-- **HTTP 401 from Wiki Search:** check that `WIKI_SEARCH_FUNCTION_KEY` is a current key for the `wikisearch` Function App and that the endpoint is correct.
-- **LangSearch authentication error:** check that `LANGSEARCH_API_KEY` is valid and active.
-- **No website domains matched:** the web search still runs unrestricted by domain; inspect `match_ontology_websites` and extend `website_sources` in `ontology/ontology.json` if needed.
-- **MCP connection error:** confirm the server process is running and the client URL is exactly `http://127.0.0.1:8000/mcp`.
-- **Import error for `mcp`:** activate the virtual environment and run `pip install -r requirements-dev.txt`.
-
-## Security
-
-Never put API keys in Python files, JSON files, screenshots, or Git commits. Keep `.env` local and rotate any key that has been exposed.
-
-
-## Preview live search results (agent-facing tool output)
-
-After configuring `.env`, run:
+The server reads **environment variables** (or a `local.settings.json` file with a `Values` object, which is gitignored). It does **not** read a `.env` file, even though `.env.example` lists the names. Set the keys in the same PowerShell window you start the server from:
 
 ```powershell
-python preview_search.py "Career Circle"
+foreach ($n in "WEBSEARCH_FUNCTION_KEY","WIKISEARCH_FUNCTION_KEY","ONTOLOGY_FUNCTION_KEY") {
+    $s = Read-Host $n -AsSecureString
+    Set-Item "Env:$n" ([System.Net.NetworkCredential]::new("", $s).Password)
+}
 ```
 
-This calls the same search functions registered as MCP tools and prints their
-structured JSON responses. This is the content an MCP-connected agent receives
-from the tool calls.
+| Variable | Default | Purpose |
+|---|---|---|
+| `WEBSEARCH_FUNCTION_KEY`, `WIKISEARCH_FUNCTION_KEY`, `ONTOLOGY_FUNCTION_KEY` | none | Function (host) keys for each app. A missing key makes calls to that app fail with HTTP 401 |
+| `WEBSEARCH_URL`, `WIKISEARCH_URL`, `ONTOLOGY_URL` | the deployed apps | Base URLs, no trailing path |
+| `MCP_REQUEST_TIMEOUT` | `30` | Seconds to wait for a backend |
+| `MCP_HOST`, `MCP_PORT` | `127.0.0.1`, `8000` | Where the MCP server listens |
+| `WIKI_EXCLUDE_TITLE_PATTERN` | circle-session pattern | Wiki pages to drop from results |
+| `LOCAL_SETTINGS_PATH` | `local.settings.json` | Optional settings file |
 
-Run one service at a time:
+Never commit keys. Rotate any key that has been pasted into chat, a URL, or a commit.
+
+## Run
 
 ```powershell
-python preview_search.py "Career Circle" --wiki-only
-python preview_search.py "networking strategies" --web-only
+python .\mcp_server.py
 ```
 
-These are live integration checks and require the corresponding API credentials
-and network access. They are separate from `pytest -q`, which tests local
-ontology behavior without calling external services.
+Leave the window open. You should see the three backend URLs and `MCP endpoint: http://127.0.0.1:8000/mcp`. Check that the port is listening:
+
+```powershell
+Test-NetConnection 127.0.0.1 -Port 8000
+```
+
+## Connect an inspector or client
+
+Add a Streamable HTTP server pointing at `http://127.0.0.1:8000/mcp` in an MCP inspector (for example MCPJam or the official MCP Inspector, run with `npx @mcpjam/inspector@latest` or `npx @modelcontextprotocol/inspector`). Keep the server window and the inspector window both running.
+
+## Test checklist
+
+Run these in order. Search results depend on what has been crawled and indexed.
+
+| # | Tool | Input | Expect |
+|---|---|---|---|
+| 1 | `check_services` | none | `all_healthy: true` |
+| 2 | `resolve_ontology` | `resume tips for students` | matched concepts and approved domains |
+| 3 | `search_sujeeth_foundation` | `how can i donate to the sujeeth foundation?` | `status: completed`, results with URLs, the FAQ wiki page with the donation link, `needs_clarification: false` |
+| 4 | `search_sujeeth_foundation` | `quantum cryptography` | `needs_clarification: true` and a suggested question |
+| 5 | `get_document` | a `url` from test 3 | page text, or an excerpt with `excerpt_only: true` for third-party sites |
+| 6 | `get_ontology_context` | concept `leadership` | relationships |
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `Service returned HTTP 401` | A Function key is missing or wrong. Restart the server with the right key |
+| `Service returned HTTP 502` from website search | The backend raised an error. Call its `/api/search` directly to see the message (a 429 inside means embedding quota) |
+| `needs_clarification` on a clear question | The ontology matched no concept. Add aliases for the topic in the ontology repo |
+| `get_document` says not found | The page is not indexed yet, or the `url` or `chunk_id` was not copied exactly from a result |
+| Nothing listening on port 8000 | The server is not running, or `MCP_PORT` was changed |
+
+## Status and security
+
+- **Local only.** It listens on `127.0.0.1`. ChatGPT, Claude, and Copilot Studio cannot reach it until it is hosted behind HTTPS with authentication, which is not built yet.
+- The MCP endpoint itself has no authentication. Do not expose it to a network as it is.
+- Function keys stay on the server and are never returned in tool output. Errors return only an HTTP status.
