@@ -1,0 +1,14 @@
+.git*
+.github
+.vscode
+.venv
+venv
+__pycache__
+*.pyc
+local.settings.json
+tests
+body.json
+*.md
+.env*
+requirements-dev.txt
+pyproject.toml

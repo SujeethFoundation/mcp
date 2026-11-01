@@ -3,12 +3,22 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
+import time
+from collections import deque
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-import requests
-from mcp.server.fastmcp import FastMCP
+# A deployment package built in CI keeps its dependencies in .python_packages/lib/site-packages.
+# The Azure Functions Python worker adds that folder to the path itself, but this server runs as a
+# custom handler launched with plain `python`, so add it here before importing third-party packages.
+_VENDORED = Path(__file__).resolve().parent / ".python_packages" / "lib" / "site-packages"
+if _VENDORED.is_dir() and str(_VENDORED) not in sys.path:
+    sys.path.insert(0, str(_VENDORED))
+
+import requests  # noqa: E402
+from mcp.server.fastmcp import FastMCP  # noqa: E402
 
 
 # ------------------------------------------------------------
@@ -55,8 +65,29 @@ WIKISEARCH_KEY = setting("WIKISEARCH_FUNCTION_KEY")
 ONTOLOGY_KEY = setting("ONTOLOGY_FUNCTION_KEY")
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
-MCP_HOST = setting("MCP_HOST", "127.0.0.1")
-MCP_PORT = int(setting("MCP_PORT", "8000"))
+# On Azure (App Service or Azure Functions) listen on all interfaces. Locally, listen on 127.0.0.1.
+# As an Azure Functions custom handler the port must match "port" in host.json (8000 here).
+HOSTED = bool(
+    os.getenv("WEBSITE_SITE_NAME")
+    or os.getenv("FUNCTIONS_CUSTOMHANDLER_PORT")
+    or os.getenv("FUNCTIONS_EXTENSION_VERSION")
+)
+MCP_HOST = setting("MCP_HOST", "0.0.0.0" if HOSTED else "127.0.0.1")
+MCP_PORT = int(setting(
+    "MCP_PORT",
+    os.getenv("FUNCTIONS_CUSTOMHANDLER_PORT") or os.getenv("PORT") or os.getenv("WEBSITES_PORT") or "8000",
+))
+
+
+def flag(name, default):
+    return str(setting(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
+
+# Public-service settings.
+ADMIN_TOOLS = flag("MCP_ADMIN_TOOLS", "false")   # diagnostic and ontology tools stay hidden unless enabled
+STATELESS = flag("MCP_STATELESS", "true")        # no in-memory sessions, safe behind a load balancer
+RATE_LIMIT_PER_IP = int(setting("MCP_RATE_LIMIT_PER_IP", "120"))     # requests per minute per client IP, 0 = off
+RATE_LIMIT_GLOBAL = int(setting("MCP_RATE_LIMIT_GLOBAL", "600"))     # requests per minute in total, 0 = off
 
 # Wiki pages that hold recorded circle sessions (recording links, transcript summaries)
 # are not served to AI clients. Override with WIKI_EXCLUDE_TITLE_PATTERN.
@@ -140,6 +171,17 @@ def drop_excluded_wiki(items):
     ]
 
 
+def merge_sources(wiki_items, website_items):
+    """Alternate wiki and website results, wiki first, so neither source crowds out the other."""
+    merged = []
+    for index in range(max(len(wiki_items), len(website_items))):
+        if index < len(wiki_items):
+            merged.append(wiki_items[index])
+        if index < len(website_items):
+            merged.append(website_items[index])
+    return merged
+
+
 def resolution_summary(data):
     return {
         "status": data.get("status"),
@@ -169,6 +211,7 @@ def assess_quality(resolution, results, errors):
     # "Sujeeth Foundation" and "donation" were named), so they are not competing
     # interpretations. Only compare the weaker, fuzzy matches against each other.
     weak = []
+    has_strong = False
     for match in matches:
         if not isinstance(match, dict):
             continue
@@ -176,12 +219,16 @@ def assess_quality(resolution, results, errors):
             confidence = float(match.get("confidence"))
         except (TypeError, ValueError):
             continue
-        if confidence < 1.0:
+        if confidence >= 1.0:
+            has_strong = True
+        else:
             weak.append((confidence, match))
     weak.sort(key=lambda pair: pair[0], reverse=True)
 
+    # If the question named something outright ("week 1"), partial matches such as "Week 2" and
+    # "Week 3" are noise, not a competing reading. Only look for a tie when nothing was named.
     close_pair = None
-    if len(weak) >= 2 and weak[0][0] - weak[1][0] <= 0.10:
+    if not has_strong and len(weak) >= 2 and weak[0][0] - weak[1][0] <= 0.10:
         reasons.append("Leading ontology matches are very close.")
         close_pair = (weak[0][1], weak[1][1])
 
@@ -240,10 +287,83 @@ mcp = FastMCP(
     "Sujeeth Foundation Search",
     host=MCP_HOST,
     port=MCP_PORT,
+    stateless_http=STATELESS,
 )
 
 
-@mcp.tool()
+def admin_tool(fn):
+    """Register a diagnostic or ontology tool only when MCP_ADMIN_TOOLS is on."""
+    return mcp.tool()(fn) if ADMIN_TOOLS else fn
+
+
+@mcp.custom_route("/healthz", methods=["GET"])
+async def healthz(request):
+    """Liveness probe for the hosting platform. Does not call any backend."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/", methods=["GET"])
+async def root(request):
+    """The Azure Functions host pings / to check that a custom handler is running."""
+    from starlette.responses import JSONResponse
+    return JSONResponse({"status": "ok", "service": "Sujeeth Foundation MCP", "endpoint": "/mcp"})
+
+
+class RateLimitMiddleware:
+    """Per-client and global request limits that answer HTTP 429.
+
+    Counts are in memory, so each running instance applies its own limits. Clients that
+    connect through a shared provider (a hosted AI assistant, for example) arrive from the
+    provider's addresses, which is why the global limit exists as well as the per-IP one.
+    """
+
+    def __init__(self, app, per_ip, global_limit, window=60.0):
+        self.app = app
+        self.per_ip = per_ip
+        self.global_limit = global_limit
+        self.window = window
+        self.hits = {}
+        self.all_hits = deque()
+
+    @staticmethod
+    def client_ip(scope):
+        for name, value in scope.get("headers", []):
+            if name == b"x-forwarded-for":
+                parts = [p.strip() for p in value.decode("latin-1").split(",") if p.strip()]
+                if parts:
+                    # The proxy appends the address it saw, so the last entry is the one to trust.
+                    last = parts[-1]
+                    return last.split(":")[0] if last.count(":") == 1 else last
+        client = scope.get("client")
+        return client[0] if client else "unknown"
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http" or scope.get("path") in ("/healthz", "/"):
+            await self.app(scope, receive, send)
+            return
+        now = time.monotonic()
+        while self.all_hits and now - self.all_hits[0] > self.window:
+            self.all_hits.popleft()
+        if len(self.hits) > 5000:
+            self.hits = {k: v for k, v in self.hits.items() if v and now - v[-1] <= self.window}
+        recent = self.hits.setdefault(self.client_ip(scope), deque())
+        while recent and now - recent[0] > self.window:
+            recent.popleft()
+        if (self.per_ip and len(recent) >= self.per_ip) or (
+            self.global_limit and len(self.all_hits) >= self.global_limit
+        ):
+            await send({"type": "http.response.start", "status": 429, "headers": [
+                (b"content-type", b"application/json"), (b"retry-after", b"30")]})
+            await send({"type": "http.response.body",
+                        "body": b'{"error":"Too many requests. Please try again shortly."}'})
+            return
+        recent.append(now)
+        self.all_hits.append(now)
+        await self.app(scope, receive, send)
+
+
+@admin_tool
 def check_services() -> dict[str, Any]:
     """Check health of all three Azure Function Apps."""
     services = {
@@ -268,7 +388,7 @@ def check_services() -> dict[str, Any]:
     return output
 
 
-@mcp.tool()
+@admin_tool
 def resolve_ontology(
     query: str,
     concepts: list[str] | None = None,
@@ -297,7 +417,7 @@ def resolve_ontology(
         return error_result(exc)
 
 
-@mcp.tool()
+@admin_tool
 def get_ontology_context(
     concept: str | None = None,
     depth: int = 2,
@@ -423,13 +543,13 @@ def search_sujeeth_foundation(
             "service_errors": [
                 {"service": "websearch_resolution", **error_result(exc)}
             ],
-            "needs_clarification": True,
-            "suggested_question": (
-                "Could you clarify which Foundation topic or resource you mean?"
-            ),
+            "needs_clarification": False,
+            "service_degraded": True,
+            "suggested_question": None,
             "agent_instructions": (
-                "Ontology resolution failed. Do not guess; ask the user "
-                "to clarify the Foundation topic."
+                "The Foundation search service is temporarily unavailable. Tell the "
+                "user, suggest trying again shortly, and do not guess an answer. "
+                "Do not ask the user to clarify their question."
             ),
         }
 
@@ -466,11 +586,11 @@ def search_sujeeth_foundation(
         wiki = {"results": []}
         errors.append({"service": "wikisearch", **error_result(exc)})
 
-    combined = normalize_results(website, "website")
-    combined.extend(drop_excluded_wiki([
+    wiki_items = drop_excluded_wiki([
         item for item in normalize_results(wiki, "wiki")
         if item.get("source") in {"wiki", None, ""}
-    ]))
+    ])
+    combined = merge_sources(wiki_items, normalize_results(website, "website"))
 
     # Remove duplicate URLs.
     seen = set()
@@ -567,11 +687,17 @@ def get_document(
 
 
 if __name__ == "__main__":
+    import uvicorn
+
     print("Starting Sujeeth Foundation MCP Server")
     print(f"Website Search: {WEBSEARCH_URL}")
     print(f"Wiki Search: {WIKISEARCH_URL}")
     print(f"Ontology: {ONTOLOGY_URL}")
+    print(f"Admin tools: {'on' if ADMIN_TOOLS else 'off'} | stateless: {STATELESS} | "
+          f"rate limits per minute: per-IP {RATE_LIMIT_PER_IP}, global {RATE_LIMIT_GLOBAL}")
     print(f"MCP endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
-    mcp.run(
-        transport="streamable-http",
-    )
+
+    app = mcp.streamable_http_app()
+    if RATE_LIMIT_PER_IP or RATE_LIMIT_GLOBAL:
+        app = RateLimitMiddleware(app, RATE_LIMIT_PER_IP, RATE_LIMIT_GLOBAL)
+    uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
