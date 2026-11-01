@@ -1,10 +1,11 @@
-
 from __future__ import annotations
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 import requests
 from mcp.server.fastmcp import FastMCP
@@ -54,6 +55,18 @@ WIKISEARCH_KEY = setting("WIKISEARCH_FUNCTION_KEY")
 ONTOLOGY_KEY = setting("ONTOLOGY_FUNCTION_KEY")
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
+MCP_HOST = setting("MCP_HOST", "127.0.0.1")
+MCP_PORT = int(setting("MCP_PORT", "8000"))
+
+# Wiki pages that hold recorded circle sessions (recording links, transcript summaries)
+# are not served to AI clients. Override with WIKI_EXCLUDE_TITLE_PATTERN.
+WIKI_EXCLUDE = re.compile(
+    setting(
+        "WIKI_EXCLUDE_TITLE_PATTERN",
+        r"\b(spring|summer|fall|winter)\s+20\d{2}\b.*\bcircle\b",
+    ),
+    re.IGNORECASE,
+)
 
 http = requests.Session()
 http.headers.update({"Accept": "application/json"})
@@ -112,8 +125,19 @@ def normalize_results(payload, source):
             "snippet": item.get("snippet") or item.get("text") or "",
             "source": item.get("source") or source,
             "score": item.get("score"),
+            "domain": item.get("domain"),
+            "concepts": item.get("concepts"),
+            "chunk_id": item.get("chunk_id"),
         })
     return results
+
+
+def drop_excluded_wiki(items):
+    return [
+        x for x in items
+        if not WIKI_EXCLUDE.search(str(x.get("title") or ""))
+        and not WIKI_EXCLUDE.search(str(x.get("url") or "").replace("-", " ").replace("%3A", " "))
+    ]
 
 
 def resolution_summary(data):
@@ -140,23 +164,31 @@ def assess_quality(resolution, results, errors):
         reasons.append("No usable search results were returned.")
     elif not any(str(x.get("snippet") or "").strip() for x in results):
         reasons.append("Results contain no useful excerpts.")
-    if errors:
-        reasons.append("One or more search services failed.")
 
-    confidences = []
+    # Matches at or above 1.0 are explicit term hits in the query (for example both
+    # "Sujeeth Foundation" and "donation" were named), so they are not competing
+    # interpretations. Only compare the weaker, fuzzy matches against each other.
+    weak = []
     for match in matches:
-        if isinstance(match, dict):
-            try:
-                confidences.append(float(match.get("confidence")))
-            except (TypeError, ValueError):
-                pass
+        if not isinstance(match, dict):
+            continue
+        try:
+            confidence = float(match.get("confidence"))
+        except (TypeError, ValueError):
+            continue
+        if confidence < 1.0:
+            weak.append((confidence, match))
+    weak.sort(key=lambda pair: pair[0], reverse=True)
 
-    if len(confidences) >= 2:
-        ranked = sorted(confidences, reverse=True)
-        if ranked[0] - ranked[1] <= 0.10:
-            reasons.append("Leading ontology matches are very close.")
+    close_pair = None
+    if len(weak) >= 2 and weak[0][0] - weak[1][0] <= 0.10:
+        reasons.append("Leading ontology matches are very close.")
+        close_pair = (weak[0][1], weak[1][1])
 
-    needs_clarification = bool(reasons)
+    # A service failure is not a reason to quiz the user about their topic.
+    service_degraded = bool(errors)
+    all_failed = service_degraded and not results
+    needs_clarification = bool(reasons) and not all_failed
     question = None
 
     if needs_clarification:
@@ -165,9 +197,9 @@ def assess_quality(resolution, results, errors):
                 "Which Foundation area are you asking about: the Career Circle "
                 "Program, students, volunteers, books, or resources?"
             )
-        elif len(matches) >= 2 and len(confidences) >= 2:
-            first = matches[0].get("name", "the first topic")
-            second = matches[1].get("name", "the second topic")
+        elif close_pair:
+            first = close_pair[0].get("name", "the first topic")
+            second = close_pair[1].get("name", "the second topic")
             question = f"Are you asking about {first} or {second}?"
         else:
             question = (
@@ -175,17 +207,28 @@ def assess_quality(resolution, results, errors):
                 "a specific person, a book, or another Foundation resource?"
             )
 
+    instructions = (
+        "If needs_clarification is true, ask the suggested question before "
+        "making a definitive claim. Use ontology context to explain "
+        "available concepts. Never guess a domain or search outside "
+        "ontology-approved domains. Otherwise answer from the results "
+        "and cite their URLs. Never quote program statistics (counts, rates, "
+        "placement or engagement figures) from these results; point the user "
+        "to sujeeth.org for current numbers."
+    )
+    if service_degraded:
+        instructions += (
+            " One or more search services failed, so results may be incomplete. "
+            "Tell the user this and suggest trying again; do not treat missing "
+            "results as proof that nothing exists."
+        )
+
     return {
         "needs_clarification": needs_clarification,
+        "service_degraded": service_degraded,
         "reasons": reasons,
         "suggested_question": question,
-        "agent_instructions": (
-            "If clarification is needed, ask the suggested question before "
-            "making a definitive claim. Use ontology context to explain "
-            "available concepts. Never guess a domain or search outside "
-            "ontology-approved domains. Otherwise answer from the results "
-            "and cite their URLs."
-        ),
+        "agent_instructions": instructions,
     }
 
 
@@ -195,8 +238,8 @@ def assess_quality(resolution, results, errors):
 
 mcp = FastMCP(
     "Sujeeth Foundation Search",
-    host="127.0.0.1",
-    port=8000,
+    host=MCP_HOST,
+    port=MCP_PORT,
 )
 
 
@@ -271,7 +314,7 @@ def get_ontology_context(
         result = {"terminology": terminology}
 
         if concept and concept.strip():
-            concept_id = concept.strip().lower()
+            concept_id = quote(concept.strip().lower(), safe="")
             result["concept"] = concept_id
             result["relationships"] = get_json(
                 f"{ONTOLOGY_URL}/api/ontology/concepts/{concept_id}/relationships",
@@ -335,10 +378,10 @@ def search_wiki(query: str, limit: int = 5) -> dict[str, Any]:
             {"q": query, "limit": max(1, min(int(limit), 10))},
         )
 
-        results = [
+        results = drop_excluded_wiki([
             item for item in normalize_results(payload, "wiki")
             if item.get("source") == "wiki"
-        ]
+        ])
 
         return {
             "query": payload.get("query", query),
@@ -424,10 +467,10 @@ def search_sujeeth_foundation(
         errors.append({"service": "wikisearch", **error_result(exc)})
 
     combined = normalize_results(website, "website")
-    combined.extend(
+    combined.extend(drop_excluded_wiki([
         item for item in normalize_results(wiki, "wiki")
         if item.get("source") in {"wiki", None, ""}
-    )
+    ]))
 
     # Remove duplicate URLs.
     seen = set()
@@ -452,7 +495,7 @@ def search_sujeeth_foundation(
             "search_mode": website.get("search_mode"),
         },
         "wiki_search": {
-            "count": len(wiki.get("results", []) or []),
+            "count": len(drop_excluded_wiki(normalize_results(wiki, "wiki"))),
         },
         "count": len(results),
         "results": results,
@@ -466,7 +509,7 @@ if __name__ == "__main__":
     print(f"Website Search: {WEBSEARCH_URL}")
     print(f"Wiki Search: {WIKISEARCH_URL}")
     print(f"Ontology: {ONTOLOGY_URL}")
-    print("MCP endpoint: http://127.0.0.1:8000/mcp")
+    print(f"MCP endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
     mcp.run(
         transport="streamable-http",
     )
