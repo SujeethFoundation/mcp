@@ -504,6 +504,68 @@ def search_sujeeth_foundation(
     }
 
 
+def looks_like_wiki(url, chunk_id, source):
+    if source:
+        return str(source).strip().lower() == "wiki"
+    if url and "github.com" in str(url).lower() and "/wiki/" in str(url).lower():
+        return True
+    return bool(chunk_id and str(chunk_id).lower().endswith(".md"))
+
+
+@mcp.tool()
+def get_document(
+    url: str | None = None,
+    chunk_id: str | None = None,
+    source: str | None = None,
+    neighbors: int = 1,
+    max_chars: int = 6000,
+) -> dict[str, Any]:
+    """
+    Read more of a search result. Pass the url or chunk_id exactly as a search result
+    returned it (and its source, "website" or "wiki", if known). Foundation sites and the
+    wiki return the page text. Third-party sites return only a short excerpt around the
+    matched passage, so link to the source instead of reproducing it.
+    """
+    if not (url or chunk_id):
+        return {"error": "Provide a url or chunk_id from a search result."}
+    max_chars = max(500, min(int(max_chars), 20000))
+
+    try:
+        if looks_like_wiki(url, chunk_id, source):
+            result = post_json(
+                f"{WIKISEARCH_URL}/api/document",
+                {"url": url, "path": chunk_id, "max_chars": max_chars},
+                WIKISEARCH_KEY,
+            )
+        else:
+            result = post_json(
+                f"{WEBSEARCH_URL}/api/document",
+                {
+                    "url": url,
+                    "chunk_id": chunk_id,
+                    "neighbors": max(0, min(int(neighbors), 3)),
+                    "max_chars": max_chars,
+                },
+                WEBSEARCH_KEY,
+            )
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 404:
+            return {"error": "That document was not found. Use a url or chunk_id from a search result."}
+        if status == 403:
+            return {"error": "That document is not available through this server."}
+        return error_result(exc)
+    except Exception as exc:
+        return error_result(exc)
+
+    result["agent_instructions"] = (
+        "Cite the url. Never quote program statistics (counts, rates, placement or "
+        "engagement figures) from this text; point the user to sujeeth.org for current "
+        "numbers. If excerpt_only is true, summarize briefly and link to the source."
+    )
+    return result
+
+
 if __name__ == "__main__":
     print("Starting Sujeeth Foundation MCP Server")
     print(f"Website Search: {WEBSEARCH_URL}")
