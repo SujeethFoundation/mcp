@@ -159,6 +159,7 @@ def normalize_results(payload, source):
             "domain": item.get("domain"),
             "concepts": item.get("concepts"),
             "chunk_id": item.get("chunk_id"),
+            "best_bet": bool(item.get("best_bet")),
         })
     return results
 
@@ -180,6 +181,24 @@ def merge_sources(wiki_items, website_items):
         if index < len(website_items):
             merged.append(website_items[index])
     return merged
+
+
+def combine_with_best_bets(wiki_items, website_items, limit):
+    """Best bets first (hand-added pages the website search flagged), then up to `limit`
+    wiki and website results. Total is at most limit plus the best bets (3), each URL once."""
+    best, seen = [], set()
+    for item in website_items:
+        identity = str(item.get("url") or "").lower()
+        if item.get("best_bet") and identity and identity not in seen:
+            seen.add(identity)
+            best.append(item)
+    normal = []
+    for item in merge_sources(wiki_items, [x for x in website_items if not x.get("best_bet")]):
+        identity = str(item.get("url") or item.get("title") or "").lower()
+        if identity and identity not in seen:
+            seen.add(identity)
+            normal.append(item)
+    return best + normal[:limit], len(best)
 
 
 def resolution_summary(data):
@@ -519,6 +538,7 @@ def search_sujeeth_foundation(
 ) -> dict[str, Any]:
     """
     Search Website Search and Wiki Search together using ontology resolution.
+    Results flagged best_bet are curated pages added by hand; present them first.
     Returns a suggested clarification question when search quality is weak.
     """
     query = (query or "").strip()
@@ -590,18 +610,9 @@ def search_sujeeth_foundation(
         item for item in normalize_results(wiki, "wiki")
         if item.get("source") in {"wiki", None, ""}
     ])
-    combined = merge_sources(wiki_items, normalize_results(website, "website"))
-
-    # Remove duplicate URLs.
-    seen = set()
-    results = []
-    for item in combined:
-        identity = str(item.get("url") or item.get("title") or "").lower()
-        if identity and identity not in seen:
-            seen.add(identity)
-            results.append(item)
-
-    results = results[:limit]
+    results, best_bet_count = combine_with_best_bets(
+        wiki_items, normalize_results(website, "website"), limit
+    )
     quality = assess_quality(resolution, results, errors)
 
     return {
@@ -618,6 +629,7 @@ def search_sujeeth_foundation(
             "count": len(drop_excluded_wiki(normalize_results(wiki, "wiki"))),
         },
         "count": len(results),
+        "best_bet_count": best_bet_count,
         "results": results,
         "service_errors": errors,
         **quality,
