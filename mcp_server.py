@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -307,6 +308,80 @@ def assess_quality(resolution, results, errors):
     }
 
 
+DOCUMENT_INSTRUCTIONS = (
+    "Cite the url. Never quote program statistics (counts, rates, placement or "
+    "engagement figures) from this text; point the user to sujeeth.org for current "
+    "numbers. If excerpt_only is true, summarize briefly and link to the source."
+)
+
+FULL_DOCUMENT_INSTRUCTIONS = (
+    " Results with a document field carry the full page text for that result. Answer from "
+    "the document, not the snippet, and cite the url. If a document has excerpt_only set to "
+    "true, it is third-party content: summarize briefly and link to the source, do not "
+    "reproduce it. If a document is truncated, say so and call get_document for more."
+)
+
+# Total characters of document text attached to one search response, so a broad question
+# cannot flood the conversation.
+DOCUMENT_CHAR_BUDGET = int(setting("FULL_DOCUMENT_CHAR_BUDGET", "40000") or 40000)
+
+
+def attach_full_documents(results, max_documents, per_document_chars):
+    """Attach full page text to best bets and the first ordinary results, one document per distinct url.
+
+    Foundation pages and wiki pages come back whole. Third-party pages come back as the
+    excerpt the document service allows, flagged excerpt_only. A failed fetch leaves the
+    result as it was. Returns a small summary for the response.
+    """
+    # Best bets are curated pages, so every one of them gets its document. They do not count
+    # against max_documents, which limits only the ordinary results after them.
+    targets, seen, ordinary = [], set(), 0
+    for item in results:
+        key = str(item.get("url") or "").strip().lower()
+        if not key or key in seen:
+            continue
+        if item.get("best_bet"):
+            seen.add(key)
+            targets.append(item)
+        elif ordinary < max_documents:
+            seen.add(key)
+            targets.append(item)
+            ordinary += 1
+
+    def load(item):
+        try:
+            return fetch_document(
+                item.get("url"), item.get("chunk_id"), item.get("source"), 3, per_document_chars
+            )
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=max(1, min(4, len(targets) or 1))) as pool:
+        fetched = list(pool.map(load, targets))
+
+    summary = {"requested": len(targets), "returned": 0, "excerpt_only": 0, "failed": 0, "skipped_for_length": 0}
+    used = 0
+    for item, doc in zip(targets, fetched):
+        text = str((doc or {}).get("text") or "")
+        if not text:
+            summary["failed"] += 1
+            continue
+        if used + len(text) > DOCUMENT_CHAR_BUDGET:
+            summary["skipped_for_length"] += 1
+            continue
+        used += len(text)
+        excerpt = bool(doc.get("excerpt_only"))
+        item["document"] = {
+            "text": text,
+            "excerpt_only": excerpt,
+            "truncated": bool(doc.get("truncated")),
+            "note": doc.get("note"),
+        }
+        summary["returned"] += 1
+        summary["excerpt_only"] += 1 if excerpt else 0
+    return summary
+
+
 # ------------------------------------------------------------
 # MCP server
 # ------------------------------------------------------------
@@ -544,10 +619,18 @@ def search_wiki(query: str, limit: int = 5) -> dict[str, Any]:
 def search_sujeeth_foundation(
     query: str,
     limit: int = 5,
+    full_documents: bool = True,
+    max_documents: int = 3,
+    document_max_chars: int = 12000,
 ) -> dict[str, Any]:
     """
     Search Website Search and Wiki Search together using ontology resolution.
     Results flagged best_bet are curated pages added by hand; present them first.
+    By default the top results also carry the full page text in a document field
+    (full_documents). Every best bet gets one, plus up to max_documents other results,
+    each up to document_max_chars.
+    Foundation and wiki pages come back whole; third-party pages come back as a short
+    excerpt flagged excerpt_only. Set full_documents to false for snippets only.
     Returns a suggested clarification question when search quality is weak.
     """
     query = (query or "").strip()
@@ -624,6 +707,16 @@ def search_sujeeth_foundation(
     )
     quality = assess_quality(resolution, results, errors)
 
+    documents_summary = None
+    if full_documents and results:
+        documents_summary = attach_full_documents(
+            results,
+            max(1, min(int(max_documents), 5)),
+            max(500, min(int(document_max_chars), 20000)),
+        )
+        if documents_summary["returned"]:
+            quality["agent_instructions"] = quality["agent_instructions"] + FULL_DOCUMENT_INSTRUCTIONS
+
     return {
         "query": query,
         "status": "partial" if errors else "completed",
@@ -639,6 +732,7 @@ def search_sujeeth_foundation(
         },
         "count": len(results),
         "best_bet_count": best_bet_count,
+        "full_documents": documents_summary,
         "results": results,
         "service_errors": errors,
         **quality,
@@ -651,6 +745,27 @@ def looks_like_wiki(url, chunk_id, source):
     if url and "github.com" in str(url).lower() and "/wiki/" in str(url).lower():
         return True
     return bool(chunk_id and str(chunk_id).lower().endswith(".md"))
+
+
+def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=6000):
+    """Fetch one document from Wiki Search or Website Search. Raises on failure."""
+    max_chars = max(500, min(int(max_chars), 20000))
+    if looks_like_wiki(url, chunk_id, source):
+        return post_json(
+            f"{WIKISEARCH_URL}/api/document",
+            {"url": url, "path": chunk_id, "max_chars": max_chars},
+            WIKISEARCH_KEY,
+        )
+    return post_json(
+        f"{WEBSEARCH_URL}/api/document",
+        {
+            "url": url,
+            "chunk_id": chunk_id,
+            "neighbors": max(0, min(int(neighbors), 3)),
+            "max_chars": max_chars,
+        },
+        WEBSEARCH_KEY,
+    )
 
 
 @mcp.tool()
@@ -669,26 +784,9 @@ def get_document(
     """
     if not (url or chunk_id):
         return {"error": "Provide a url or chunk_id from a search result."}
-    max_chars = max(500, min(int(max_chars), 20000))
 
     try:
-        if looks_like_wiki(url, chunk_id, source):
-            result = post_json(
-                f"{WIKISEARCH_URL}/api/document",
-                {"url": url, "path": chunk_id, "max_chars": max_chars},
-                WIKISEARCH_KEY,
-            )
-        else:
-            result = post_json(
-                f"{WEBSEARCH_URL}/api/document",
-                {
-                    "url": url,
-                    "chunk_id": chunk_id,
-                    "neighbors": max(0, min(int(neighbors), 3)),
-                    "max_chars": max_chars,
-                },
-                WEBSEARCH_KEY,
-            )
+        result = fetch_document(url, chunk_id, source, neighbors, max_chars)
     except requests.HTTPError as exc:
         status = exc.response.status_code if exc.response is not None else None
         if status == 404:
@@ -699,11 +797,7 @@ def get_document(
     except Exception as exc:
         return error_result(exc)
 
-    result["agent_instructions"] = (
-        "Cite the url. Never quote program statistics (counts, rates, placement or "
-        "engagement figures) from this text; point the user to sujeeth.org for current "
-        "numbers. If excerpt_only is true, summarize briefly and link to the source."
-    )
+    result["agent_instructions"] = DOCUMENT_INSTRUCTIONS
     return result
 
 
