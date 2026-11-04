@@ -1,0 +1,12 @@
+python -m pip install -r requirements.txt
+
+foreach ($n in "WEBSEARCH_FUNCTION_KEY","WIKISEARCH_FUNCTION_KEY","ONTOLOGY_FUNCTION_KEY") {
+    $s = Read-Host $n -AsSecureString
+    Set-Item "Env:$n" ([System.Net.NetworkCredential]::new("", $s).Password)
+}
+$env:MCP_ADMIN_TOOLS = "true"           # optional: shows the three admin tools while testing
+python .\mcp_server.py
+
+---
+
+npx @modelcontextprotocol/inspector

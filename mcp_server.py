@@ -160,6 +160,7 @@ def normalize_results(payload, source):
             "concepts": item.get("concepts"),
             "chunk_id": item.get("chunk_id"),
             "best_bet": bool(item.get("best_bet")),
+            "spotlight": bool(item.get("spotlight")),
         })
     return results
 
@@ -186,19 +187,27 @@ def merge_sources(wiki_items, website_items):
 def combine_with_best_bets(wiki_items, website_items, limit):
     """Best bets first (hand-added pages the website search flagged), then up to `limit`
     wiki and website results. Total is at most limit plus the best bets (3), each URL once."""
-    best, seen = [], set()
+    best, spotlights, seen = [], [], set()
     for item in website_items:
         identity = str(item.get("url") or "").lower()
         if item.get("best_bet") and identity and identity not in seen:
             seen.add(identity)
             best.append(item)
+    # Spotlight pages the website search reserved for career questions go right after best
+    # bets, so wiki and Teal results cannot crowd them out of the limit.
+    for item in website_items:
+        identity = str(item.get("url") or "").lower()
+        if item.get("spotlight") and not item.get("best_bet") and identity and identity not in seen:
+            seen.add(identity)
+            spotlights.append(item)
     normal = []
-    for item in merge_sources(wiki_items, [x for x in website_items if not x.get("best_bet")]):
+    prioritized = lambda x: x.get("best_bet") or x.get("spotlight")
+    for item in merge_sources(wiki_items, [x for x in website_items if not prioritized(x)]):
         identity = str(item.get("url") or item.get("title") or "").lower()
         if identity and identity not in seen:
             seen.add(identity)
             normal.append(item)
-    return best + normal[:limit], len(best)
+    return best + spotlights + normal[:limit], len(best)
 
 
 def resolution_summary(data):
