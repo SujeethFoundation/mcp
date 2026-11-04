@@ -162,7 +162,19 @@ def normalize_results(payload, source):
             "chunk_id": item.get("chunk_id"),
             "best_bet": bool(item.get("best_bet")),
             "spotlight": bool(item.get("spotlight")),
+            # Wiki Search returns the whole page as text beside the snippet. Keep it for
+            # attach_full_documents and strip it before the response goes out.
+            "_full_text": item.get("text") if item.get("snippet") and item.get("text") else None,
+            "_truncated": bool(item.get("truncated")),
         })
+    return results
+
+
+def strip_internal(results):
+    """Remove keys that only the server uses from results before they are returned."""
+    for item in results:
+        item.pop("_full_text", None)
+        item.pop("_truncated", None)
     return results
 
 
@@ -349,6 +361,14 @@ def attach_full_documents(results, max_documents, per_document_chars):
             ordinary += 1
 
     def load(item):
+        # Text that came back with the search result needs no second request.
+        if item.get("_full_text"):
+            return {
+                "text": item["_full_text"],
+                "truncated": item.get("_truncated"),
+                "excerpt_only": False,
+                "from_search": True,
+            }
         try:
             return fetch_document(
                 item.get("url"), item.get("chunk_id"), item.get("source"), 3, per_document_chars
@@ -359,7 +379,10 @@ def attach_full_documents(results, max_documents, per_document_chars):
     with ThreadPoolExecutor(max_workers=max(1, min(4, len(targets) or 1))) as pool:
         fetched = list(pool.map(load, targets))
 
-    summary = {"requested": len(targets), "returned": 0, "excerpt_only": 0, "failed": 0, "skipped_for_length": 0}
+    summary = {
+        "requested": len(targets), "returned": 0, "excerpt_only": 0, "failed": 0,
+        "skipped_for_length": 0, "from_search_text": 0,
+    }
     used = 0
     for item, doc in zip(targets, fetched):
         text = str((doc or {}).get("text") or "")
@@ -379,6 +402,7 @@ def attach_full_documents(results, max_documents, per_document_chars):
         }
         summary["returned"] += 1
         summary["excerpt_only"] += 1 if excerpt else 0
+        summary["from_search_text"] += 1 if doc.get("from_search") else 0
     return summary
 
 
@@ -588,29 +612,50 @@ def search_website(
 
 
 @mcp.tool()
-def search_wiki(query: str, limit: int = 5) -> dict[str, Any]:
-    """Search the Sujeeth Foundation GitHub wiki."""
+def search_wiki(
+    query: str,
+    limit: int = 5,
+    full_documents: bool = True,
+    document_max_chars: int = 12000,
+) -> dict[str, Any]:
+    """
+    Search the Sujeeth Foundation GitHub wiki. By default each result also carries the full
+    page text in a document field (cut at document_max_chars). Set full_documents to false
+    for snippets only.
+    """
     query = (query or "").strip()
     if not query:
         return {"error": "Please provide a query."}
 
+    document_max_chars = max(500, min(int(document_max_chars), 20000))
     try:
-        payload = get_json(
-            f"{WIKISEARCH_URL}/api/search",
-            WIKISEARCH_KEY,
-            {"q": query, "limit": max(1, min(int(limit), 10))},
-        )
+        params = {"q": query, "limit": max(1, min(int(limit), 10))}
+        if full_documents:
+            params.update({"full_text": "true", "max_chars": document_max_chars})
+        else:
+            params["full_text"] = "false"
+        payload = get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params)
 
         results = drop_excluded_wiki([
             item for item in normalize_results(payload, "wiki")
             if item.get("source") == "wiki"
         ])
-
-        return {
+        response = {
             "query": payload.get("query", query),
             "count": len(results),
             "results": results,
         }
+        if full_documents:
+            response["full_documents"] = attach_full_documents(
+                results, len(results) or 1, document_max_chars
+            )
+            if response["full_documents"]["returned"]:
+                response["agent_instructions"] = DOCUMENT_INSTRUCTIONS.replace(
+                    "If excerpt_only is true, summarize briefly and link to the source.",
+                    "Answer from the document field, not the snippet.",
+                )
+        strip_internal(results)
+        return response
     except Exception as exc:
         return error_result(exc)
 
@@ -689,11 +734,15 @@ def search_sujeeth_foundation(
         website = {"results": [], "status": resolution.get("status")}
 
     try:
-        wiki = get_json(
-            f"{WIKISEARCH_URL}/api/search",
-            WIKISEARCH_KEY,
-            {"q": query, "limit": limit},
-        )
+        wiki_params = {"q": query, "limit": limit}
+        if full_documents:
+            wiki_params.update({
+                "full_text": "true",
+                "max_chars": max(500, min(int(document_max_chars), 20000)),
+            })
+        else:
+            wiki_params["full_text"] = "false"
+        wiki = get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, wiki_params)
     except Exception as exc:
         wiki = {"results": []}
         errors.append({"service": "wikisearch", **error_result(exc)})
@@ -716,6 +765,7 @@ def search_sujeeth_foundation(
         )
         if documents_summary["returned"]:
             quality["agent_instructions"] = quality["agent_instructions"] + FULL_DOCUMENT_INSTRUCTIONS
+    strip_internal(results)
 
     return {
         "query": query,
