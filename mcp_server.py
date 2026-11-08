@@ -4,6 +4,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
@@ -112,6 +113,12 @@ VERBOSE_ONTOLOGY = flag("SEARCH_VERBOSE_ONTOLOGY", "false")
 TIMINGS = flag("SEARCH_TIMINGS", "false")
 # Most pages one get_documents call will read (they are read in parallel).
 MAX_BATCH_DOCUMENTS = max(1, int(setting("MAX_BATCH_DOCUMENTS", "3") or 3))
+# Pages read through get_document and get_documents are kept in memory so a repeat read does not
+# call the search apps again. DOCUMENT_CACHE_SECONDS=0 turns this off. A page changed on the
+# site can show its old text for up to this long (a wiki page for up to this long plus the
+# wiki app's own 15 minutes). Each entry is one page, at most about 12 to 24 KB.
+DOCUMENT_CACHE_SECONDS = max(0, int(setting("DOCUMENT_CACHE_SECONDS", "900") or 0))
+DOCUMENT_CACHE_MAX = max(10, int(setting("DOCUMENT_CACHE_MAX_ENTRIES", "300") or 300))
 
 # Wiki pages that hold recorded circle sessions (recording links, transcript summaries)
 # are not served to AI clients. Override with WIKI_EXCLUDE_TITLE_PATTERN.
@@ -920,7 +927,7 @@ def looks_like_wiki(url, chunk_id, source):
     return bool(chunk_id and str(chunk_id).lower().endswith(".md"))
 
 
-def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=6000):
+def _fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=6000):
     """Fetch one document from Wiki Search or Website Search. Raises on failure."""
     max_chars = max(500, min(int(max_chars), 20000))
     if looks_like_wiki(url, chunk_id, source):
@@ -939,6 +946,34 @@ def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=
         },
         WEBSEARCH_KEY,
     )
+
+
+_document_cache = {}  # (url, max_chars) -> (expires, result)
+_document_cache_lock = threading.Lock()
+
+
+def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=6000):
+    """Fetch one document, reusing a recent copy of a whole-page read. Raises on failure.
+
+    Only reads by url are kept. A read by chunk_id returns a passage with its neighbors, which
+    depends on the arguments, so it always goes to the search apps. Failures are never kept.
+    """
+    if DOCUMENT_CACHE_SECONDS <= 0 or chunk_id or not url:
+        return _fetch_document(url, chunk_id, source, neighbors, max_chars)
+    key = (str(url).strip().lower().rstrip("/"), max(500, min(int(max_chars), 20000)))
+    now = time.monotonic()
+    with _document_cache_lock:
+        hit = _document_cache.get(key)
+    if hit and hit[0] > now:
+        return dict(hit[1])
+    result = _fetch_document(url, chunk_id, source, neighbors, max_chars)
+    if isinstance(result, dict) and result.get("text") and not result.get("error"):
+        with _document_cache_lock:
+            _document_cache[key] = (now + DOCUMENT_CACHE_SECONDS, dict(result))
+            if len(_document_cache) > DOCUMENT_CACHE_MAX:
+                for old in list(_document_cache)[: max(1, DOCUMENT_CACHE_MAX // 10)]:
+                    _document_cache.pop(old, None)
+    return result
 
 
 @mcp.tool()
