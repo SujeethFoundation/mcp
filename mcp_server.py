@@ -120,6 +120,26 @@ MAX_BATCH_DOCUMENTS = max(1, int(setting("MAX_BATCH_DOCUMENTS", "3") or 3))
 DOCUMENT_CACHE_SECONDS = max(0, int(setting("DOCUMENT_CACHE_SECONDS", "900") or 0))
 DOCUMENT_CACHE_MAX = max(10, int(setting("DOCUMENT_CACHE_MAX_ENTRIES", "300") or 300))
 
+# Warm-up. Shortly after the server starts, and then every WARMUP_INTERVAL_SECONDS, a background
+# thread runs the common questions below and reads the Foundation's own pages they find, so the
+# page cache is filled before a user asks. It also keeps the search apps awake and rebuilds the
+# wiki app's own cache (a 20 second job) in the background instead of during a user's request.
+# WARMUP_QUERIES is separated by semicolons. WARMUP_INTERVAL_SECONDS=0 warms once at start only.
+# Keep the interval shorter than DOCUMENT_CACHE_SECONDS, or pages expire between refreshes.
+WARMUP_ENABLED = flag("WARMUP_ENABLED", "true")
+WARMUP_QUERIES = [
+    q.strip()
+    for q in str(setting(
+        "WARMUP_QUERIES",
+        "Week 1 agenda; Week 2 agenda; Week 3 agenda; Week 4 agenda; Week 5 agenda; "
+        "Week 6 agenda; how Career Circles work; become a mentor volunteer; mentor FAQ",
+    )).replace("\n", ";").split(";")
+    if q.strip()
+]
+WARMUP_PAGES_PER_QUERY = max(1, int(setting("WARMUP_PAGES_PER_QUERY", "2") or 2))
+WARMUP_INTERVAL_SECONDS = max(0, int(setting("WARMUP_INTERVAL_SECONDS", "300") or 0))
+WARMUP_DELAY_SECONDS = max(0, int(setting("WARMUP_DELAY_SECONDS", "10") or 0))
+
 # Wiki pages that hold recorded circle sessions (recording links, transcript summaries)
 # are not served to AI clients. Override with WIKI_EXCLUDE_TITLE_PATTERN.
 WIKI_EXCLUDE = re.compile(
@@ -952,7 +972,7 @@ _document_cache = {}  # (url, max_chars) -> (expires, result)
 _document_cache_lock = threading.Lock()
 
 
-def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=6000):
+def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=6000, refresh=False):
     """Fetch one document, reusing a recent copy of a whole-page read. Raises on failure.
 
     Only reads by url are kept. A read by chunk_id returns a passage with its neighbors, which
@@ -964,7 +984,7 @@ def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=
     now = time.monotonic()
     with _document_cache_lock:
         hit = _document_cache.get(key)
-    if hit and hit[0] > now:
+    if hit and hit[0] > now and not refresh:
         return dict(hit[1])
     result = _fetch_document(url, chunk_id, source, neighbors, max_chars)
     if isinstance(result, dict) and result.get("text") and not result.get("error"):
@@ -1075,6 +1095,62 @@ def get_documents(urls: list[str], max_chars: int = 6000) -> dict[str, Any]:
     return response
 
 
+def is_foundation_page(item):
+    """True for the Foundation's own pages and the wiki; third-party pages are never warmed."""
+    domain = str(item.get("domain") or "").lower()
+    return item.get("source") == "wiki" or domain == "sujeeth.org" or domain.endswith(".sujeeth.org")
+
+
+def warm_cache_once():
+    """Run the warm-up questions and read the Foundation pages they find. Never raises."""
+    began = time.perf_counter()
+    seen, pages, failures = set(), 0, 0
+    for query in WARMUP_QUERIES:
+        try:
+            found = search_sujeeth_foundation(query, limit=4, full_documents=False)
+            targets = []
+            for item in found.get("results", []) or []:
+                url = str(item.get("url") or "").strip()
+                key = url.lower().rstrip("/")
+                if not url or key in seen or not is_foundation_page(item):
+                    continue
+                seen.add(key)
+                targets.append((url, item.get("source")))
+                if len(targets) >= WARMUP_PAGES_PER_QUERY:
+                    break
+            if targets:
+                with ThreadPoolExecutor(max_workers=len(targets)) as pool:
+                    list(pool.map(
+                        lambda t: fetch_document(t[0], None, t[1], 1, 6000, refresh=True), targets))
+                pages += len(targets)
+        except Exception as exc:
+            failures += 1
+            print(f"warmup_failed query={query!r} error={type(exc).__name__}: {exc}",
+                  file=sys.stderr, flush=True)
+    print(f"warmup_done {json.dumps({'queries': len(WARMUP_QUERIES), 'pages': pages, 'failed_queries': failures, 'seconds': round(time.perf_counter() - began, 1)})}",
+          file=sys.stderr, flush=True)
+
+
+def warm_loop():
+    time.sleep(WARMUP_DELAY_SECONDS)  # let the server start answering first
+    while True:
+        warm_cache_once()
+        if WARMUP_INTERVAL_SECONDS <= 0:
+            return
+        time.sleep(WARMUP_INTERVAL_SECONDS)
+
+
+def start_warmup():
+    """Start the background warm-up. It does nothing when the page cache is off."""
+    if not (WARMUP_ENABLED and WARMUP_QUERIES and DOCUMENT_CACHE_SECONDS > 0):
+        return False
+    if 0 < DOCUMENT_CACHE_SECONDS <= WARMUP_INTERVAL_SECONDS:
+        print("warmup_note WARMUP_INTERVAL_SECONDS is not shorter than DOCUMENT_CACHE_SECONDS, "
+              "so warmed pages will expire between refreshes.", file=sys.stderr, flush=True)
+    threading.Thread(target=warm_loop, name="cache-warmup", daemon=True).start()
+    return True
+
+
 if __name__ == "__main__":
     import uvicorn
 
@@ -1085,6 +1161,11 @@ if __name__ == "__main__":
     print(f"Admin tools: {'on' if ADMIN_TOOLS else 'off'} | stateless: {STATELESS} | "
           f"rate limits per minute: per-IP {RATE_LIMIT_PER_IP}, global {RATE_LIMIT_GLOBAL}")
     print(f"MCP endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
+
+    if start_warmup():
+        print(f"Warm-up: {len(WARMUP_QUERIES)} questions, first run in {WARMUP_DELAY_SECONDS}s, "
+              f"then every {WARMUP_INTERVAL_SECONDS}s" if WARMUP_INTERVAL_SECONDS else
+              f"Warm-up: {len(WARMUP_QUERIES)} questions at start only")
 
     app = mcp.streamable_http_app()
     if RATE_LIMIT_PER_IP or RATE_LIMIT_GLOBAL:
