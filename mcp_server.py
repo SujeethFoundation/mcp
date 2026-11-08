@@ -220,7 +220,7 @@ def combine_with_best_bets(wiki_items, website_items, limit):
         if identity and identity not in seen:
             seen.add(identity)
             normal.append(item)
-    return best + spotlights + normal[:limit], len(best)
+    return best + spotlights + normal[:limit], len(best), len(spotlights)
 
 
 def resolution_summary(data):
@@ -333,6 +333,12 @@ FULL_DOCUMENT_INSTRUCTIONS = (
     "reproduce it. If a document is truncated, say so and call get_document for more."
 )
 
+PRIORITY_INSTRUCTIONS = (
+    " Results flagged best_bet or spotlight are curated pages. Present them first, "
+    "in the order returned. When one fits the question, include it with its link "
+    "and one sentence on why it fits."
+)
+
 # Total characters of document text attached to one search response, so a broad question
 # cannot flood the conversation.
 DOCUMENT_CHAR_BUDGET = int(setting("FULL_DOCUMENT_CHAR_BUDGET", "40000") or 40000)
@@ -345,14 +351,14 @@ def attach_full_documents(results, max_documents, per_document_chars):
     excerpt the document service allows, flagged excerpt_only. A failed fetch leaves the
     result as it was. Returns a small summary for the response.
     """
-    # Best bets are curated pages, so every one of them gets its document. They do not count
-    # against max_documents, which limits only the ordinary results after them.
+    # Best bets and spotlights are curated pages, so every one of them gets its document. They
+    # do not count against max_documents, which limits only the ordinary results after them.
     targets, seen, ordinary = [], set(), 0
     for item in results:
         key = str(item.get("url") or "").strip().lower()
         if not key or key in seen:
             continue
-        if item.get("best_bet"):
+        if item.get("best_bet") or item.get("spotlight"):
             seen.add(key)
             targets.append(item)
         elif ordinary < max_documents:
@@ -670,7 +676,7 @@ def search_sujeeth_foundation(
 ) -> dict[str, Any]:
     """
     Search Website Search and Wiki Search together using ontology resolution.
-    Results flagged best_bet are curated pages added by hand; present them first.
+    Results flagged best_bet or spotlight are curated pages; present them first.
     By default the top results also carry the full page text in a document field
     (full_documents). Every best bet gets one, plus up to max_documents other results,
     each up to document_max_chars.
@@ -751,10 +757,12 @@ def search_sujeeth_foundation(
         item for item in normalize_results(wiki, "wiki")
         if item.get("source") in {"wiki", None, ""}
     ])
-    results, best_bet_count = combine_with_best_bets(
+    results, best_bet_count, spotlight_count = combine_with_best_bets(
         wiki_items, normalize_results(website, "website"), limit
     )
     quality = assess_quality(resolution, results, errors)
+    if best_bet_count or spotlight_count:
+        quality["agent_instructions"] += PRIORITY_INSTRUCTIONS
 
     documents_summary = None
     if full_documents and results:
@@ -782,6 +790,7 @@ def search_sujeeth_foundation(
         },
         "count": len(results),
         "best_bet_count": best_bet_count,
+        "spotlight_count": spotlight_count,
         "full_documents": documents_summary,
         "results": results,
         "service_errors": errors,
