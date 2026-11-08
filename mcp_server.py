@@ -9,7 +9,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 # A deployment package built in CI keeps its dependencies in .python_packages/lib/site-packages.
 # The Azure Functions Python worker adds that folder to the path itself, but this server runs as a
@@ -66,6 +66,17 @@ WIKISEARCH_KEY = setting("WIKISEARCH_FUNCTION_KEY")
 ONTOLOGY_KEY = setting("ONTOLOGY_FUNCTION_KEY")
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
+
+# Search diversity settings.
+# SEARCH_RESULT_COUNT: ordinary results returned (best bets and spotlights come on top of these).
+# SEARCH_CANDIDATE_POOL: how many website candidates to request before choosing, so less
+#   dominant sources have a chance to appear.
+# MAX_RESULTS_PER_DOMAIN: ceiling per source. Results are picked one per source first, then a
+#   second per source, and so on, until SEARCH_RESULT_COUNT is reached.
+RESULT_COUNT = int(setting("SEARCH_RESULT_COUNT", "10") or 10)
+CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "50") or 50)
+MAX_PER_DOMAIN = int(setting("MAX_RESULTS_PER_DOMAIN", "2") or 2)
+WIKI_POOL = MAX_PER_DOMAIN + 2  # the wiki counts as one source, so it needs only a few candidates
 # On Azure (App Service or Azure Functions) listen on all interfaces. Locally, listen on 127.0.0.1.
 # As an Azure Functions custom handler the port must match "port" in host.json (8000 here).
 HOSTED = bool(
@@ -197,9 +208,40 @@ def merge_sources(wiki_items, website_items):
     return merged
 
 
+def domain_key(item):
+    """The source an item counts against. The wiki is one source; sujeeth.org subdomains are one."""
+    if item.get("source") == "wiki":
+        return "wiki"
+    host = str(item.get("domain") or "").strip().lower()
+    if not host:
+        host = (urlparse(str(item.get("url") or "")).hostname or "").lower()
+    host = host.removeprefix("www.")
+    if host == "sujeeth.org" or host.endswith(".sujeeth.org"):
+        return "sujeeth.org"
+    return host or "unknown"
+
+
+def select_diverse(candidates, count, max_per_domain):
+    """Round-robin across sources. Round 1 takes each source's best result (sources ordered by
+    where their best result ranks), round 2 takes each source's second, up to max_per_domain,
+    stopping at count."""
+    by_domain = {}
+    for item in candidates:
+        by_domain.setdefault(domain_key(item), []).append(item)
+    picked = []
+    for round_n in range(max(1, max_per_domain)):
+        for docs in by_domain.values():
+            if round_n < len(docs):
+                picked.append(docs[round_n])
+                if len(picked) >= count:
+                    return picked
+    return picked
+
+
 def combine_with_best_bets(wiki_items, website_items, limit):
-    """Best bets first (hand-added pages the website search flagged), then up to `limit`
-    wiki and website results. Total is at most limit plus the best bets (3), each URL once."""
+    """Best bets first (hand-added pages the website search flagged), then spotlights, then up
+    to `limit` wiki and website results chosen across sources (see select_diverse). Best bets
+    and spotlights sit outside the limit and the per-source cap. Each URL appears once."""
     best, spotlights, seen = [], [], set()
     for item in website_items:
         identity = str(item.get("url") or "").lower()
@@ -220,7 +262,7 @@ def combine_with_best_bets(wiki_items, website_items, limit):
         if identity and identity not in seen:
             seen.add(identity)
             normal.append(item)
-    return best + spotlights + normal[:limit], len(best), len(spotlights)
+    return best + spotlights + select_diverse(normal, limit, MAX_PER_DOMAIN), len(best), len(spotlights)
 
 
 def resolution_summary(data):
@@ -341,7 +383,7 @@ PRIORITY_INSTRUCTIONS = (
 
 # Total characters of document text attached to one search response, so a broad question
 # cannot flood the conversation.
-DOCUMENT_CHAR_BUDGET = int(setting("FULL_DOCUMENT_CHAR_BUDGET", "40000") or 40000)
+DOCUMENT_CHAR_BUDGET = int(setting("FULL_DOCUMENT_CHAR_BUDGET", "60000") or 60000)
 
 
 def attach_full_documents(results, max_documents, per_document_chars):
@@ -669,17 +711,20 @@ def search_wiki(
 @mcp.tool()
 def search_sujeeth_foundation(
     query: str,
-    limit: int = 5,
+    limit: int | None = None,
     full_documents: bool = True,
-    max_documents: int = 3,
+    max_documents: int | None = None,
     document_max_chars: int = 12000,
 ) -> dict[str, Any]:
     """
     Search Website Search and Wiki Search together using ontology resolution.
     Results flagged best_bet or spotlight are curated pages; present them first.
-    By default the top results also carry the full page text in a document field
-    (full_documents). Every best bet gets one, plus up to max_documents other results,
-    each up to document_max_chars.
+    Results come from as many different sources as possible (at most MAX_RESULTS_PER_DOMAIN
+    from any one). limit defaults to SEARCH_RESULT_COUNT.
+    By default the results also carry the full page text in a document field
+    (full_documents). Every best bet gets one, plus up to max_documents other results
+    (default: all of them), each up to document_max_chars, within the response's total
+    character budget.
     Foundation and wiki pages come back whole; third-party pages come back as a short
     excerpt flagged excerpt_only. Set full_documents to false for snippets only.
     Returns a suggested clarification question when search quality is weak.
@@ -688,7 +733,7 @@ def search_sujeeth_foundation(
     if not query:
         return {"error": "Please provide a query."}
 
-    limit = max(1, min(int(limit), 5))
+    limit = max(1, min(int(limit or RESULT_COUNT), 20))
     errors = []
 
     # First resolve the query through the Search App's ontology resolver.
@@ -729,7 +774,7 @@ def search_sujeeth_foundation(
                     "concepts": concepts,
                     "domains": domains,
                     "purpose": "search",
-                    "limit": limit,
+                    "limit": CANDIDATE_POOL,
                 },
                 WEBSEARCH_KEY,
             )
@@ -740,7 +785,7 @@ def search_sujeeth_foundation(
         website = {"results": [], "status": resolution.get("status")}
 
     try:
-        wiki_params = {"q": query, "limit": limit}
+        wiki_params = {"q": query, "limit": WIKI_POOL}
         if full_documents:
             wiki_params.update({
                 "full_text": "true",
@@ -768,7 +813,7 @@ def search_sujeeth_foundation(
     if full_documents and results:
         documents_summary = attach_full_documents(
             results,
-            max(1, min(int(max_documents), 5)),
+            max(1, min(int(max_documents or limit), 20)),
             max(500, min(int(document_max_chars), 20000)),
         )
         if documents_summary["returned"]:
