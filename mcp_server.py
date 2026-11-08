@@ -110,6 +110,8 @@ VERBOSE_ONTOLOGY = flag("SEARCH_VERBOSE_ONTOLOGY", "false")
 # SEARCH_TIMINGS=true adds a timings_ms block to each combined search response. The timings are
 # always written to the log, so you can read them in Application Insights without the flag.
 TIMINGS = flag("SEARCH_TIMINGS", "false")
+# Most pages one get_documents call will read (they are read in parallel).
+MAX_BATCH_DOCUMENTS = max(1, int(setting("MAX_BATCH_DOCUMENTS", "3") or 3))
 
 # Wiki pages that hold recorded circle sessions (recording links, transcript summaries)
 # are not served to AI clients. Override with WIKI_EXCLUDE_TITLE_PATTERN.
@@ -392,10 +394,11 @@ FULL_DOCUMENT_INSTRUCTIONS = (
 EXCERPT_INSTRUCTIONS = (
     " Results are excerpts and may stop mid-sentence. If they do not fully answer the question "
     "(steps, an agenda, a list, dates, exact wording, or an excerpt that looks cut off), call "
-    "get_document with the result's url and source before answering, starting with a best_bet "
-    "or spotlight. Fetch at most two pages per question. Results whose domain is not "
-    "sujeeth.org are third-party: summarize briefly and link instead of fetching. Do not "
-    "answer program details from an excerpt that does not contain them."
+    "get_documents once, with the urls of every page you need, before answering, starting with "
+    "a best_bet or spotlight. Read at most two pages per question, and read them in one call. "
+    "Results whose domain is not sujeeth.org are third-party: summarize briefly and link "
+    "instead of reading them. Do not answer program details from an excerpt that does not "
+    "contain them."
 )
 
 GET_DOCUMENT_INSTRUCTIONS = DOCUMENT_INSTRUCTIONS + (
@@ -712,7 +715,7 @@ def search_wiki(
 ) -> dict[str, Any]:
     """
     Search the Sujeeth Foundation GitHub wiki. Returns short excerpts that can stop
-    mid-sentence. To read a page, call get_document with the result's url and source.
+    mid-sentence. To read pages, call get_documents once with their urls.
     Set full_documents to true to attach the full page text to every result (uses many tokens).
     """
     query = (query or "").strip()
@@ -770,8 +773,8 @@ def search_sujeeth_foundation(
     Results flagged best_bet or spotlight are curated pages; present them first.
     Results come from as many different sources as possible (at most MAX_RESULTS_PER_DOMAIN
     from any one). limit defaults to SEARCH_RESULT_COUNT.
-    Results are short excerpts that can stop mid-sentence. To read a page, call
-    get_document with the result's url and source. Set full_documents to true to attach
+    Results are short excerpts that can stop mid-sentence. To read pages, call
+    get_documents once with their urls. Set full_documents to true to attach
     full page text instead: every best bet gets one, plus up to max_documents other results
     (default: all of them), each up to document_max_chars, within the response's total
     character budget (uses many tokens). Third-party pages are always excerpts.
@@ -971,6 +974,70 @@ def get_document(
 
     result["agent_instructions"] = GET_DOCUMENT_INSTRUCTIONS
     return result
+
+
+def explain_fetch_error(exc):
+    """A short, user-safe reason a page could not be read."""
+    if isinstance(exc, requests.HTTPError):
+        status = exc.response.status_code if exc.response is not None else None
+        if status == 404:
+            return "That document was not found. Use a url from a search result."
+        if status == 403:
+            return "That document is not available through this server."
+    return error_result(exc).get("error", "Could not read the document.")
+
+
+@mcp.tool()
+def get_documents(urls: list[str], max_chars: int = 6000) -> dict[str, Any]:
+    """
+    Read the pages behind several search results in one call, all at the same time. Call it
+    once with every url you need (up to 3), exactly as the search results returned them,
+    instead of calling get_document more than once. Foundation sites and the wiki return the
+    page text; third-party sites return only a short excerpt, so link to the source instead
+    of reproducing it. Each document reports total_chars and truncated.
+    """
+    seen, wanted = set(), []
+    for raw in urls or []:
+        url = str(raw or "").strip()
+        key = url.lower().rstrip("/")
+        if url and key not in seen:
+            seen.add(key)
+            wanted.append(url)
+    if not wanted:
+        return {"error": "Provide at least one url from a search result."}
+    skipped = wanted[MAX_BATCH_DOCUMENTS:]
+    wanted = wanted[:MAX_BATCH_DOCUMENTS]
+    max_chars = max(500, min(int(max_chars), 12000))
+
+    def read(url):
+        began = time.perf_counter()
+        try:
+            doc = fetch_document(url, None, None, 1, max_chars)
+            item = {"url": url, "status": "ok"}
+            for key in ("title", "source", "text", "total_chars", "truncated", "excerpt_only", "note"):
+                if doc.get(key) is not None:
+                    item[key] = doc[key]
+        except Exception as exc:
+            item = {"url": url, "status": "error", "error": explain_fetch_error(exc)}
+        item["ms"] = round((time.perf_counter() - began) * 1000)
+        return item
+
+    started = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+        documents = list(pool.map(read, wanted))
+    total_ms = round((time.perf_counter() - started) * 1000)
+    print(f"get_documents_ms {json.dumps({'total': total_ms, 'each': [d['ms'] for d in documents]})}",
+          file=sys.stderr, flush=True)
+
+    response = {
+        "count": len(documents),
+        "documents": documents,
+        "agent_instructions": GET_DOCUMENT_INSTRUCTIONS.replace("call get_document again", "call get_documents again"),
+    }
+    if skipped:
+        response["not_read"] = skipped
+        response["note"] = f"Only the first {MAX_BATCH_DOCUMENTS} urls were read."
+    return response
 
 
 if __name__ == "__main__":
