@@ -107,6 +107,9 @@ RATE_LIMIT_GLOBAL = int(setting("MCP_RATE_LIMIT_GLOBAL", "600"))     # requests 
 # and a second copy of the domain list to each response (about 600 tokens).
 FULL_DOCUMENTS_DEFAULT = flag("SEARCH_FULL_DOCUMENTS", "false")
 VERBOSE_ONTOLOGY = flag("SEARCH_VERBOSE_ONTOLOGY", "false")
+# SEARCH_TIMINGS=true adds a timings_ms block to each combined search response. The timings are
+# always written to the log, so you can read them in Application Insights without the flag.
+TIMINGS = flag("SEARCH_TIMINGS", "false")
 
 # Wiki pages that hold recorded circle sessions (recording links, transcript summaries)
 # are not served to AI clients. Override with WIKI_EXCLUDE_TITLE_PATTERN.
@@ -684,6 +687,22 @@ def search_website(
         return error_result(exc)
 
 
+def run_wiki_search(query, full_documents, document_max_chars):
+    """Wiki search for the combined tool. Returns (payload, error) and never raises."""
+    try:
+        params = {"q": query, "limit": WIKI_POOL}
+        if full_documents:
+            params.update({
+                "full_text": "true",
+                "max_chars": max(500, min(int(document_max_chars), 20000)),
+            })
+        else:
+            params["full_text"] = "false"
+        return get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params), None
+    except Exception as exc:
+        return {"results": []}, exc
+
+
 @mcp.tool()
 def search_wiki(
     query: str,
@@ -765,6 +784,20 @@ def search_sujeeth_foundation(
     limit = max(1, min(int(limit or RESULT_COUNT), 20))
     errors = []
 
+    # Timing: each lap records the milliseconds since the previous one.
+    started = mark = time.perf_counter()
+    timings = {}
+
+    def lap(name):
+        nonlocal mark
+        now = time.perf_counter()
+        timings[name] = round((now - mark) * 1000)
+        mark = now
+
+    # The wiki search does not depend on the ontology, so run it alongside the steps below.
+    wiki_pool = ThreadPoolExecutor(max_workers=1)
+    wiki_future = wiki_pool.submit(run_wiki_search, query, full_documents, document_max_chars)
+
     # First resolve the query through the Search App's ontology resolver.
     try:
         resolution = post_json(
@@ -773,6 +806,7 @@ def search_sujeeth_foundation(
             WEBSEARCH_KEY,
         )
     except Exception as exc:
+        wiki_pool.shutdown(wait=False)
         return {
             "query": query,
             "status": "resolution_failed",
@@ -790,6 +824,7 @@ def search_sujeeth_foundation(
             ),
         }
 
+    lap("resolution_ms")
     concepts = resolution.get("matched_concepts") or []
     domains = resolution.get("domains") or []
 
@@ -813,19 +848,12 @@ def search_sujeeth_foundation(
     else:
         website = {"results": [], "status": resolution.get("status")}
 
-    try:
-        wiki_params = {"q": query, "limit": WIKI_POOL}
-        if full_documents:
-            wiki_params.update({
-                "full_text": "true",
-                "max_chars": max(500, min(int(document_max_chars), 20000)),
-            })
-        else:
-            wiki_params["full_text"] = "false"
-        wiki = get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, wiki_params)
-    except Exception as exc:
-        wiki = {"results": []}
-        errors.append({"service": "wikisearch", **error_result(exc)})
+    lap("website_ms")
+    wiki, wiki_error = wiki_future.result()
+    wiki_pool.shutdown(wait=False)
+    if wiki_error is not None:
+        errors.append({"service": "wikisearch", **error_result(wiki_error)})
+    lap("wiki_wait_ms")
 
     wiki_items = drop_excluded_wiki([
         item for item in normalize_results(wiki, "wiki")
@@ -847,12 +875,15 @@ def search_sujeeth_foundation(
         )
         if documents_summary["returned"]:
             quality["agent_instructions"] = quality["agent_instructions"] + FULL_DOCUMENT_INSTRUCTIONS
+    lap("documents_ms")
     if not (documents_summary and documents_summary["returned"]):
         quality["agent_instructions"] = quality["agent_instructions"].replace(
             "Otherwise answer from the results and cite their URLs.",
             "Otherwise answer from the results, reading pages as described below, and cite their URLs.",
         ) + EXCERPT_INSTRUCTIONS
     strip_internal(results)
+    timings["total_ms"] = round((time.perf_counter() - started) * 1000)
+    print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
 
     return {
         "query": query,
@@ -873,6 +904,7 @@ def search_sujeeth_foundation(
         "full_documents": documents_summary,
         "results": results,
         "service_errors": errors,
+        **({"timings_ms": timings} if TIMINGS else {}),
         **quality,
     }
 
