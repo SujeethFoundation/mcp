@@ -101,6 +101,13 @@ STATELESS = flag("MCP_STATELESS", "true")        # no in-memory sessions, safe b
 RATE_LIMIT_PER_IP = int(setting("MCP_RATE_LIMIT_PER_IP", "120"))     # requests per minute per client IP, 0 = off
 RATE_LIMIT_GLOBAL = int(setting("MCP_RATE_LIMIT_GLOBAL", "600"))     # requests per minute in total, 0 = off
 
+# Token savings. Searches return short excerpts by default; the agent reads a whole page with
+# get_document only when it needs more. Set SEARCH_FULL_DOCUMENTS=true to attach full page
+# text to search results again. SEARCH_VERBOSE_ONTOLOGY adds the per-concept match details
+# and a second copy of the domain list to each response (about 600 tokens).
+FULL_DOCUMENTS_DEFAULT = flag("SEARCH_FULL_DOCUMENTS", "false")
+VERBOSE_ONTOLOGY = flag("SEARCH_VERBOSE_ONTOLOGY", "false")
+
 # Wiki pages that hold recorded circle sessions (recording links, transcript summaries)
 # are not served to AI clients. Override with WIKI_EXCLUDE_TITLE_PATTERN.
 WIKI_EXCLUDE = re.compile(
@@ -266,14 +273,16 @@ def combine_with_best_bets(wiki_items, website_items, limit):
 
 
 def resolution_summary(data):
-    return {
+    summary = {
         "status": data.get("status"),
         "ontology_version": data.get("ontology_version"),
         "matched_concepts": data.get("matched_concepts", []),
-        "concept_matches": data.get("concept_matches", []),
         "domains": data.get("domains", []),
         "message": data.get("message"),
     }
+    if VERBOSE_ONTOLOGY:
+        summary["concept_matches"] = data.get("concept_matches", [])
+    return summary
 
 
 def assess_quality(resolution, results, errors):
@@ -373,6 +382,22 @@ FULL_DOCUMENT_INSTRUCTIONS = (
     "the document, not the snippet, and cite the url. If a document has excerpt_only set to "
     "true, it is third-party content: summarize briefly and link to the source, do not "
     "reproduce it. If a document is truncated, say so and call get_document for more."
+)
+
+# Used when a search returns excerpts only. This sits beside the results, which is where the
+# agent decides whether to answer or to read a page.
+EXCERPT_INSTRUCTIONS = (
+    " Results are excerpts and may stop mid-sentence. If they do not fully answer the question "
+    "(steps, an agenda, a list, dates, exact wording, or an excerpt that looks cut off), call "
+    "get_document with the result's url and source before answering, starting with a best_bet "
+    "or spotlight. Fetch at most two pages per question. Results whose domain is not "
+    "sujeeth.org are third-party: summarize briefly and link instead of fetching. Do not "
+    "answer program details from an excerpt that does not contain them."
+)
+
+GET_DOCUMENT_INSTRUCTIONS = DOCUMENT_INSTRUCTIONS + (
+    " If truncated is true and the part you need is missing, call get_document again with a "
+    "larger max_chars (up to 12000)."
 )
 
 PRIORITY_INSTRUCTIONS = (
@@ -663,13 +688,13 @@ def search_website(
 def search_wiki(
     query: str,
     limit: int = 5,
-    full_documents: bool = True,
+    full_documents: bool = FULL_DOCUMENTS_DEFAULT,
     document_max_chars: int = 12000,
 ) -> dict[str, Any]:
     """
-    Search the Sujeeth Foundation GitHub wiki. By default each result also carries the full
-    page text in a document field (cut at document_max_chars). Set full_documents to false
-    for snippets only.
+    Search the Sujeeth Foundation GitHub wiki. Returns short excerpts that can stop
+    mid-sentence. To read a page, call get_document with the result's url and source.
+    Set full_documents to true to attach the full page text to every result (uses many tokens).
     """
     query = (query or "").strip()
     if not query:
@@ -702,6 +727,11 @@ def search_wiki(
                     "If excerpt_only is true, summarize briefly and link to the source.",
                     "Answer from the document field, not the snippet.",
                 )
+        else:
+            response["agent_instructions"] = DOCUMENT_INSTRUCTIONS.replace(
+                "If excerpt_only is true, summarize briefly and link to the source.",
+                EXCERPT_INSTRUCTIONS.strip(),
+            )
         strip_internal(results)
         return response
     except Exception as exc:
@@ -712,7 +742,7 @@ def search_wiki(
 def search_sujeeth_foundation(
     query: str,
     limit: int | None = None,
-    full_documents: bool = True,
+    full_documents: bool = FULL_DOCUMENTS_DEFAULT,
     max_documents: int | None = None,
     document_max_chars: int = 12000,
 ) -> dict[str, Any]:
@@ -721,12 +751,11 @@ def search_sujeeth_foundation(
     Results flagged best_bet or spotlight are curated pages; present them first.
     Results come from as many different sources as possible (at most MAX_RESULTS_PER_DOMAIN
     from any one). limit defaults to SEARCH_RESULT_COUNT.
-    By default the results also carry the full page text in a document field
-    (full_documents). Every best bet gets one, plus up to max_documents other results
+    Results are short excerpts that can stop mid-sentence. To read a page, call
+    get_document with the result's url and source. Set full_documents to true to attach
+    full page text instead: every best bet gets one, plus up to max_documents other results
     (default: all of them), each up to document_max_chars, within the response's total
-    character budget.
-    Foundation and wiki pages come back whole; third-party pages come back as a short
-    excerpt flagged excerpt_only. Set full_documents to false for snippets only.
+    character budget (uses many tokens). Third-party pages are always excerpts.
     Returns a suggested clarification question when search quality is weak.
     """
     query = (query or "").strip()
@@ -818,6 +847,11 @@ def search_sujeeth_foundation(
         )
         if documents_summary["returned"]:
             quality["agent_instructions"] = quality["agent_instructions"] + FULL_DOCUMENT_INSTRUCTIONS
+    if not (documents_summary and documents_summary["returned"]):
+        quality["agent_instructions"] = quality["agent_instructions"].replace(
+            "Otherwise answer from the results and cite their URLs.",
+            "Otherwise answer from the results, reading pages as described below, and cite their URLs.",
+        ) + EXCERPT_INSTRUCTIONS
     strip_internal(results)
 
     return {
@@ -827,7 +861,7 @@ def search_sujeeth_foundation(
         "website_search": {
             "status": website.get("status"),
             "count": len(website.get("results", []) or []),
-            "domains": website.get("domains", domains),
+            **({"domains": website.get("domains", domains)} if VERBOSE_ONTOLOGY else {}),
             "search_mode": website.get("search_mode"),
         },
         "wiki_search": {
@@ -881,10 +915,12 @@ def get_document(
     max_chars: int = 6000,
 ) -> dict[str, Any]:
     """
-    Read more of a search result. Pass the url or chunk_id exactly as a search result
-    returned it (and its source, "website" or "wiki", if known). Foundation sites and the
-    wiki return the page text. Third-party sites return only a short excerpt around the
-    matched passage, so link to the source instead of reproducing it.
+    Read the page behind a search result. Search results are excerpts; call this when they do
+    not fully answer the question. Pass the url (or chunk_id) exactly as the result returned it,
+    and its source, "website" or "wiki". Foundation sites and the wiki return the page text
+    (total_chars and truncated say whether more exists; raise max_chars up to 12000 for more).
+    Third-party sites return only a short excerpt around the matched passage, so link to the
+    source instead of reproducing it.
     """
     if not (url or chunk_id):
         return {"error": "Provide a url or chunk_id from a search result."}
@@ -901,7 +937,7 @@ def get_document(
     except Exception as exc:
         return error_result(exc)
 
-    result["agent_instructions"] = DOCUMENT_INSTRUCTIONS
+    result["agent_instructions"] = GET_DOCUMENT_INSTRUCTIONS
     return result
 
 
