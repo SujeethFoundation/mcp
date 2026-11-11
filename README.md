@@ -73,8 +73,15 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 | `MCP_PORT` | `FUNCTIONS_CUSTOMHANDLER_PORT`, `PORT`, or `WEBSITES_PORT` if set, else `8000` | Port. On Azure Functions it must equal `port` in `host.json` (8000), so set it explicitly |
 | `MCP_ADMIN_TOOLS` | `false` | Show the admin tools |
 | `MCP_STATELESS` | `true` | No in-memory sessions, so any instance can answer any request |
-| `MCP_RATE_LIMIT_PER_IP` | `120` | Requests per minute per client address (0 turns it off) |
-| `MCP_RATE_LIMIT_GLOBAL` | `600` | Requests per minute across all clients (0 turns it off) |
+| `MCP_RATE_LIMIT_PER_IP` | `120` | Requests per minute per client address for ordinary callers (0 turns it off) |
+| `MCP_RATE_LIMIT_TRUSTED_PER_IP` | `1200` | Requests per minute per address for trusted callers: AI providers and our Foundry project (0 turns it off) |
+| `MCP_RATE_LIMIT_GLOBAL` | `600` | Requests per minute across all clients, trusted or not (0 turns it off) |
+| `MCP_TRUSTED_RANGES` | `160.79.104.0/21` | Comma-separated CIDR ranges that count as trusted. Default is Anthropic's published outbound range. `none` clears it |
+| `MCP_TRUSTED_RANGE_URLS` | OpenAI's ChatGPT connectors manifest (`https://openai.com/chatgpt-connectors.json`) | Comma-separated URLs of JSON manifests of ranges (`{"prefixes":[{"ipv4Prefix":"..."}]}`), read at start and refreshed daily. `none` turns it off |
+| `MCP_TRUSTED_REFRESH_SECONDS` | `86400` | How often the manifests are read again. A failed read keeps the last good ranges |
+| `MCP_TRUSTED_KEY` | empty (off) | Shared secret. A caller that sends it in the header below counts as trusted. Use it for the Foundry project |
+| `MCP_TRUSTED_KEY_HEADER` | `x-mcp-client-key` | Name of the header that carries that secret |
+| `MCP_TRUSTED_USER_AGENTS` | empty (off) | Optional regular expression. A matching User-Agent counts as trusted. It can be faked, so it only picks the bucket |
 | `MCP_REQUEST_TIMEOUT` | `30` | Seconds to wait for a backend |
 | `WIKI_EXCLUDE_TITLE_PATTERN` | circle-session pattern | Wiki pages to drop from results |
 | `LOCAL_SETTINGS_PATH` | `local.settings.json` | Optional settings file |
@@ -139,7 +146,10 @@ Local testing of the Functions setup needs Azure Functions Core Tools (`func sta
 ## Operating notes
 
 - **There is no client login, by design.** The service is public. The protections are: admin tools hidden, rate limits, answers limited to ontology-approved domains, excerpt-only output for third-party sites, and the circle-session filter. Backend keys never leave the server.
-- **Rate limits are per instance and in memory, and Flex Consumption adds instances under load.** The effective total is the limit times the number of running instances. Clients that connect through a shared provider (a hosted AI assistant, for example) arrive from the provider's addresses, so many customers can share one address. Keep the global limit as the main protection and raise the per-IP limit if legitimate users get HTTP 429. Behind the Azure front end and the Functions host, the client address comes from the `X-Forwarded-For` header. Check that it looks right in your first test.
+- **Rate limits are per instance and in memory, and Flex Consumption adds instances under load.** The effective total is the limit times the number of running instances. Behind the Azure front end and the Functions host, the client address comes from the `X-Forwarded-For` header. Check that it looks right in your first test.
+- **Hosted AI assistants share addresses, so they get their own bucket.** Claude and ChatGPT call this server from the provider's cloud, not from the user's device, and the Foundry agent calls from the project's data proxy. Every visitor behind one provider arrives from the same few addresses. A per-address limit sized for one person then throttles all of them at once. In a load test it did exactly that: the limit was reached, the Foundry run failed as `tool_user_error`, and nothing in our own logs said why. Callers that are trusted (see `rate_limit.py` and the settings above) count in a separate, higher per-address bucket. Trust changes only that limit. It does not authenticate anyone, and the global limit still counts every request.
+- **Foundry does not publish a stable address for its tool calls**, so identify the Foundry project with a key. Set `MCP_TRUSTED_KEY` on this app, then in the Foundry project add the MCP tool with key-based authentication and the same value under the header name in `MCP_TRUSTED_KEY_HEADER`. Foundry keeps the secret in the project connection, so the agent never sees it. OpenAI says its own ranges are best effort and that addresses outside the manifest have appeared before, so watch for `rate_limited bucket=public` lines from OpenAI addresses and add them to `MCP_TRUSTED_RANGES`.
+- **Throttling is logged.** Each throttled address writes one line per minute: `rate_limited bucket=public|trusted|global ip=... limit_per_minute=...`. These lines contain client addresses. Search the log for them first when a tool call fails with no other explanation.
 - **Each search can spend money.** Every search calls the websearch app, which uses Azure AI Search and the embedding deployment. Keep a budget alert on those resources.
 - **Scaling.** Flex Consumption adds instances as requests arrive, up to the maximum you set. Stateless mode is what makes that safe. The always-ready instances keep the first request from waiting on a cold start.
 - **Preview status.** Hosting your own SDK-based MCP server on Azure Functions is in public preview. Check the Azure documentation before relying on it for something with a service-level agreement.

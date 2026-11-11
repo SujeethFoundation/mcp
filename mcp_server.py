@@ -6,7 +6,6 @@ import re
 import sys
 import threading
 import time
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
@@ -21,6 +20,8 @@ if _VENDORED.is_dir() and str(_VENDORED) not in sys.path:
 
 import requests  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
+
+from rate_limit import RateLimitMiddleware, TrustedRanges  # noqa: E402
 
 
 # ------------------------------------------------------------
@@ -101,6 +102,22 @@ ADMIN_TOOLS = flag("MCP_ADMIN_TOOLS", "false")   # diagnostic and ontology tools
 STATELESS = flag("MCP_STATELESS", "true")        # no in-memory sessions, safe behind a load balancer
 RATE_LIMIT_PER_IP = int(setting("MCP_RATE_LIMIT_PER_IP", "120"))     # requests per minute per client IP, 0 = off
 RATE_LIMIT_GLOBAL = int(setting("MCP_RATE_LIMIT_GLOBAL", "600"))     # requests per minute in total, 0 = off
+
+# Hosted AI assistants (Claude, ChatGPT, the Foundry agent) reach this server from a few shared addresses, so
+# many visitors arrive as one client. Callers that are trusted as such count in a separate, much higher
+# per-address bucket. Trust only changes the per-address limit; the global limit still counts everyone.
+# See rate_limit.py for the full rules. "none" turns a list off.
+RATE_LIMIT_TRUSTED_PER_IP = int(setting("MCP_RATE_LIMIT_TRUSTED_PER_IP", "1200"))  # per minute per trusted address, 0 = off
+TRUSTED_RANGES = [] if setting("MCP_TRUSTED_RANGES", "160.79.104.0/21").strip().lower() == "none" else [
+    x.strip() for x in setting("MCP_TRUSTED_RANGES", "160.79.104.0/21").split(",") if x.strip()
+]  # default: Anthropic's published outbound range
+TRUSTED_RANGE_URLS = [] if setting("MCP_TRUSTED_RANGE_URLS", "https://openai.com/chatgpt-connectors.json").strip().lower() == "none" else [
+    x.strip() for x in setting("MCP_TRUSTED_RANGE_URLS", "https://openai.com/chatgpt-connectors.json").split(",") if x.strip()
+]  # default: OpenAI's ChatGPT connectors manifest
+TRUSTED_REFRESH_SECONDS = int(setting("MCP_TRUSTED_REFRESH_SECONDS", "86400"))
+TRUSTED_KEY = setting("MCP_TRUSTED_KEY")                      # shared secret the Foundry project sends; empty = off
+TRUSTED_KEY_HEADER = setting("MCP_TRUSTED_KEY_HEADER", "x-mcp-client-key")
+TRUSTED_USER_AGENTS = setting("MCP_TRUSTED_USER_AGENTS")      # optional regex; a User-Agent can be faked
 
 # Token savings. Searches return short excerpts by default; the agent reads a whole page with
 # get_document only when it needs more. Set SEARCH_FULL_DOCUMENTS=true to attach full page
@@ -541,59 +558,6 @@ async def root(request):
     """The Azure Functions host pings / to check that a custom handler is running."""
     from starlette.responses import JSONResponse
     return JSONResponse({"status": "ok", "service": "Sujeeth Foundation MCP", "endpoint": "/mcp"})
-
-
-class RateLimitMiddleware:
-    """Per-client and global request limits that answer HTTP 429.
-
-    Counts are in memory, so each running instance applies its own limits. Clients that
-    connect through a shared provider (a hosted AI assistant, for example) arrive from the
-    provider's addresses, which is why the global limit exists as well as the per-IP one.
-    """
-
-    def __init__(self, app, per_ip, global_limit, window=60.0):
-        self.app = app
-        self.per_ip = per_ip
-        self.global_limit = global_limit
-        self.window = window
-        self.hits = {}
-        self.all_hits = deque()
-
-    @staticmethod
-    def client_ip(scope):
-        for name, value in scope.get("headers", []):
-            if name == b"x-forwarded-for":
-                parts = [p.strip() for p in value.decode("latin-1").split(",") if p.strip()]
-                if parts:
-                    # The proxy appends the address it saw, so the last entry is the one to trust.
-                    last = parts[-1]
-                    return last.split(":")[0] if last.count(":") == 1 else last
-        client = scope.get("client")
-        return client[0] if client else "unknown"
-
-    async def __call__(self, scope, receive, send):
-        if scope["type"] != "http" or scope.get("path") in ("/healthz", "/"):
-            await self.app(scope, receive, send)
-            return
-        now = time.monotonic()
-        while self.all_hits and now - self.all_hits[0] > self.window:
-            self.all_hits.popleft()
-        if len(self.hits) > 5000:
-            self.hits = {k: v for k, v in self.hits.items() if v and now - v[-1] <= self.window}
-        recent = self.hits.setdefault(self.client_ip(scope), deque())
-        while recent and now - recent[0] > self.window:
-            recent.popleft()
-        if (self.per_ip and len(recent) >= self.per_ip) or (
-            self.global_limit and len(self.all_hits) >= self.global_limit
-        ):
-            await send({"type": "http.response.start", "status": 429, "headers": [
-                (b"content-type", b"application/json"), (b"retry-after", b"30")]})
-            await send({"type": "http.response.body",
-                        "body": b'{"error":"Too many requests. Please try again shortly."}'})
-            return
-        recent.append(now)
-        self.all_hits.append(now)
-        await self.app(scope, receive, send)
 
 
 @admin_tool
@@ -1159,7 +1123,8 @@ if __name__ == "__main__":
     print(f"Wiki Search: {WIKISEARCH_URL}")
     print(f"Ontology: {ONTOLOGY_URL}")
     print(f"Admin tools: {'on' if ADMIN_TOOLS else 'off'} | stateless: {STATELESS} | "
-          f"rate limits per minute: per-IP {RATE_LIMIT_PER_IP}, global {RATE_LIMIT_GLOBAL}")
+          f"rate limits per minute: per-IP {RATE_LIMIT_PER_IP}, trusted per-IP {RATE_LIMIT_TRUSTED_PER_IP}, "
+          f"global {RATE_LIMIT_GLOBAL} | trusted key: {'on' if TRUSTED_KEY else 'off'}")
     print(f"MCP endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
 
     if start_warmup():
@@ -1168,6 +1133,13 @@ if __name__ == "__main__":
               f"Warm-up: {len(WARMUP_QUERIES)} questions at start only")
 
     app = mcp.streamable_http_app()
-    if RATE_LIMIT_PER_IP or RATE_LIMIT_GLOBAL:
-        app = RateLimitMiddleware(app, RATE_LIMIT_PER_IP, RATE_LIMIT_GLOBAL)
+    if RATE_LIMIT_PER_IP or RATE_LIMIT_GLOBAL or RATE_LIMIT_TRUSTED_PER_IP:
+        trusted = TrustedRanges(TRUSTED_RANGES, TRUSTED_RANGE_URLS, TRUSTED_REFRESH_SECONDS)
+        trusted.start()  # reads the provider manifests in the background
+        app = RateLimitMiddleware(
+            app, RATE_LIMIT_PER_IP, RATE_LIMIT_GLOBAL,
+            trusted=trusted, trusted_per_ip=RATE_LIMIT_TRUSTED_PER_IP,
+            trusted_key=TRUSTED_KEY, key_header=TRUSTED_KEY_HEADER,
+            trusted_agents=TRUSTED_USER_AGENTS or None,
+        )
     uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")

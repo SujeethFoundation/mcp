@@ -73,6 +73,7 @@ jobs:
           unzip -t release.zip > /dev/null
           unzip -l release.zip | grep -q " host.json"
           unzip -l release.zip | grep -q " mcp_server.py"
+          unzip -l release.zip | grep -q " rate_limit.py"
           unzip -l release.zip | grep -q ".python_packages/lib/site-packages/mcp/"
           unzip -l release.zip | grep -q ".python_packages/lib/site-packages/requests/"
           echo "Deployment package verified."
