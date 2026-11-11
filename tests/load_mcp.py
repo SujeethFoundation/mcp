@@ -12,6 +12,11 @@ Raise MCP_RATE_LIMIT_GLOBAL on the app for the run (default 600 a minute per ins
 Each search calls the website search, the wiki search and Azure AI Search (with an embedding call), so a run costs
 a little. Page reads are cached by the server for 15 minutes, so they look faster here than a first read would.
 
+Fixed-rate mode sends searches at a steady rate instead of playing visitors. It uses a pool of workers, so one
+machine can send far more than the visitor mode can:
+    python tests/load_mcp.py --url <...>/mcp --rate 30 --duration 60
+It prints a warning if this machine could not keep up, because then the server was not the limit.
+
 --handshake adds an initialize, a notifications/initialized and a tools/list before each call, three more requests.
 Some clients do this on every call in stateless mode. It matters for the per-minute request limits, so use it to see
 how many requests a real chat might cost. Press Ctrl+C to stop early; what finished is still reported.
@@ -24,6 +29,7 @@ import statistics
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 import urllib.error
 import urllib.request
 from urllib.parse import urlparse
@@ -42,6 +48,22 @@ QUESTIONS = [
     "How do I ask for a referral?", "What is an elevator pitch?", "How do I network at a career fair?",
     "What should I wear to an interview?", "How do I handle a rejection?", "How should I prepare for a phone screen?", "What are good questions to ask an interviewer?",
 ]
+
+
+NO_ANSWER = []  # (seconds since the run started, kind) for every request that got no HTTP answer
+_no_answer_lock = threading.Lock()
+RUN_START = [time.perf_counter()]
+
+
+def note_no_answer(exc):
+    """Remember what kind of failure it was (reset, timeout, refused, TLS...) and when, so a few can be explained."""
+    reason = getattr(exc, "reason", None)  # urllib wraps the real error in URLError.reason
+    inner = reason if isinstance(reason, BaseException) else exc
+    kind = type(inner).__name__
+    if kind in ("URLError", "error") and reason is not None and not isinstance(reason, BaseException):
+        kind = f"URLError({str(reason)[:40]})"
+    with _no_answer_lock:
+        NO_ANSWER.append((time.perf_counter() - RUN_START[0], kind))
 
 
 def percentile(values, p):
@@ -69,7 +91,8 @@ class Client:
                 status, raw, ctype = response.status, response.read().decode("utf-8", "replace"), response.headers.get("content-type", "")
         except urllib.error.HTTPError as exc:
             return exc.code, time.perf_counter() - began, None
-        except Exception:
+        except Exception as exc:
+            note_no_answer(exc)
             return "error", time.perf_counter() - began, None
         return status, time.perf_counter() - began, parse_body(raw, ctype)
 
@@ -114,6 +137,20 @@ def tool_payload(message):
     return payload if isinstance(payload, dict) else {}, failed
 
 
+def classify_search(payload):
+    """What a search answer really contained. The server answers HTTP 200 even when a backend failed, and says so
+    inside the answer, so 'HTTP 200' alone does not mean the search worked."""
+    if not isinstance(payload, dict) or not payload:
+        return "unreadable"
+    if str(payload.get("status") or "") == "resolution_failed":
+        return "resolution_failed"
+    if payload.get("service_errors") or payload.get("service_degraded") or str(payload.get("status") or "") == "partial":
+        return "degraded"
+    if not payload.get("results"):
+        return "empty"
+    return "ok"
+
+
 def main():
     ap = argparse.ArgumentParser(description="Load test for the MCP server.")
     ap.add_argument("--url", required=True, help="the MCP endpoint, ending in /mcp")
@@ -125,15 +162,25 @@ def main():
     ap.add_argument("--ramp", type=float, default=10.0, help="spread the visitors' start times over this many seconds")
     ap.add_argument("--read-chance", type=float, default=0.5, help="chance a visitor reads pages after a search (0 to 1)")
     ap.add_argument("--handshake", action="store_true", help="send initialize, initialized and tools/list before each call")
+    ap.add_argument("--rate", type=float, default=0.0, help="fixed-rate mode: searches per second (ignores --visitors/--calls/--ramp/--think)")
+    ap.add_argument("--duration", type=float, default=60.0, help="fixed-rate mode: seconds to keep sending")
+    ap.add_argument("--workers", type=int, default=500, help="fixed-rate mode: most requests this machine keeps in flight at once")
+    ap.add_argument("--ignore-first", type=float, default=-1.0, help="also report the searches that finished after this many "
+                    "seconds, to leave out the warm-up (default: 60 for a fixed-rate run of 180s or more)")
     ap.add_argument("--max-requests", type=int, default=600, help="stop after this many HTTP requests")
     ap.add_argument("--timeout", type=float, default=60.0)
     args = ap.parse_args()
     if urlparse(args.url).scheme not in ("http", "https"):
         sys.exit("--url must start with http:// or https://")
+    if args.rate > 0:
+        args.max_requests = max(args.max_requests, int(args.rate * args.duration * 1.5) + 100)
 
     lock = threading.Lock()
     results = []  # (kind, status, seconds, tool_failed)
-    state = {"stop": False, "sent": 0, "in_flight": 0, "peak": 0, "calls": 0}
+    timeline = []  # (seconds into the run when it finished, kind, status, seconds, outcome)
+    outcomes = {}   # what the searches returned: ok, degraded, empty, resolution_failed, unreadable
+    service_errors = {}  # "service: message" -> count, from the answers' service_errors
+    state = {"stop": False, "sent": 0, "in_flight": 0, "peak": 0, "calls": 0, "queued": 0, "peak_queued": 0, "max_lag": 0.0, "scheduled": 0}
 
     def record(client, kind, method, params=None, notify=False):
         with lock:
@@ -141,17 +188,28 @@ def main():
                 state["stop"] = True
                 return None
             state["sent"] += 1
+            state["last_sent_at"] = time.perf_counter()
             state["in_flight"] += 1
             state["peak"] = max(state["peak"], state["in_flight"])
         status, seconds, message = client.rpc(method, params, notify)
         failed = False
         payload = {}
+        outcome = ""
         if kind in ("search", "get_documents") and status == 200:
             payload, failed = tool_payload(message)
+            if kind == "search":
+                outcome = "failed" if failed else classify_search(payload)
         with lock:
             state["in_flight"] -= 1
             state["last_done"] = time.perf_counter()
             results.append((kind, status, seconds, failed))
+            timeline.append((state["last_done"] - RUN_START[0], kind, status, seconds, outcome))
+            if kind == "search" and status == 200:
+                outcomes[outcome] = outcomes.get(outcome, 0) + 1
+                for err in (payload.get("service_errors") or [])[:3]:
+                    if isinstance(err, dict):
+                        key = f"{err.get('service', '?')}: {str(err.get('error', ''))[:60]}"
+                        service_errors[key] = service_errors.get(key, 0) + 1
         return status, payload
 
     def nap(seconds):
@@ -188,14 +246,64 @@ def main():
             if n < args.calls - 1:
                 nap(random.uniform(0.5 * args.think, 1.5 * args.think))
 
-    print(f"{args.visitors} visitors x {args.calls} questions, think {args.think}s, ramp {args.ramp}s, "
+    def one_search():
+        with lock:
+            state["queued"] -= 1
+        client = Client(args.url, args.key, args.key_header, args.timeout)
+        if args.handshake:
+            record(client, "initialize", "initialize", {"protocolVersion": "2025-06-18", "capabilities": {},
+                                                        "clientInfo": {"name": "load-test", "version": "1"}})
+            record(client, "initialized", "notifications/initialized", notify=True)
+            record(client, "tools/list", "tools/list", {})
+        sent = record(client, "search", "tools/call", {"name": "search_sujeeth_foundation",
+                                                       "arguments": {"query": random.choice(QUESTIONS)}})
+        if sent is None:
+            return
+        with lock:
+            state["calls"] += 1
+        status, payload = sent
+        urls = [r.get("url") for r in payload.get("results", []) if isinstance(r, dict) and r.get("url")
+                and ("sujeeth.org" in str(r.get("url")) or "github.com" in str(r.get("url")))]
+        if status == 200 and urls and random.random() < args.read_chance:
+            record(client, "get_documents", "tools/call", {"name": "get_documents",
+                                                           "arguments": {"urls": urls[:2], "max_chars": 6000}})
+
+    def generator():
+        """Open loop: start one search every 1/rate seconds, whether or not earlier ones have finished."""
+        pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
+        t0, n = time.perf_counter(), 0
+        while not state["stop"] and time.perf_counter() - t0 < args.duration:
+            due = t0 + n / args.rate
+            now = time.perf_counter()
+            if now < due:
+                time.sleep(min(0.002, due - now))
+                continue
+            with lock:
+                state["queued"] += 1
+                state["scheduled"] += 1
+                state["peak_queued"] = max(state["peak_queued"], state["queued"])
+                state["max_lag"] = max(state["max_lag"], now - due)
+            pool.submit(one_search)
+            n += 1
+        pool.shutdown(wait=True)
+
+    if args.rate > 0:
+        print(f"Fixed rate {args.rate:g} searches a second for {args.duration:g}s (up to {args.workers} in flight), "
+              f"handshake {'on' if args.handshake else 'off'}, read chance {args.read_chance:g}, "
+              f"key {'sent' if args.key else 'NOT sent'}")
+    else:
+        print(f"{args.visitors} visitors x {args.calls} questions, think {args.think}s, ramp {args.ramp}s, "
           f"handshake {'on' if args.handshake else 'off'}, key {'sent' if args.key else 'NOT sent'} (cap {args.max_requests} requests)")
     if not args.key:
         print("  No key: this machine counts in the public bucket (120 requests a minute by default) and will hit HTTP 429.")
     print("A progress line prints every 10 seconds. Press Ctrl+C to stop early; the results so far are still reported.")
 
     started = time.perf_counter()
-    threads = [threading.Thread(target=visitor, args=(i,), daemon=True) for i in range(args.visitors)]
+    RUN_START[0] = started
+    if args.rate > 0:
+        threads = [threading.Thread(target=generator, daemon=True)]
+    else:
+        threads = [threading.Thread(target=visitor, args=(i,), daemon=True) for i in range(args.visitors)]
     for t in threads:
         t.start()
     try:
@@ -223,10 +331,22 @@ def main():
         print("No requests finished.")
         return
     print(f"\nFinished in {wall:.0f}s. Requests sent: {state['sent']}. Highest number waiting at once: {state['peak']}.")
-    if state["sent"] >= args.max_requests and not args.max_requests == 0:
+    if args.rate == 0 and state["sent"] >= args.max_requests:
         print(f"NOTE: the --max-requests cap ({args.max_requests}) stopped this run. Visitors did not finish their "
               f"{args.calls} questions, so this was a burst of first requests, not {args.visitors} x {args.calls} calls. "
               "Raise --max-requests or use fewer visitors to test the shape you meant.")
+    if args.rate > 0:
+        sending = max(1e-9, state.get("last_sent_at", started) - started)  # until the last request really left
+        print(f"Target {args.rate:g} searches a second. Scheduled {state['scheduled']}; the last of the {state['sent']} "
+              f"sent left this machine at {sending:.0f}s ({state['sent'] / sending:.1f} requests a second on average). "
+              f"Most in flight at once: {state['peak']}.")
+        if state["peak"] >= args.workers:
+            print(f"WARNING: all {args.workers} workers were busy at once. When the server slows down, this machine stops "
+                  "sending at the target rate and the latencies below start late, so they are understated.")
+        if state["peak_queued"] > 5 or state["max_lag"] > 1.0:
+            print(f"WARNING: this machine fell behind (up to {state['peak_queued']} searches waiting for a free worker, "
+                  f"up to {state['max_lag']:.1f}s late starting one). Latencies below are understated and the rate was not "
+                  "reached. Raise --workers or send from more than one machine.")
     by_status = {}
     for _, status, _, _ in done:
         by_status[status] = by_status.get(status, 0) + 1
@@ -236,7 +356,42 @@ def main():
         times = [s for k, st, s, _ in done if k == kind and st in (200, 202)]
         if times:
             print(f"  {kind:14s} n={len(times):4d}  median {statistics.median(times):5.2f}s  p90 {percentile(times, 90):5.2f}s  "
-                  f"p95 {percentile(times, 95):5.2f}s  slowest {max(times):5.2f}s")
+                  f"p95 {percentile(times, 95):5.2f}s  p99 {percentile(times, 99):5.2f}s  slowest {max(times):5.2f}s")
+    with lock:
+        events = list(timeline)
+    if wall > 60 and events:
+        print("Timeline of searches, in 30-second buckets by when they finished:")
+        print("  seconds    done    ok  median     p95  slowest  no-answer  not-ok answers")
+        width = 30
+        for lo in range(0, int(wall) + 1, width):
+            bucket = [(st, sec, oc) for at, k, st, sec, oc in events if k == "search" and lo <= at < lo + width]
+            late = [t for t, _ in NO_ANSWER if lo <= t < lo + width]
+            oks = [sec for st, sec, oc in bucket if st == 200]
+            notok = sum(1 for st, sec, oc in bucket if st == 200 and oc != "ok")
+            if not bucket and not late:
+                continue
+            med = f"{statistics.median(oks):6.2f}s" if oks else "     -"
+            p95 = f"{percentile(oks, 95):6.2f}s" if oks else "     -"
+            top = f"{max(oks):6.2f}s" if oks else "     -"
+            print(f"  {lo:3d}-{lo + width:<4d} {len(bucket):6d} {len(oks):6d}  {med} {p95} {top}  {len(late):9d}  {notok}")
+    cutoff = args.ignore_first if args.ignore_first >= 0 else (60.0 if args.rate > 0 and args.duration >= 180 else 0.0)
+    if cutoff > 0:
+        steady = [sec for at, k, st, sec, oc in events if k == "search" and st == 200 and at >= cutoff]
+        if steady:
+            print(f"Searches that finished after the first {cutoff:.0f}s (warm-up left out): n={len(steady)}  "
+                  f"median {statistics.median(steady):.2f}s  p90 {percentile(steady, 90):.2f}s  p95 {percentile(steady, 95):.2f}s  "
+                  f"p99 {percentile(steady, 99):.2f}s  slowest {max(steady):.2f}s")
+    if outcomes:
+        total = sum(outcomes.values())
+        good = outcomes.get("ok", 0)
+        order = ["ok", "degraded", "empty", "resolution_failed", "unreadable", "failed"]
+        print("What the answered searches actually contained (HTTP 200 does not mean the search worked): "
+              + ", ".join(f"{k} {outcomes[k]}" for k in order if outcomes.get(k)) + f"  [{good / total:.1%} returned results with no backend errors]")
+        if good < total:
+            for key, n in sorted(service_errors.items(), key=lambda kv: -kv[1])[:6]:
+                print(f"    backend error seen {n}x: {key}")
+            print("  degraded = a backend failed or timed out and the server answered with what it had; resolution_failed = "
+                  "no search ran; empty = the search ran and found nothing. Only 'ok' counts as a working search.")
     tool_failed = sum(1 for _, st, _, f in done if f)
     if tool_failed:
         print(f"  {tool_failed} tool calls returned HTTP 200 but reported an error (a backend app failed or timed out).")
@@ -245,8 +400,16 @@ def main():
     print(f"Requests per search call: {len(done) / calls:.1f}" if calls else "No search calls were sent.")
     print(f"Request rate: {len(done) / minutes:.0f} requests a minute over the whole run (peak minute is higher).")
     if by_status.get("error"):
-        print(f"{by_status['error']} requests got no HTTP answer at all (connection refused, DNS or timeout): "
-              "check --url and that the app is running.")
+        kinds = {}
+        for _, kind in NO_ANSWER:
+            kinds[kind] = kinds.get(kind, 0) + 1
+        when = [t for t, _ in NO_ANSWER]
+        print(f"{by_status['error']} requests got no HTTP answer at all. By kind: "
+              + ", ".join(f"{k} x{v}" for k, v in sorted(kinds.items(), key=lambda kv: -kv[1])) + ".")
+        if when:
+            print(f"  They happened between {min(when):.0f}s and {max(when):.0f}s into the run. A reset or refused "
+                  "connection means the server or platform dropped it; a timeout means it waited past --timeout; "
+                  "a TLS or DNS error usually points at this machine's network.")
     if by_status.get(429):
         print("HTTP 429 means a rate limit stopped requests: check the key, MCP_TRUSTED_KEY on the app, and the "
               "`rate_limited bucket=...` lines in its log. This run is not a capacity measurement.")
