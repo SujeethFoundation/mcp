@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import functools
 import json
 import os
 import re
@@ -101,6 +103,9 @@ def flag(name, default):
 ADMIN_TOOLS = flag("MCP_ADMIN_TOOLS", "false")   # diagnostic and ontology tools stay hidden unless enabled
 STATELESS = flag("MCP_STATELESS", "true")        # no in-memory sessions, safe behind a load balancer
 RATE_LIMIT_PER_IP = int(setting("MCP_RATE_LIMIT_PER_IP", "120"))     # requests per minute per client IP, 0 = off
+# Tool calls do blocking work (HTTP calls to the search apps), so they run on a pool of worker threads and the
+# event loop stays free to accept requests. Without this, one instance answers one tool call at a time.
+TOOL_THREADS = max(1, int(setting("MCP_TOOL_THREADS", "32") or 32))
 RATE_LIMIT_GLOBAL = int(setting("MCP_RATE_LIMIT_GLOBAL", "600"))     # requests per minute in total, 0 = off
 
 # Hosted AI assistants (Claude, ChatGPT, the Foundry agent) reach this server from a few shared addresses, so
@@ -169,6 +174,26 @@ WIKI_EXCLUDE = re.compile(
 
 http = requests.Session()
 http.headers.update({"Accept": "application/json"})
+_adapter = requests.adapters.HTTPAdapter(pool_connections=8, pool_maxsize=max(10, TOOL_THREADS * 2))
+http.mount("https://", _adapter)
+http.mount("http://", _adapter)
+
+_tool_pool = ThreadPoolExecutor(max_workers=TOOL_THREADS, thread_name_prefix="mcp-tool")
+
+
+def in_thread(fn):
+    """Run a blocking tool function on the worker pool.
+
+    FastMCP calls a plain `def` tool directly on the event loop, so a search that waits on the search apps
+    stops the whole process from accepting or answering anything else (including /healthz) until it ends.
+    The wrapper is async, so FastMCP awaits it, and keeps the name, docstring and signature FastMCP reads.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(_tool_pool, functools.partial(fn, *args, **kwargs))
+
+    return wrapper
 
 
 def auth(key):
@@ -543,7 +568,7 @@ mcp = FastMCP(
 
 def admin_tool(fn):
     """Register a diagnostic or ontology tool only when MCP_ADMIN_TOOLS is on."""
-    return mcp.tool()(fn) if ADMIN_TOOLS else fn
+    return mcp.tool()(in_thread(fn)) if ADMIN_TOOLS else fn
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
@@ -654,6 +679,7 @@ def get_ontology_context(
 
 
 @mcp.tool()
+@in_thread
 def search_website(
     query: str,
     concepts: list[str] | None = None,
@@ -698,6 +724,7 @@ def run_wiki_search(query, full_documents, document_max_chars):
 
 
 @mcp.tool()
+@in_thread
 def search_wiki(
     query: str,
     limit: int = 5,
@@ -752,6 +779,7 @@ def search_wiki(
 
 
 @mcp.tool()
+@in_thread
 def search_sujeeth_foundation(
     query: str,
     limit: int | None = None,
@@ -961,6 +989,7 @@ def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=
 
 
 @mcp.tool()
+@in_thread
 def get_document(
     url: str | None = None,
     chunk_id: str | None = None,
@@ -1007,6 +1036,7 @@ def explain_fetch_error(exc):
 
 
 @mcp.tool()
+@in_thread
 def get_documents(urls: list[str], max_chars: int = 6000) -> dict[str, Any]:
     """
     Read the pages behind several search results in one call, all at the same time. Call it
@@ -1124,7 +1154,7 @@ if __name__ == "__main__":
     print(f"Ontology: {ONTOLOGY_URL}")
     print(f"Admin tools: {'on' if ADMIN_TOOLS else 'off'} | stateless: {STATELESS} | "
           f"rate limits per minute: per-IP {RATE_LIMIT_PER_IP}, trusted per-IP {RATE_LIMIT_TRUSTED_PER_IP}, "
-          f"global {RATE_LIMIT_GLOBAL} | trusted key: {'on' if TRUSTED_KEY else 'off'}")
+          f"global {RATE_LIMIT_GLOBAL} | trusted key: {'on' if TRUSTED_KEY else 'off'} | tool threads: {TOOL_THREADS}")
     print(f"MCP endpoint: http://{MCP_HOST}:{MCP_PORT}/mcp")
 
     if start_warmup():

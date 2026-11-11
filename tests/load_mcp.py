@@ -150,12 +150,19 @@ def main():
             payload, failed = tool_payload(message)
         with lock:
             state["in_flight"] -= 1
+            state["last_done"] = time.perf_counter()
             results.append((kind, status, seconds, failed))
         return status, payload
 
+    def nap(seconds):
+        """Sleep, but wake up as soon as the run is stopped (cap reached or Ctrl+C)."""
+        end = time.perf_counter() + seconds
+        while not state["stop"] and time.perf_counter() < end:
+            time.sleep(min(0.25, max(0.0, end - time.perf_counter())))
+
     def visitor(index):
         client = Client(args.url, args.key, args.key_header, args.timeout)
-        time.sleep(random.uniform(0, args.ramp))
+        nap(random.uniform(0, args.ramp))
         for n in range(args.calls):
             if state["stop"]:
                 return
@@ -179,7 +186,7 @@ def main():
                 record(client, "get_documents", "tools/call", {"name": "get_documents",
                                                                "arguments": {"urls": urls[:2], "max_chars": 6000}})
             if n < args.calls - 1:
-                time.sleep(random.uniform(0.5 * args.think, 1.5 * args.think))
+                nap(random.uniform(0.5 * args.think, 1.5 * args.think))
 
     print(f"{args.visitors} visitors x {args.calls} questions, think {args.think}s, ramp {args.ramp}s, "
           f"handshake {'on' if args.handshake else 'off'}, key {'sent' if args.key else 'NOT sent'} (cap {args.max_requests} requests)")
@@ -208,7 +215,7 @@ def main():
     except KeyboardInterrupt:
         state["stop"] = True
         print("\nStopping. Reporting what finished so far (requests still on their way are not counted).")
-    wall = time.perf_counter() - started
+    wall = state.get("last_done", time.perf_counter()) - started  # to the last finished request, not the idle tail
 
     with lock:
         done = list(results)
@@ -216,6 +223,10 @@ def main():
         print("No requests finished.")
         return
     print(f"\nFinished in {wall:.0f}s. Requests sent: {state['sent']}. Highest number waiting at once: {state['peak']}.")
+    if state["sent"] >= args.max_requests and not args.max_requests == 0:
+        print(f"NOTE: the --max-requests cap ({args.max_requests}) stopped this run. Visitors did not finish their "
+              f"{args.calls} questions, so this was a burst of first requests, not {args.visitors} x {args.calls} calls. "
+              "Raise --max-requests or use fewer visitors to test the shape you meant.")
     by_status = {}
     for _, status, _, _ in done:
         by_status[status] = by_status.get(status, 0) + 1
