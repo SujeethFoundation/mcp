@@ -85,3 +85,31 @@ def test_errors_inside_a_tool_reach_the_caller():
         assert str(exc) == "bad"
     else:
         raise AssertionError("the error was swallowed")
+
+
+def test_the_plain_function_is_reachable_for_code_off_the_event_loop():
+    assert not inspect.iscoroutinefunction(server.search_sujeeth_foundation.sync)
+    assert inspect.iscoroutinefunction(server.search_sujeeth_foundation)
+
+
+def test_warmup_runs_the_search_and_reads_the_pages_it_finds(monkeypatch, capsys):
+    """The warm-up runs on a plain thread. After the tools were wrapped it called the async wrapper, got a
+    coroutine, and failed every query with: 'coroutine' object has no attribute 'get'."""
+    def fake_post(url, payload, key=""):
+        if url.endswith("/api/domain-resolution"):
+            return {"status": "resolved", "matched_concepts": ["circle"], "domains": ["sujeeth.org"]}
+        return {"status": "completed", "results": [{"title": "Career Circle", "url": "https://www.sujeeth.org/circle",
+                                                    "snippet": "A six week program.", "source": "website",
+                                                    "domain": "sujeeth.org", "chunk_id": "c-0"}]}
+
+    reads = []
+    monkeypatch.setattr(server, "post_json", fake_post)
+    monkeypatch.setattr(server, "get_json", lambda url, key="", params=None: {"results": []})
+    monkeypatch.setattr(server, "fetch_document", lambda *a, **k: reads.append((a, k)) or {"text": "page"})
+    monkeypatch.setattr(server, "WARMUP_QUERIES", ["Week 1 agenda"])
+    server.warm_cache_once()
+    err = capsys.readouterr().err
+    assert "warmup_failed" not in err, err
+    assert reads and reads[0][0][0] == "https://www.sujeeth.org/circle" and reads[0][1].get("refresh") is True
+    assert '"failed_queries": 0' in err
+

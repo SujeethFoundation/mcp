@@ -187,12 +187,15 @@ def in_thread(fn):
     FastMCP calls a plain `def` tool directly on the event loop, so a search that waits on the search apps
     stops the whole process from accepting or answering anything else (including /healthz) until it ends.
     The wrapper is async, so FastMCP awaits it, and keeps the name, docstring and signature FastMCP reads.
+    Code that is not running on the event loop and wants the result directly (the warm-up thread) must call
+    the plain function as `tool.sync(...)`. Calling the wrapper itself returns a coroutine that never runs.
     """
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(_tool_pool, functools.partial(fn, *args, **kwargs))
 
+    wrapper.sync = fn
     return wrapper
 
 
@@ -1101,7 +1104,7 @@ def warm_cache_once():
     seen, pages, failures = set(), 0, 0
     for query in WARMUP_QUERIES:
         try:
-            found = search_sujeeth_foundation(query, limit=4, full_documents=False)
+            found = search_sujeeth_foundation.sync(query, limit=4, full_documents=False)
             targets = []
             for item in found.get("results", []) or []:
                 url = str(item.get("url") or "").strip()

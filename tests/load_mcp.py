@@ -17,12 +17,18 @@ machine can send far more than the visitor mode can:
     python tests/load_mcp.py --url <...>/mcp --rate 30 --duration 60
 It prints a warning if this machine could not keep up, because then the server was not the limit.
 
+Ramp mode finds where failures start in one run: the rate climbs steadily from --rate to --ramp-to over --duration,
+and the report shows, by when each request STARTED, the offered rate, latency, failures and answers slower than
+--sla. Raise --workers so this machine never holds the rate back (a pool that fills up hides the overload):
+    python tests/load_mcp.py --url <...>/mcp --rate 20 --ramp-to 120 --duration 600 --workers 4000 --timeout 45 --sla 45
+
 --handshake adds an initialize, a notifications/initialized and a tools/list before each call, three more requests.
 Some clients do this on every call in stateless mode. It matters for the per-minute request limits, so use it to see
 how many requests a real chat might cost. Press Ctrl+C to stop early; what finished is still reported.
 """
 import argparse
 import json
+import math
 import os
 import random
 import statistics
@@ -62,6 +68,10 @@ def note_no_answer(exc):
     kind = type(inner).__name__
     if kind in ("URLError", "error") and reason is not None and not isinstance(reason, BaseException):
         kind = f"URLError({str(reason)[:40]})"
+    # urllib wraps a failure to CONNECT (including the TLS handshake) in URLError and lets a failure while
+    # WAITING FOR THE REPLY through unwrapped. That tells a path that never opened (this machine, the network or
+    # the platform's front end) from a server that accepted the request and never answered.
+    kind = ("while connecting: " if isinstance(exc, urllib.error.URLError) else "after connecting, waiting for the reply: ") + kind
     with _no_answer_lock:
         NO_ANSWER.append((time.perf_counter() - RUN_START[0], kind))
 
@@ -122,6 +132,25 @@ def parse_body(raw, content_type):
         return None
 
 
+# Words that can follow a question, so the same question arrives worded differently.
+VARIATIONS = [
+    "for a first-generation college student", "if I have no experience", "at a small company", "as an international student",
+    "in healthcare", "in tech", "for a nonprofit job", "before graduation", "while working part time", "as a career changer",
+    "this semester", "for an internship", "in my first job", "for a remote role", "in a new city", "with a low GPA",
+    "after a layoff", "at a big company", "in finance", "in marketing", "in education", "for a government job",
+]
+
+
+def pick_question(vary_share=0.0, rng=random):
+    """A question to ask. With vary_share above zero, that share of questions gets extra words and a random number, so
+    it is a question nobody asked before: the result cache and the question-embedding cache cannot answer it, and every
+    search does its full work. Without it, 40 fixed questions are asked over and over and the caches answer most of them."""
+    question = rng.choice(QUESTIONS)
+    if vary_share > 0 and rng.random() < vary_share:
+        question = f"{question.rstrip('?.')} {rng.choice(VARIATIONS)}? ref {rng.randrange(10 ** 6)}"
+    return question
+
+
 def tool_payload(message):
     """(structured result dict, is_error) from a tools/call answer."""
     result = (message or {}).get("result") or {}
@@ -161,19 +190,25 @@ def main():
     ap.add_argument("--think", type=float, default=20.0, help="seconds a visitor waits between questions")
     ap.add_argument("--ramp", type=float, default=10.0, help="spread the visitors' start times over this many seconds")
     ap.add_argument("--read-chance", type=float, default=0.5, help="chance a visitor reads pages after a search (0 to 1)")
+    ap.add_argument("--vary-share", type=float, default=0.0,
+                    help="share of searches (0 to 1) sent as questions nobody asked before, so caches cannot answer them. "
+                         "1 is the worst case for the app; 0.7 is a plausible mix; 0 asks the same 40 questions (caches answer most)")
     ap.add_argument("--handshake", action="store_true", help="send initialize, initialized and tools/list before each call")
     ap.add_argument("--rate", type=float, default=0.0, help="fixed-rate mode: searches per second (ignores --visitors/--calls/--ramp/--think)")
     ap.add_argument("--duration", type=float, default=60.0, help="fixed-rate mode: seconds to keep sending")
     ap.add_argument("--workers", type=int, default=500, help="fixed-rate mode: most requests this machine keeps in flight at once")
     ap.add_argument("--ignore-first", type=float, default=-1.0, help="also report the searches that finished after this many "
                     "seconds, to leave out the warm-up (default: 60 for a fixed-rate run of 180s or more)")
+    ap.add_argument("--ramp-to", type=float, default=0.0, help="fixed-rate mode: climb steadily from --rate to this rate over --duration")
+    ap.add_argument("--sla", type=float, default=45.0, help="seconds; an answer slower than this, or any failure, counts as an SLA breach")
     ap.add_argument("--max-requests", type=int, default=600, help="stop after this many HTTP requests")
     ap.add_argument("--timeout", type=float, default=60.0)
     args = ap.parse_args()
     if urlparse(args.url).scheme not in ("http", "https"):
         sys.exit("--url must start with http:// or https://")
     if args.rate > 0:
-        args.max_requests = max(args.max_requests, int(args.rate * args.duration * 1.5) + 100)
+        average = (args.rate + (args.ramp_to or args.rate)) / 2
+        args.max_requests = max(args.max_requests, int(average * args.duration * 1.5) + 100)
 
     lock = threading.Lock()
     results = []  # (kind, status, seconds, tool_failed)
@@ -230,7 +265,7 @@ def main():
                 record(client, "initialized", "notifications/initialized", notify=True)
                 record(client, "tools/list", "tools/list", {})
             sent = record(client, "search", "tools/call", {"name": "search_sujeeth_foundation",
-                                                           "arguments": {"query": random.choice(QUESTIONS)}})
+                                                           "arguments": {"query": pick_question(args.vary_share)}})
             if sent is None:
                 return
             with lock:
@@ -256,7 +291,7 @@ def main():
             record(client, "initialized", "notifications/initialized", notify=True)
             record(client, "tools/list", "tools/list", {})
         sent = record(client, "search", "tools/call", {"name": "search_sujeeth_foundation",
-                                                       "arguments": {"query": random.choice(QUESTIONS)}})
+                                                       "arguments": {"query": pick_question(args.vary_share)}})
         if sent is None:
             return
         with lock:
@@ -268,12 +303,26 @@ def main():
             record(client, "get_documents", "tools/call", {"name": "get_documents",
                                                            "arguments": {"urls": urls[:2], "max_chars": 6000}})
 
+    def due_time(n):
+        """Seconds after the start at which the n-th search is due. A steady rate, or a linear ramp from --rate
+        to --ramp-to over --duration (arrivals so far = r0*t + (r1-r0)*t^2/(2*T); this solves it for t)."""
+        r0, r1, total = args.rate, (args.ramp_to or args.rate), args.duration
+        if r1 == r0:
+            return n / r0
+        a = (r1 - r0) / (2 * total)
+        disc = r0 * r0 + 4 * a * n
+        return float("inf") if disc < 0 else (-r0 + math.sqrt(disc)) / (2 * a)
+
     def generator():
-        """Open loop: start one search every 1/rate seconds, whether or not earlier ones have finished."""
+        """Open loop: start searches on schedule, whether or not earlier ones have finished."""
+        try:
+            threading.stack_size(256 * 1024)  # thousands of waiting workers stay cheap
+        except (ValueError, RuntimeError):
+            pass
         pool = ThreadPoolExecutor(max_workers=max(1, args.workers))
         t0, n = time.perf_counter(), 0
         while not state["stop"] and time.perf_counter() - t0 < args.duration:
-            due = t0 + n / args.rate
+            due = t0 + due_time(n)
             now = time.perf_counter()
             if now < due:
                 time.sleep(min(0.002, due - now))
@@ -288,7 +337,9 @@ def main():
         pool.shutdown(wait=True)
 
     if args.rate > 0:
-        print(f"Fixed rate {args.rate:g} searches a second for {args.duration:g}s (up to {args.workers} in flight), "
+        shape = (f"Ramp from {args.rate:g} to {args.ramp_to:g} searches a second over {args.duration:g}s"
+                 if args.ramp_to and args.ramp_to != args.rate else f"Fixed rate {args.rate:g} searches a second for {args.duration:g}s")
+        print(f"{shape} (up to {args.workers} in flight, SLA {args.sla:g}s), "
               f"handshake {'on' if args.handshake else 'off'}, read chance {args.read_chance:g}, "
               f"key {'sent' if args.key else 'NOT sent'}")
     else:
@@ -296,6 +347,10 @@ def main():
           f"handshake {'on' if args.handshake else 'off'}, key {'sent' if args.key else 'NOT sent'} (cap {args.max_requests} requests)")
     if not args.key:
         print("  No key: this machine counts in the public bucket (120 requests a minute by default) and will hit HTTP 429.")
+    if args.vary_share > 0:
+        print(f"  Questions: {args.vary_share:.0%} are new wordings nobody asked before, so the result cache and the question-embedding cache answer few of them.")
+    else:
+        print(f"  Questions: the same {len(QUESTIONS)} asked over and over, so caches will answer most of them. Add --vary-share 1 to measure the uncached cost.")
     print("A progress line prints every 10 seconds. Press Ctrl+C to stop early; the results so far are still reported.")
 
     started = time.perf_counter()
@@ -337,7 +392,7 @@ def main():
               "Raise --max-requests or use fewer visitors to test the shape you meant.")
     if args.rate > 0:
         sending = max(1e-9, state.get("last_sent_at", started) - started)  # until the last request really left
-        print(f"Target {args.rate:g} searches a second. Scheduled {state['scheduled']}; the last of the {state['sent']} "
+        print(f"Target {args.rate:g}{('-' + format(args.ramp_to, 'g')) if args.ramp_to and args.ramp_to != args.rate else ''} searches a second. Scheduled {state['scheduled']}; the last of the {state['sent']} "
               f"sent left this machine at {sending:.0f}s ({state['sent'] / sending:.1f} requests a second on average). "
               f"Most in flight at once: {state['peak']}.")
         if state["peak"] >= args.workers:
@@ -374,6 +429,35 @@ def main():
             p95 = f"{percentile(oks, 95):6.2f}s" if oks else "     -"
             top = f"{max(oks):6.2f}s" if oks else "     -"
             print(f"  {lo:3d}-{lo + width:<4d} {len(bucket):6d} {len(oks):6d}  {med} {p95} {top}  {len(late):9d}  {notok}")
+    if args.rate > 0 and events:
+        searches = [(max(0.0, at - sec), st, sec, oc) for at, k, st, sec, oc in events if k == "search"]
+        width = 30 if args.duration >= 180 else 10
+        top = max(t for t, _, _, _ in searches)
+        print(f"Offered load and outcome, by when each search STARTED ({width}-second buckets; SLA {args.sla:g}s):")
+        print("  start      offered/s  answered  median     p95   failed  late  not-ok   breach%")
+        first_breach, total_breach = None, 0
+        for lo in range(0, int(top) + 1, width):
+            bucket = [(st, sec, oc) for t, st, sec, oc in searches if lo <= t < lo + width]
+            if not bucket:
+                continue
+            answered = [sec for st, sec, oc in bucket if st == 200]
+            failed = sum(1 for st, sec, oc in bucket if st != 200)
+            late = sum(1 for st, sec, oc in bucket if st == 200 and sec > args.sla)
+            notok = sum(1 for st, sec, oc in bucket if st == 200 and oc != "ok")
+            breaches = failed + late + notok
+            total_breach += breaches
+            pct = 100.0 * breaches / len(bucket)
+            mark = ""
+            if first_breach is None and pct >= 1.0:
+                first_breach = (lo, len(bucket) / width)
+                mark = "  <- first bucket with 1% or more breaches"
+            med = f"{statistics.median(answered):6.2f}s" if answered else "     -"
+            p95 = f"{percentile(answered, 95):6.2f}s" if answered else "     -"
+            print(f"  {lo:3d}-{lo + width:<4d} {len(bucket) / width:9.1f} {len(answered):9d}  {med} {p95} {failed:7d} {late:5d} {notok:7d} {pct:8.1f}{mark}")
+        print(f"SLA breaches (failed, slower than {args.sla:g}s, or not a working answer): {total_breach} of {len(searches)} "
+              f"({100.0 * total_breach / len(searches):.1f}%)."
+              + (f" First bucket with 1% or more began at {first_breach[0]}s, at about {first_breach[1]:.0f} searches a second offered."
+                 if first_breach else " No bucket reached 1%."))
     cutoff = args.ignore_first if args.ignore_first >= 0 else (60.0 if args.rate > 0 and args.duration >= 180 else 0.0)
     if cutoff > 0:
         steady = [sec for at, k, st, sec, oc in events if k == "search" and st == 200 and at >= cutoff]
