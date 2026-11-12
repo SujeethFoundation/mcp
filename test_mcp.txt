@@ -1,2 +1,0 @@
-$env:MCP_TRUSTED_KEY = "SUJ33TH"
-python tests/load_mcp.py --url https://sujeethmcp-c3hjg6g4c2f2f2dn.eastus-01.azurewebsites.net/mcp --rate 20 --ramp-to 120 --duration 60 --workers 4000 --timeout 45 --sla 45
