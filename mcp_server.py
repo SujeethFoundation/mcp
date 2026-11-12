@@ -281,6 +281,18 @@ def drop_excluded_wiki(items):
     ]
 
 
+def page_identity(item):
+    """One key for a page however it was reached: no scheme, no leading www., no fragment, no trailing slash, lower case.
+    https://www.sujeeth.org/circle/ and http://sujeeth.org/circle#top are the same page. Falls back to the title."""
+    url = str(item.get("url") or "").strip().split("#", 1)[0]
+    url = re.sub(r"^[a-zA-Z][a-zA-Z0-9+.-]*://", "", url)
+    host, slash, rest = url.partition("/")
+    host = host.lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return (host + slash + rest).rstrip("/").lower() or str(item.get("title") or "").strip().lower()
+
+
 def merge_sources(wiki_items, website_items):
     """Alternate wiki and website results, wiki first, so neither source crowds out the other."""
     merged = []
@@ -328,21 +340,21 @@ def combine_with_best_bets(wiki_items, website_items, limit):
     and spotlights sit outside the limit and the per-source cap. Each URL appears once."""
     best, spotlights, seen = [], [], set()
     for item in website_items:
-        identity = str(item.get("url") or "").lower()
+        identity = page_identity(item) if item.get("url") else ""
         if item.get("best_bet") and identity and identity not in seen:
             seen.add(identity)
             best.append(item)
     # Spotlight pages the website search reserved for career questions go right after best
     # bets, so wiki and Teal results cannot crowd them out of the limit.
     for item in website_items:
-        identity = str(item.get("url") or "").lower()
+        identity = page_identity(item) if item.get("url") else ""
         if item.get("spotlight") and not item.get("best_bet") and identity and identity not in seen:
             seen.add(identity)
             spotlights.append(item)
     normal = []
     prioritized = lambda x: x.get("best_bet") or x.get("spotlight")
     for item in merge_sources(wiki_items, [x for x in website_items if not prioritized(x)]):
-        identity = str(item.get("url") or item.get("title") or "").lower()
+        identity = page_identity(item)
         if identity and identity not in seen:
             seen.add(identity)
             normal.append(item)
@@ -500,7 +512,7 @@ def attach_full_documents(results, max_documents, per_document_chars):
     # do not count against max_documents, which limits only the ordinary results after them.
     targets, seen, ordinary = [], set(), 0
     for item in results:
-        key = str(item.get("url") or "").strip().lower()
+        key = page_identity(item) if item.get("url") else ""
         if not key or key in seen:
             continue
         if item.get("best_bet") or item.get("spotlight"):
