@@ -5,10 +5,13 @@ import functools
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
@@ -179,6 +182,71 @@ http.mount("https://", _adapter)
 http.mount("http://", _adapter)
 
 _tool_pool = ThreadPoolExecutor(max_workers=TOOL_THREADS, thread_name_prefix="mcp-tool")
+_tool_state = {"in_flight": 0, "peak_in_flight": 0}   # tool calls running or waiting for a thread, and the most seen at once
+_tool_lock = threading.Lock()
+
+
+_PROCESS_STARTED = time.time()
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except Exception:
+        return None
+
+
+def _rss_mb():
+    """Resident memory of this process in MB (Linux only; None elsewhere)."""
+    try:
+        return round(int((_read("/proc/self/statm") or "").split()[1]) * os.sysconf("SC_PAGE_SIZE") / 1048576, 1)
+    except Exception:
+        return None
+
+
+def _cgroup():
+    """The container's CPU limit (cores), memory limit (MB) and total time its CPU was throttled, from cgroup v2 or v1.
+    A value the platform does not expose is None, so an unknown limit never reads as 'no limit'."""
+    out = {"cpu_limit_cores": None, "mem_limit_mb": None, "cpu_throttled_seconds": None}
+    try:
+        quota = _read("/sys/fs/cgroup/cpu.max")                       # v2: "max 100000" or "200000 100000"
+        if quota:
+            part = quota.split()
+            if len(part) == 2 and part[0] != "max":
+                out["cpu_limit_cores"] = round(int(part[0]) / int(part[1]), 2)
+        else:                                                         # v1
+            q, p = _read("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"), _read("/sys/fs/cgroup/cpu/cpu.cfs_period_us")
+            if q and p and int(q) > 0:
+                out["cpu_limit_cores"] = round(int(q) / int(p), 2)
+        mem = _read("/sys/fs/cgroup/memory.max") or _read("/sys/fs/cgroup/memory/memory.limit_in_bytes")
+        if mem and mem.isdigit() and int(mem) < (1 << 50):
+            out["mem_limit_mb"] = round(int(mem) / 1048576)
+        stat = _read("/sys/fs/cgroup/cpu.stat") or _read("/sys/fs/cgroup/cpu/cpu.stat")
+        if stat:
+            vals = dict(line.split()[:2] for line in stat.splitlines() if len(line.split()) >= 2)
+            if "throttled_usec" in vals:
+                out["cpu_throttled_seconds"] = round(int(vals["throttled_usec"]) / 1e6, 2)
+            elif "throttled_time" in vals:
+                out["cpu_throttled_seconds"] = round(int(vals["throttled_time"]) / 1e9, 2)
+    except Exception:
+        pass
+    return out
+
+
+def process_info():
+    """Who is answering, how long it has run, and how much memory and CPU it uses, so a restart shows as a new pid or a
+    drop in uptime and a busy instance shows as CPU time climbing faster than the clock."""
+    return {
+        "pid": os.getpid(),
+        "instance": os.getenv("WEBSITE_INSTANCE_ID") or socket.gethostname(),
+        "started_at": datetime.fromtimestamp(_PROCESS_STARTED, timezone.utc).isoformat(),
+        "uptime_seconds": int(time.time() - _PROCESS_STARTED),
+        "rss_mb": _rss_mb(),
+        "cpu_seconds": round(time.process_time(), 2),   # CPU time used by every thread of this process since it started
+        "cpu_count": os.cpu_count(),
+        **_cgroup(),
+    }
 
 
 def in_thread(fn):
@@ -193,7 +261,14 @@ def in_thread(fn):
     @functools.wraps(fn)
     async def wrapper(*args, **kwargs):
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(_tool_pool, functools.partial(fn, *args, **kwargs))
+        with _tool_lock:
+            _tool_state["in_flight"] += 1
+            _tool_state["peak_in_flight"] = max(_tool_state["peak_in_flight"], _tool_state["in_flight"])
+        try:
+            return await loop.run_in_executor(_tool_pool, functools.partial(fn, *args, **kwargs))
+        finally:
+            with _tool_lock:
+                _tool_state["in_flight"] -= 1
 
     wrapper.sync = fn
     return wrapper
@@ -203,7 +278,7 @@ def auth(key):
     return {"x-functions-key": key} if key else {}
 
 
-def get_json(url, key="", params=None):
+def _get_json_raw(url, key="", params=None):
     response = http.get(
         url,
         headers=auth(key),
@@ -215,7 +290,7 @@ def get_json(url, key="", params=None):
     return data if isinstance(data, dict) else {"data": data}
 
 
-def post_json(url, payload, key=""):
+def _post_json_raw(url, payload, key=""):
     response = http.post(
         url,
         headers={
@@ -228,6 +303,59 @@ def post_json(url, payload, key=""):
     response.raise_for_status()
     data = response.json()
     return data if isinstance(data, dict) else {"data": data}
+
+
+_downstream = {}   # service -> {"calls", "errors", "recent": [(finished at, seconds)]}
+_downstream_lock = threading.Lock()
+
+
+def _service_of(url):
+    for name, base in (("websearch", WEBSEARCH_URL), ("wikisearch", WIKISEARCH_URL), ("ontology", ONTOLOGY_URL)):
+        if base and str(url).startswith(base):
+            return name
+    return "other"
+
+
+def _note_call(url, seconds, failed):
+    with _downstream_lock:
+        entry = _downstream.setdefault(_service_of(url), {"calls": 0, "errors": 0, "recent": deque(maxlen=3000)})
+        entry["calls"] += 1
+        entry["errors"] += 1 if failed else 0
+        entry["recent"].append((time.time(), seconds))
+
+
+def downstream_stats():
+    """Per backend app: calls, errors, and over the last minute the call count, median and p95 time, and the seconds this app
+    spent waiting on it (divide by 60 for the average number of calls in progress)."""
+    now, out = time.time(), {}
+    with _downstream_lock:
+        snapshot = {k: (v["calls"], v["errors"], list(v["recent"])) for k, v in _downstream.items()}
+    for name, (calls, errors, recent) in snapshot.items():
+        last = sorted(d for t, d in recent if now - t <= 60)
+        pick = lambda q: round(1000 * last[min(len(last) - 1, int(q * len(last)))]) if last else None
+        out[name] = {"calls": calls, "errors": errors, "last_minute_calls": len(last), "p50_ms": pick(0.5),
+                     "p95_ms": pick(0.95), "waited_seconds_last_minute": round(sum(last), 1)}
+    return out
+
+
+def get_json(url, key="", params=None):
+    began, failed = time.perf_counter(), True
+    try:
+        data = _get_json_raw(url, key, params)
+        failed = False
+        return data
+    finally:
+        _note_call(url, time.perf_counter() - began, failed)
+
+
+def post_json(url, payload, key=""):
+    began, failed = time.perf_counter(), True
+    try:
+        data = _post_json_raw(url, payload, key)
+        failed = False
+        return data
+    finally:
+        _note_call(url, time.perf_counter() - began, failed)
 
 
 def error_result(exc):
@@ -591,6 +719,25 @@ async def healthz(request):
     """Liveness probe for the hosting platform. Does not call any backend."""
     from starlette.responses import JSONResponse
     return JSONResponse({"status": "ok"})
+
+
+@mcp.custom_route("/status", methods=["GET"])
+async def status(request):
+    """Instance, uptime, memory, CPU, tool-thread load and backend call times, for watch_all.py. Needs the trusted key
+    header, so it is not public."""
+    import hmac
+    from starlette.responses import JSONResponse
+    sent = request.headers.get(TRUSTED_KEY_HEADER, "")
+    if not TRUSTED_KEY or not hmac.compare_digest(sent.encode(), TRUSTED_KEY.encode()):
+        return JSONResponse({"error": "not found"}, status_code=404)
+    with _tool_lock:
+        in_flight, peak = _tool_state["in_flight"], _tool_state["peak_in_flight"]
+    return JSONResponse({
+        "status": "ok",
+        "process": process_info(),
+        "tool_pool": {"threads": TOOL_THREADS, "in_flight": in_flight, "queued": max(0, in_flight - TOOL_THREADS), "peak_in_flight": peak},
+        "downstream": downstream_stats(),
+    }, headers={"Cache-Control": "no-store"})
 
 
 @mcp.custom_route("/", methods=["GET"])
