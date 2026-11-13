@@ -17,9 +17,11 @@ The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mc
 | Tool | Use it to |
 |---|---|
 | `search_sujeeth_foundation` | The main tool. Resolves the question through the ontology, searches website and wiki, de-duplicates by URL, and reports whether the answer needs clarification or a service failed |
-| `get_documents` | Read more of the results. Pass up to three `urls` exactly as returned, in one call (they are read at the same time). Foundation sites and the wiki return page text; third-party sites return a short excerpt only |
+| `get_documents` | Read more of the results. Pass up to `MAX_BATCH_DOCUMENTS` (default 2) `urls` exactly as returned, in one call (they are read at the same time). `max_chars` defaults to `DOCUMENT_DEFAULT_CHARS` (12000) and is at most 20000. A page is read once and kept for 15 minutes whatever size is asked for. Foundation sites and the wiki return page text; third-party sites return a short excerpt only |
 | `search_website` | Search ontology-approved websites only |
 | `search_wiki` | Search the GitHub wiki only |
+
+Wiki results carry their whole page in a `document` field (`WIKI_FULL_TEXT=true`, each page cut at `WIKI_FULL_TEXT_CHARS`, default 12000); other results are excerpts. The tool descriptions and the server `instructions` that agents read are built from one set of constants in `mcp_server.py`, so the page limit and the statistics rule read the same everywhere.
 
 **Admin tools** (hidden unless `MCP_ADMIN_TOOLS=true`, which is meant for local testing): `check_services`, `resolve_ontology`, `get_ontology_context`. They expose backend health and the ontology's internal structure, so they are off in production.
 
@@ -27,7 +29,7 @@ The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mc
 
 - `needs_clarification` and `suggested_question`: set when no concept matched, no domain was approved, nothing useful came back, or two weaker concept matches are nearly tied. Explicit matches (for example both "Sujeeth Foundation" and "donation" named in the question) are not treated as ambiguity.
 - `service_degraded` and `service_errors`: set when a backend failed. The agent is told results may be incomplete, to tell the user, and not to treat missing results as proof that nothing exists. An outage never turns into a question asking the customer to rephrase.
-- `agent_instructions`: every result tells the agent to cite URLs, never to search outside ontology-approved domains, and never to quote program statistics (counts, rates, placement or engagement figures) from these results. Current numbers come from sujeeth.org.
+- `agent_instructions`: every result tells the agent to cite URLs, never to search outside ontology-approved domains, and to quote program statistics (counts, rates, placement or engagement figures) only from a result on sujeeth.org (subdomains such as topics.sujeeth.org count), with its url. Statistics from the wiki or third-party pages are never quoted; the agent points to sujeeth.org instead.
 - Results carry `source`, `url`, `snippet`, `score`, `domain`, `concepts`, and `chunk_id`. Scores come from different engines for website and wiki results and cannot be compared.
 
 ### What is never returned

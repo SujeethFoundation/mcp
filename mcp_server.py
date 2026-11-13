@@ -152,7 +152,12 @@ VERBOSE_ONTOLOGY = flag("SEARCH_VERBOSE_ONTOLOGY", "false")
 # always written to the log, so you can read them in Application Insights without the flag.
 TIMINGS = flag("SEARCH_TIMINGS", "false")
 # Most pages one get_documents call will read (they are read in parallel).
-MAX_BATCH_DOCUMENTS = max(1, int(setting("MAX_BATCH_DOCUMENTS", "3") or 3))
+# The agent is told to read this many pages per question, so the tool and the instructions agree.
+MAX_BATCH_DOCUMENTS = max(1, int(setting("MAX_BATCH_DOCUMENTS", "2") or 2))
+# The most text one page read returns (the search apps' own limit). A read with no max_chars
+# gets DOCUMENT_DEFAULT_CHARS, enough for nearly every Foundation page in one read.
+DOCUMENT_MAX_CHARS = 20000
+DOCUMENT_DEFAULT_CHARS = max(500, min(int(setting("DOCUMENT_DEFAULT_CHARS", "12000") or 12000), DOCUMENT_MAX_CHARS))
 # Pages read through get_documents are kept in memory so a repeat read does not
 # call the search apps again. DOCUMENT_CACHE_SECONDS=0 turns this off. A page changed on the
 # site can show its old text for up to this long (a wiki page for up to this long plus the
@@ -656,10 +661,8 @@ def assess_quality(resolution, results, errors):
         "If needs_clarification is true, ask the suggested question before "
         "making a definitive claim. Use ontology context to explain "
         "available concepts. Never guess a domain or search outside "
-        "ontology-approved domains. Otherwise answer from the results "
-        "and cite their URLs. Never quote program statistics (counts, rates, "
-        "placement or engagement figures) from these results; point the user "
-        "to sujeeth.org for current numbers."
+        "ontology-approved domains. Otherwise answer from the results, reading "
+        "pages as described below, and cite their URLs. " + STATS_RULE
     )
     if service_degraded:
         instructions += (
@@ -677,35 +680,57 @@ def assess_quality(resolution, results, errors):
     }
 
 
-DOCUMENT_INSTRUCTIONS = (
-    "Cite the url. Never quote program statistics (counts, rates, placement or "
-    "engagement figures) from this text; point the user to sujeeth.org for current "
-    "numbers. If excerpt_only is true, summarize briefly and link to the source."
+# The rule about program statistics, in one place so every response says it the same way.
+STATS_RULE = (
+    "Quote program statistics (counts, rates, placement or engagement figures) only from a result "
+    "whose domain is sujeeth.org (a subdomain such as topics.sujeeth.org counts), and cite its url. "
+    "Never quote them from the wiki, third-party pages or your own totals; for those, point the "
+    "user to sujeeth.org for current numbers."
+)
+
+DOCUMENT_INSTRUCTIONS = "Cite the url. " + STATS_RULE + (
+    " If excerpt_only is true, summarize briefly and link to the source."
+)
+
+# What to do when a page is cut off. Both the search responses and get_documents say the same thing.
+TRUNCATED_INSTRUCTIONS = (
+    f"If a document is truncated and the part you need is missing, call get_documents again with "
+    f"that url and max_chars {DOCUMENT_MAX_CHARS}. If it is still truncated, say the page is longer "
+    f"than what you read and link to it."
 )
 
 FULL_DOCUMENT_INSTRUCTIONS = (
-    " Results with a document field carry the full page text for that result. Answer from "
-    "the document, not the snippet, and cite the url. If a document has excerpt_only set to "
-    "true, it is third-party content: summarize briefly and link to the source, do not "
-    "reproduce it. If a document is truncated, say so and call get_documents with its url for more."
+    " Results with a document field carry the page text for that result. Answer from the "
+    "document, not the snippet, and cite the url. If a document has excerpt_only set to true, "
+    "it is third-party content: summarize briefly and link to the source, do not reproduce it. "
+    + TRUNCATED_INSTRUCTIONS
 )
 
 # Used when a search returns excerpts only. This sits beside the results, which is where the
 # agent decides whether to answer or to read a page.
-EXCERPT_INSTRUCTIONS = (
-    " Results are excerpts and may stop mid-sentence. If they do not fully answer the question "
-    "(steps, an agenda, a list, dates, exact wording, or an excerpt that looks cut off), call "
-    "get_documents once, with the urls of every page you need, before answering, starting with "
-    "a best_bet or spotlight. Read at most two pages per question, and read them in one call. "
-    "Results whose domain is not sujeeth.org are third-party: summarize briefly and link "
-    "instead of reading them. Do not answer program details from an excerpt that does not "
-    "contain them."
+READ_PAGES_INSTRUCTIONS = (
+    f"call get_documents once, with the urls of every page you need, before answering, starting "
+    f"with a best_bet or spotlight. Read at most {MAX_BATCH_DOCUMENTS} pages per question, and read "
+    f"them in one call. Results whose domain is not sujeeth.org are third-party: summarize briefly "
+    f"and link instead of reading them. Do not answer program details from an excerpt that does not "
+    f"contain them."
 )
 
-GET_DOCUMENTS_INSTRUCTIONS = DOCUMENT_INSTRUCTIONS + (
-    " If truncated is true and the part you need is missing, call get_documents again with that "
-    "url and a larger max_chars (up to 12000)."
+EXCERPT_INSTRUCTIONS = (
+    " Results are excerpts and may stop mid-sentence. If they do not fully answer the question "
+    "(steps, an agenda, a list, dates, exact wording, or an excerpt that looks cut off), "
+    + READ_PAGES_INSTRUCTIONS
 )
+
+# Used when the wiki results carry their whole page and the other results are excerpts.
+WIKI_DOCUMENT_INSTRUCTIONS = (
+    " Wiki results carry the whole page in their document field. Answer from it, not the snippet, "
+    "and cite the url; read a wiki page with get_documents only if its document is truncated and "
+    "the part you need is missing. Every other result is an excerpt and may stop mid-sentence: if "
+    "the excerpts do not fully answer the question, " + READ_PAGES_INSTRUCTIONS
+)
+
+GET_DOCUMENTS_INSTRUCTIONS = DOCUMENT_INSTRUCTIONS + " " + TRUNCATED_INSTRUCTIONS
 
 PRIORITY_INSTRUCTIONS = (
     " Results flagged best_bet or spotlight are curated pages. Present them first, "
@@ -713,9 +738,73 @@ PRIORITY_INSTRUCTIONS = (
     "and one sentence on why it fits."
 )
 
+
+CITE_AND_STATS = "Cite the url. " + STATS_RULE
+
+# What the agent reads when it lists the tools. They are written for the agent: what each tool is
+# for, when to use it, and what to do with what comes back. Implementation detail stays in code comments.
+SEARCH_DESCRIPTION = (
+    "Search the Sujeeth Foundation website and GitHub wiki together. Use this first for any question "
+    "about the Foundation: the Career Circles program and its six-week curriculum, mentoring, "
+    "volunteering, donating, partnering, annual reports, blog posts and career resources. Write the "
+    "query as the few distinctive words a page would contain (for example 'week 3 resume agenda'), "
+    "not as a full sentence. Each result has a title, url, source (website or wiki) and matched "
+    "concepts; results flagged best_bet or spotlight are curated pages. "
+    + ("A wiki result carries its whole page in a document field; every other result" if WIKI_FULL_TEXT
+       else "Every result")
+    + " is an excerpt that can stop mid-sentence, and get_documents reads the full page. The response "
+    "includes agent_instructions and, when the question is ambiguous, a suggested_question to ask. "
+    "Leave full_documents, max_documents and document_max_chars at their defaults."
+)
+
+WEBSITE_SEARCH_DESCRIPTION = (
+    "Search only the ontology-approved Foundation websites (not the wiki). Prefer "
+    "search_sujeeth_foundation. Use this only when you already hold concepts and domains from an "
+    "earlier search and want website results alone. Results are excerpts; get_documents reads full pages."
+)
+
+WIKI_SEARCH_DESCRIPTION = (
+    "Search only the Foundation's GitHub wiki: mentor, student, donor and partner FAQs, the weekly "
+    "agendas for weeks 1 to 6, and essays on the program's ideas. Prefer search_sujeeth_foundation "
+    "unless you want wiki pages alone. "
+    + ("The best wiki results carry their whole page in a document field."
+       if WIKI_FULL_TEXT else "Results are excerpts; get_documents reads full pages.")
+)
+
+GET_DOCUMENTS_DESCRIPTION = (
+    "Read the full text of pages that search results pointed to. Call it only when the results do not "
+    "answer the question (steps, an agenda, a list, dates, exact wording, or a result that stops "
+    f"mid-sentence). Pass every url you need in one call, at most {MAX_BATCH_DOCUMENTS}, exactly as "
+    "the search results returned them. Foundation pages and the wiki return the page text; "
+    "third-party pages return only a short excerpt, so link to the source instead of reproducing it. "
+    "Each document has status, title, text and truncated (true means more of the page exists). If it is "
+    f"truncated and the part you need is missing, call again with that url and max_chars up to "
+    f"{DOCUMENT_MAX_CHARS}."
+)
+
+SERVER_INSTRUCTIONS = (
+    "Knowledge about the Sujeeth Foundation: its Career Circles student mentorship program, mentoring, "
+    "volunteering, donating and partnering. Start with search_sujeeth_foundation; it searches the "
+    "website and the wiki together. "
+    + ("Wiki results carry their whole page; other results are excerpts. " if WIKI_FULL_TEXT
+       else "Results are excerpts. ")
+    + f"If the excerpts do not answer the question, call get_documents once with the urls you need "
+    f"(at most {MAX_BATCH_DOCUMENTS}). Cite the url for every claim. " + STATS_RULE
+)
+
 # Total characters of document text attached to one search response, so a broad question
 # cannot flood the conversation.
 DOCUMENT_CHAR_BUDGET = int(setting("FULL_DOCUMENT_CHAR_BUDGET", "60000") or 60000)
+
+
+def fold_snippet(item):
+    """Once a result carries its whole page, drop the snippet: it only repeats part of the page.
+
+    A truncated document keeps its snippet, because the best passage may lie past the cut.
+    """
+    doc = item.get("document") or {}
+    if doc.get("text") and not doc.get("truncated"):
+        item.pop("snippet", None)
 
 
 def attach_full_documents(results, max_documents, per_document_chars):
@@ -750,6 +839,12 @@ def attach_full_documents(results, max_documents, per_document_chars):
                 "from_search": True,
             }
         try:
+            if is_foundation_page(item) and item.get("url"):
+                # A Foundation page is read whole, by url. That read is cached, so a later
+                # get_documents of the same page costs nothing. (A read by chunk_id returns only
+                # the matched passage and its neighbours, not the page.)
+                return fetch_document(item.get("url"), None, item.get("source"), 1, per_document_chars)
+            # Third-party pages come back as an excerpt around the matched passage.
             return fetch_document(
                 item.get("url"), item.get("chunk_id"), item.get("source"), 3, per_document_chars
             )
@@ -780,21 +875,11 @@ def attach_full_documents(results, max_documents, per_document_chars):
             "truncated": bool(doc.get("truncated")),
             "note": doc.get("note"),
         }
+        fold_snippet(item)
         summary["returned"] += 1
         summary["excerpt_only"] += 1 if excerpt else 0
         summary["from_search_text"] += 1 if doc.get("from_search") else 0
     return summary
-
-
-WIKI_DOCUMENT_INSTRUCTIONS = (
-    " Wiki results carry the whole page in their document field. Answer from it, not the snippet, "
-    "and cite the url; call get_documents for a wiki page only if its document is truncated and the "
-    "part you need is missing. Every other result is an excerpt and may stop mid-sentence: if the "
-    "excerpts do not fully answer the question, call get_documents once, with the urls of every page "
-    "you need, before answering. Read at most two pages per question, and read them in one call. "
-    "Results whose domain is not sujeeth.org are third-party: summarize briefly and link instead of "
-    "reading them. Do not answer program details from an excerpt that does not contain them."
-)
 
 
 def attach_wiki_documents(results):
@@ -830,6 +915,7 @@ def attach_wiki_documents(results):
             "truncated": bool(item.get("_truncated")),
             "note": None,
         }
+        fold_snippet(item)
         summary["returned"] += 1
         summary["from_search_text"] += 1
     return summary
@@ -841,6 +927,7 @@ def attach_wiki_documents(results):
 
 mcp = FastMCP(
     "Sujeeth Foundation Search",
+    instructions=SERVER_INSTRUCTIONS,
     host=MCP_HOST,
     port=MCP_PORT,
     stateless_http=STATELESS,
@@ -978,7 +1065,7 @@ def get_ontology_context(
         return error_result(exc)
 
 
-@mcp.tool()
+@mcp.tool(description=WEBSITE_SEARCH_DESCRIPTION)
 @in_thread
 def search_website(
     query: str,
@@ -992,7 +1079,7 @@ def search_website(
         return {"error": "Please provide a query."}
 
     try:
-        return post_json_with_retry(
+        result = post_json_with_retry(
             f"{WEBSEARCH_URL}/api/search",
             {
                 "query": query,
@@ -1003,6 +1090,9 @@ def search_website(
             },
             WEBSEARCH_KEY,
         )
+        if isinstance(result, dict) and "agent_instructions" not in result:
+            result["agent_instructions"] = CITE_AND_STATS + EXCERPT_INSTRUCTIONS
+        return result
     except Exception as exc:
         return error_result(exc)
 
@@ -1023,7 +1113,7 @@ def run_wiki_search(query, full_documents, document_max_chars):
         return {"results": []}, exc
 
 
-@mcp.tool()
+@mcp.tool(description=WIKI_SEARCH_DESCRIPTION)
 @in_thread
 def search_wiki(
     query: str,
@@ -1059,27 +1149,22 @@ def search_wiki(
             "count": len(results),
             "results": results,
         }
+        has_documents = False
         if full_documents:
             response["full_documents"] = attach_full_documents(
                 results, len(results) or 1, document_max_chars
             )
-            if response["full_documents"]["returned"]:
-                response["agent_instructions"] = DOCUMENT_INSTRUCTIONS.replace(
-                    "If excerpt_only is true, summarize briefly and link to the source.",
-                    "Answer from the document field, not the snippet.",
-                )
-        else:
-            response["agent_instructions"] = DOCUMENT_INSTRUCTIONS.replace(
-                "If excerpt_only is true, summarize briefly and link to the source.",
-                EXCERPT_INSTRUCTIONS.strip(),
-            )
+            has_documents = bool(response["full_documents"]["returned"])
+        response["agent_instructions"] = CITE_AND_STATS + (
+            WIKI_DOCUMENT_INSTRUCTIONS if has_documents else EXCERPT_INSTRUCTIONS
+        )
         strip_internal(results)
         return response
     except Exception as exc:
         return error_result(exc)
 
 
-@mcp.tool()
+@mcp.tool(description=SEARCH_DESCRIPTION)
 @in_thread
 def search_sujeeth_foundation(
     query: str,
@@ -1190,29 +1275,20 @@ def search_sujeeth_foundation(
         quality["agent_instructions"] += PRIORITY_INSTRUCTIONS
 
     documents_summary = None
-    wiki_only_documents = False
     if full_documents and results:
         documents_summary = attach_full_documents(
             results,
             max(1, min(int(max_documents or limit), 20)),
-            max(500, min(int(document_max_chars), 20000)),
+            max(500, min(int(document_max_chars), DOCUMENT_MAX_CHARS)),
         )
-        if documents_summary["returned"]:
-            quality["agent_instructions"] = quality["agent_instructions"] + FULL_DOCUMENT_INSTRUCTIONS
+        reading = FULL_DOCUMENT_INSTRUCTIONS if documents_summary["returned"] else EXCERPT_INSTRUCTIONS
     elif WIKI_FULL_TEXT and results:
         documents_summary = attach_wiki_documents(results)
-        wiki_only_documents = bool(documents_summary["returned"])
+        reading = WIKI_DOCUMENT_INSTRUCTIONS if documents_summary["returned"] else EXCERPT_INSTRUCTIONS
+    else:
+        reading = EXCERPT_INSTRUCTIONS
+    quality["agent_instructions"] += reading
     lap("documents_ms")
-    if wiki_only_documents:
-        quality["agent_instructions"] = quality["agent_instructions"].replace(
-            "Otherwise answer from the results and cite their URLs.",
-            "Otherwise answer from the results, reading pages as described below, and cite their URLs.",
-        ) + WIKI_DOCUMENT_INSTRUCTIONS
-    elif not (documents_summary and documents_summary["returned"]):
-        quality["agent_instructions"] = quality["agent_instructions"].replace(
-            "Otherwise answer from the results and cite their URLs.",
-            "Otherwise answer from the results, reading pages as described below, and cite their URLs.",
-        ) + EXCERPT_INSTRUCTIONS
     strip_internal(results)
     timings["total_ms"] = round((time.perf_counter() - started) * 1000)
     print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
@@ -1221,14 +1297,14 @@ def search_sujeeth_foundation(
         "query": query,
         "status": "partial" if errors else "completed",
         "ontology": resolution_summary(resolution),
-        "website_search": {
-            "status": website.get("status"),
-            "count": len(website.get("results", []) or []),
-            **({"domains": website.get("domains", domains)} if VERBOSE_ONTOLOGY else {}),
+        # "count" is what this response returns. The candidates are what each source found before
+        # the best results were chosen across sources, so they are usually larger.
+        "retrieval": {
+            "website_status": website.get("status"),
+            "website_candidates": len(website.get("results", []) or []),
+            "wiki_candidates": len(wiki_items),
             "search_mode": website.get("search_mode"),
-        },
-        "wiki_search": {
-            "count": len(drop_excluded_wiki(normalize_results(wiki, "wiki"))),
+            **({"domains": website.get("domains", domains)} if VERBOSE_ONTOLOGY else {}),
         },
         "count": len(results),
         "best_bet_count": best_bet_count,
@@ -1270,32 +1346,51 @@ def _fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars
     )
 
 
-_document_cache = {}  # (url, max_chars) -> (expires, result)
+_document_cache = {}  # url -> (expires, result read at DOCUMENT_MAX_CHARS)
 _document_cache_lock = threading.Lock()
+
+
+def fit_document(result, max_chars, cached=False):
+    """A copy of a page read, cut to max_chars. truncated is true when text was cut here or by the search app."""
+    out = dict(result)
+    text = out.get("text")
+    if isinstance(text, str) and len(text) > max_chars:
+        out["total_chars"] = out.get("total_chars", len(text))
+        out["text"] = text[:max_chars]
+        out["truncated"] = True
+    out["_cached"] = cached
+    return out
 
 
 def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=6000, refresh=False):
     """Fetch one document, reusing a recent copy of a whole-page read. Raises on failure.
 
-    Only reads by url are kept. A read by chunk_id returns a passage with its neighbors, which
-    depends on the arguments, so it always goes to the search apps. Failures are never kept.
+    A page is read once at the largest size and kept by url, so a repeat read of the same page
+    is served from memory whatever max_chars it asks for (a read at a larger size would otherwise
+    miss the cache and fetch the page again). Only reads by url are kept. A read by chunk_id
+    returns a passage with its neighbors, which depends on the arguments, so it always goes to
+    the search apps. Failures are never kept. The result's _cached key says whether memory
+    answered; callers that return the result to the agent leave it out.
     """
     if DOCUMENT_CACHE_SECONDS <= 0 or chunk_id or not url:
         return _fetch_document(url, chunk_id, source, neighbors, max_chars)
-    key = (str(url).strip().lower().rstrip("/"), max(500, min(int(max_chars), 20000)))
+    key = str(url).strip().lower().rstrip("/")
+    want = max(500, min(int(max_chars), DOCUMENT_MAX_CHARS))
     now = time.monotonic()
     with _document_cache_lock:
         hit = _document_cache.get(key)
     if hit and hit[0] > now and not refresh:
-        return dict(hit[1])
-    result = _fetch_document(url, chunk_id, source, neighbors, max_chars)
-    if isinstance(result, dict) and result.get("text") and not result.get("error"):
+        return fit_document(hit[1], want, cached=True)
+    result = _fetch_document(url, chunk_id, source, neighbors, DOCUMENT_MAX_CHARS)
+    if not isinstance(result, dict):
+        return result
+    if result.get("text") and not result.get("error"):
         with _document_cache_lock:
             _document_cache[key] = (now + DOCUMENT_CACHE_SECONDS, dict(result))
             if len(_document_cache) > DOCUMENT_CACHE_MAX:
                 for old in list(_document_cache)[: max(1, DOCUMENT_CACHE_MAX // 10)]:
                     _document_cache.pop(old, None)
-    return result
+    return fit_document(result, want)
 
 
 def explain_fetch_error(exc):
@@ -1309,17 +1404,10 @@ def explain_fetch_error(exc):
     return error_result(exc).get("error", "Could not read the document.")
 
 
-@mcp.tool()
+@mcp.tool(description=GET_DOCUMENTS_DESCRIPTION)
 @in_thread
-def get_documents(urls: list[str], max_chars: int = 6000) -> dict[str, Any]:
-    """
-    Read the pages behind search results. Search results are excerpts; call this when they do
-    not fully answer the question. Pass every url you need in one call (up to 3, read at the
-    same time), exactly as the search results returned them, rather than one call per page.
-    Foundation sites and the wiki return the page text; third-party sites return only a short
-    excerpt, so link to the source instead of reproducing it. Each document reports
-    total_chars and truncated; raise max_chars (up to 12000) to read more of a long page.
-    """
+def get_documents(urls: list[str], max_chars: int = DOCUMENT_DEFAULT_CHARS) -> dict[str, Any]:
+    """Read the full text of the pages behind search results. The agent-facing description is GET_DOCUMENTS_DESCRIPTION."""
     seen, wanted = set(), []
     for raw in urls or []:
         url = str(raw or "").strip()
@@ -1331,27 +1419,34 @@ def get_documents(urls: list[str], max_chars: int = 6000) -> dict[str, Any]:
         return {"error": "Provide at least one url from a search result."}
     skipped = wanted[MAX_BATCH_DOCUMENTS:]
     wanted = wanted[:MAX_BATCH_DOCUMENTS]
-    max_chars = max(500, min(int(max_chars), 12000))
+    max_chars = max(500, min(int(max_chars), DOCUMENT_MAX_CHARS))
 
     def read(url):
         began = time.perf_counter()
+        cached = False
         try:
             doc = fetch_document(url, None, None, 1, max_chars)
+            cached = bool(doc.get("_cached"))
             item = {"url": url, "status": "ok"}
-            for key in ("title", "source", "text", "total_chars", "truncated", "excerpt_only", "note"):
+            for key in ("title", "source", "domain", "text", "total_chars", "truncated", "excerpt_only", "note"):
                 if doc.get(key) is not None:
                     item[key] = doc[key]
         except Exception as exc:
             item = {"url": url, "status": "error", "error": explain_fetch_error(exc)}
-        item["ms"] = round((time.perf_counter() - began) * 1000)
-        return item
+        return item, round((time.perf_counter() - began) * 1000), cached
 
     started = time.perf_counter()
     with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
-        documents = list(pool.map(read, wanted))
+        reads = list(pool.map(read, wanted))
     total_ms = round((time.perf_counter() - started) * 1000)
-    print(f"get_documents_ms {json.dumps({'total': total_ms, 'each': [d['ms'] for d in documents]})}",
+    documents = [item for item, _, _ in reads]
+    # The log line always says what each read cost and whether memory answered it. The agent
+    # sees those numbers only when SEARCH_TIMINGS is on: they are diagnostics, not content.
+    print(f"get_documents_ms {json.dumps({'total': total_ms, 'each': [ms for _, ms, _ in reads], 'cached': [c for _, _, c in reads]})}",
           file=sys.stderr, flush=True)
+    if TIMINGS:
+        for item, ms, cached in reads:
+            item["ms"], item["cached"] = ms, cached
 
     response = {
         "count": len(documents),
@@ -1360,7 +1455,8 @@ def get_documents(urls: list[str], max_chars: int = 6000) -> dict[str, Any]:
     }
     if skipped:
         response["not_read"] = skipped
-        response["note"] = f"Only the first {MAX_BATCH_DOCUMENTS} urls were read."
+        response["note"] = (f"Only the first {MAX_BATCH_DOCUMENTS} urls were read. Read the others in "
+                            f"a separate call only if you still need them.")
     return response
 
 

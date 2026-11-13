@@ -179,7 +179,9 @@ def test_a_service_that_was_never_retried_reports_zero_retries():
 def test_search_website_recovers_from_a_loading_instance(monkeypatch):
     server._downstream.clear()
     Fake(monkeypatch, [reply(503, {"Retry-After": "1"}), reply(body=b'{"results": [{"title": "T"}]}')])
-    assert server.search_website.sync("career circle", concepts=["circle"], domains=["sujeeth.org"]) == {"results": [{"title": "T"}]}
+    result = server.search_website.sync("career circle", concepts=["circle"], domains=["sujeeth.org"])
+    assert result["results"] == [{"title": "T"}]
+    assert "get_documents" in result["agent_instructions"]  # website-only results carry the same guidance as the others
 
 
 def test_search_website_reports_an_error_when_the_instance_never_loads(monkeypatch):
