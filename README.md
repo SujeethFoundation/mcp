@@ -84,6 +84,10 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 | `MCP_TRUSTED_KEY_HEADER` | `x-mcp-client-key` | Name of the header that carries that secret |
 | `MCP_TRUSTED_USER_AGENTS` | empty (off) | Optional regular expression. A matching User-Agent counts as trusted. It can be faked, so it only picks the bucket |
 | `MCP_REQUEST_TIMEOUT` | `30` | Seconds to wait for a backend |
+| `MCP_RETRY_ATTEMPTS` | `4` | Tries in all (the first included) for a call to the website search app that is refused with HTTP 503 (an instance still loading its index, when `LOCAL_INDEX_FAIL_FAST` is on there) or cannot be reached. `1` turns retries off. All tries together stay within `MCP_REQUEST_TIMEOUT` |
+| `MCP_RETRY_DEFAULT_WAIT_SECONDS` | `3` | Wait before a retry when the 503 has no `Retry-After` header, and after a connection error |
+| `MCP_RETRY_MAX_WAIT_SECONDS` | `8` | Longest single wait, whatever `Retry-After` says |
+| `MCP_RETRY_MIN_ATTEMPT_SECONDS` | `4` | A retry is made only if at least this much of the timeout would be left after the wait |
 | `WIKI_EXCLUDE_TITLE_PATTERN` | circle-session pattern | Wiki pages to drop from results |
 | `LOCAL_SETTINGS_PATH` | `local.settings.json` | Optional settings file |
 

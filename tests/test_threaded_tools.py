@@ -95,7 +95,7 @@ def test_the_plain_function_is_reachable_for_code_off_the_event_loop():
 def test_warmup_runs_the_search_and_reads_the_pages_it_finds(monkeypatch, capsys):
     """The warm-up runs on a plain thread. After the tools were wrapped it called the async wrapper, got a
     coroutine, and failed every query with: 'coroutine' object has no attribute 'get'."""
-    def fake_post(url, payload, key=""):
+    def fake_post(url, payload, key="", timeout=None):
         if url.endswith("/api/domain-resolution"):
             return {"status": "resolved", "matched_concepts": ["circle"], "domains": ["sujeeth.org"]}
         return {"status": "completed", "results": [{"title": "Career Circle", "url": "https://www.sujeeth.org/circle",

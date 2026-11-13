@@ -4,6 +4,7 @@ import asyncio
 import functools
 import json
 import os
+import random
 import re
 import socket
 import sys
@@ -73,6 +74,15 @@ WIKISEARCH_KEY = setting("WIKISEARCH_FUNCTION_KEY")
 ONTOLOGY_KEY = setting("ONTOLOGY_FUNCTION_KEY")
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
+
+# Retries of calls to the website search app. A search instance that is still loading its index refuses a request at
+# once with HTTP 503 and a Retry-After header (LOCAL_INDEX_FAIL_FAST on that app), so the request can be tried again
+# in a moment instead of waiting on a busy instance. Connection errors are retried too. Every attempt together stays
+# within MCP_REQUEST_TIMEOUT, so a caller never waits longer than it did without retries.
+RETRY_ATTEMPTS = max(1, int(setting("MCP_RETRY_ATTEMPTS", "4") or 4))                 # tries in all, the first included; 1 = no retry
+RETRY_DEFAULT_WAIT = float(setting("MCP_RETRY_DEFAULT_WAIT_SECONDS", "3") or 3)       # wait when the 503 has no Retry-After
+RETRY_MAX_WAIT = float(setting("MCP_RETRY_MAX_WAIT_SECONDS", "8") or 8)               # longest single wait, whatever Retry-After says
+RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)         # a retry is made only if this long is left after the wait
 
 # Search diversity settings.
 # SEARCH_RESULT_COUNT: ordinary results returned (best bets and spotlights come on top of these).
@@ -290,7 +300,7 @@ def _get_json_raw(url, key="", params=None):
     return data if isinstance(data, dict) else {"data": data}
 
 
-def _post_json_raw(url, payload, key=""):
+def _post_json_raw(url, payload, key="", timeout=None):
     response = http.post(
         url,
         headers={
@@ -298,7 +308,7 @@ def _post_json_raw(url, payload, key=""):
             "Content-Type": "application/json",
         },
         json=payload,
-        timeout=TIMEOUT,
+        timeout=TIMEOUT if timeout is None else timeout,
     )
     response.raise_for_status()
     data = response.json()
@@ -318,10 +328,16 @@ def _service_of(url):
 
 def _note_call(url, seconds, failed):
     with _downstream_lock:
-        entry = _downstream.setdefault(_service_of(url), {"calls": 0, "errors": 0, "recent": deque(maxlen=3000)})
+        entry = _downstream.setdefault(_service_of(url), {"calls": 0, "errors": 0, "retries": 0, "recent": deque(maxlen=3000)})
         entry["calls"] += 1
         entry["errors"] += 1 if failed else 0
         entry["recent"].append((time.time(), seconds))
+
+
+def _note_retry(url):
+    with _downstream_lock:
+        entry = _downstream.setdefault(_service_of(url), {"calls": 0, "errors": 0, "retries": 0, "recent": deque(maxlen=3000)})
+        entry["retries"] += 1
 
 
 def downstream_stats():
@@ -329,11 +345,11 @@ def downstream_stats():
     spent waiting on it (divide by 60 for the average number of calls in progress)."""
     now, out = time.time(), {}
     with _downstream_lock:
-        snapshot = {k: (v["calls"], v["errors"], list(v["recent"])) for k, v in _downstream.items()}
-    for name, (calls, errors, recent) in snapshot.items():
+        snapshot = {k: (v["calls"], v["errors"], v.get("retries", 0), list(v["recent"])) for k, v in _downstream.items()}
+    for name, (calls, errors, retries, recent) in snapshot.items():
         last = sorted(d for t, d in recent if now - t <= 60)
         pick = lambda q: round(1000 * last[min(len(last) - 1, int(q * len(last)))]) if last else None
-        out[name] = {"calls": calls, "errors": errors, "last_minute_calls": len(last), "p50_ms": pick(0.5),
+        out[name] = {"calls": calls, "errors": errors, "retries": retries, "last_minute_calls": len(last), "p50_ms": pick(0.5),
                      "p95_ms": pick(0.95), "waited_seconds_last_minute": round(sum(last), 1)}
     return out
 
@@ -348,14 +364,82 @@ def get_json(url, key="", params=None):
         _note_call(url, time.perf_counter() - began, failed)
 
 
-def post_json(url, payload, key=""):
+def post_json(url, payload, key="", timeout=None):
     began, failed = time.perf_counter(), True
     try:
-        data = _post_json_raw(url, payload, key)
+        data = _post_json_raw(url, payload, key, timeout)
         failed = False
         return data
     finally:
         _note_call(url, time.perf_counter() - began, failed)
+
+
+# -- retries ------------------------------------------------------------------------------------------------------
+_clock = time.monotonic   # the two clocks the retry uses; tests replace them
+_sleep = time.sleep
+
+
+def _jitter():
+    """A little random wait on top of each retry, so callers refused together do not all come back together."""
+    return random.uniform(0, 0.5)
+
+
+def _retry_after_seconds(response):
+    """The seconds a 503 asks us to wait (Retry-After as a number), or the default when it is missing or unusable."""
+    raw = response.headers.get("Retry-After") if response is not None else None
+    try:
+        seconds = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return RETRY_DEFAULT_WAIT
+    return seconds if seconds >= 0 else RETRY_DEFAULT_WAIT
+
+
+def _retry_wait(exc):
+    """Seconds to wait before trying again, or None when this failure is not worth another try.
+
+    Retried: HTTP 503 (the search app is still loading its index) and connection errors or timeouts. Not retried: any
+    other HTTP status, which a second try would not change (a 502 is a real failure in the search itself)."""
+    if isinstance(exc, requests.HTTPError):
+        response = exc.response
+        if response is not None and response.status_code == 503:
+            return min(_retry_after_seconds(response), RETRY_MAX_WAIT)
+        return None
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return min(RETRY_DEFAULT_WAIT, RETRY_MAX_WAIT)
+    return None
+
+
+def _why(exc):
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        return f"HTTP {exc.response.status_code}"
+    return type(exc).__name__
+
+
+def post_json_with_retry(url, payload, key="", attempts=None):
+    """post_json, tried again when the search app is still loading or briefly unreachable.
+
+    All tries together take at most MCP_REQUEST_TIMEOUT seconds: each try is given only the time that is left, and a
+    retry is made only if at least MCP_RETRY_MIN_ATTEMPT_SECONDS would remain after the wait. The last failure is
+    raised as before, so callers handle it exactly as they did without retries. Every try is counted in the downstream
+    numbers, and each retry also in "retries"."""
+    attempts = RETRY_ATTEMPTS if attempts is None else max(1, int(attempts))
+    deadline = _clock() + TIMEOUT
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            return post_json(url, payload, key, timeout=max(1.0, min(float(TIMEOUT), deadline - _clock())))
+        except Exception as exc:
+            wait = _retry_wait(exc) if attempt < attempts else None
+            if wait is None:
+                raise
+            wait += _jitter()
+            if deadline - _clock() - wait < RETRY_MIN_ATTEMPT:
+                raise
+            _note_retry(url)
+            print(f"retry service={_service_of(url)} attempt={attempt} reason={_why(exc)} wait_s={wait:.1f}",
+                  file=sys.stderr, flush=True)
+            _sleep(wait)
 
 
 def error_result(exc):
@@ -854,7 +938,7 @@ def search_website(
         return {"error": "Please provide a query."}
 
     try:
-        return post_json(
+        return post_json_with_retry(
             f"{WEBSEARCH_URL}/api/search",
             {
                 "query": query,
@@ -1015,7 +1099,7 @@ def search_sujeeth_foundation(
     # Only search websites when the ontology authorizes a concept and domain.
     if concepts and domains:
         try:
-            website = post_json(
+            website = post_json_with_retry(
                 f"{WEBSEARCH_URL}/api/search",
                 {
                     "query": query,
@@ -1110,7 +1194,7 @@ def _fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars
             {"url": url, "path": chunk_id, "max_chars": max_chars},
             WIKISEARCH_KEY,
         )
-    return post_json(
+    return post_json_with_retry(
         f"{WEBSEARCH_URL}/api/document",
         {
             "url": url,
