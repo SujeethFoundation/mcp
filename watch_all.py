@@ -12,7 +12,13 @@ to tell a restart (process id changes or uptime drops) from instances simply com
 
 CPU is the share of one core the process used since the last poll of the same instance (CPU seconds divided by clock
 seconds). A Python process is held near 100% by the interpreter lock whatever the core count, so a steady 90% or more means
-that instance is out of CPU: add instances, shrink the work per request, or cache. Memory is shown against the container
+that instance is out of CPU: add instances, shrink the work per request, or cache.
+
+Each poll reaches whichever instance the platform picks, so an instance seen once has no "since the last poll" figure. For
+those the line shows the average since the process started, marked with a tilde (cpu~ 60%): CPU seconds divided by uptime,
+which needs only one poll. It includes start-up (loading the index is heavy) and the idle time before a burst, so it
+understates a short peak and, on a young instance, overstates steady load. A "CPU HIGH (avg)" flag needs the instance to be at
+least 30 seconds old. The summary adds, per app, how the since-start figures spread across the instances seen. Memory is shown against the container
 limit when the platform exposes it. The mcp line also shows tool threads in use and, per backend app, the median and p95
 time of its calls over the last minute and how many calls a minute, which is what to read when deciding what to cache.
 
@@ -46,6 +52,10 @@ SLOW_MS = 2000
 HIGH_CPU = 85.0      # percent of one core (or of the container limit when known)
 HIGH_MEM = 85.0      # percent of the container memory limit
 WINDOW_SECONDS = 30
+BUSY_CPU = 70.0      # the summary counts instances whose average CPU since start is at or above this (percent of the CPU limit)
+MIN_UPTIME_AVG = 2       # seconds up before an average since start means anything
+MIN_UPTIME_FLAG = 30     # seconds up before an average since start can raise CPU HIGH (a young instance is still starting up)
+MIN_UPTIME_ROLLUP = 20   # seconds up (at its last poll) for an instance to count in the summary's spread
 
 
 def short(name):
@@ -120,7 +130,7 @@ class AppWatch:
         status, ms, body = fetch(self.url, self.header, self.key, timeout)
         self.polls += 1
         row = {"time": clock, "app": self.name, "instance": "", "pid": "", "uptime": "", "rss_mb": "", "cpu_pct": "", "cpu_seconds": "",
-               "mem_limit_mb": "", "cpu_limit_cores": "", "throttled_s": "", "ms": round(ms), "status": status}
+               "cpu_life_pct": "", "mem_limit_mb": "", "cpu_limit_cores": "", "throttled_s": "", "ms": round(ms), "status": status}
         ok = status == 200 and isinstance(body, dict)
         if not ok:
             self.failures += 1
@@ -139,7 +149,7 @@ class AppWatch:
         record = self.instances.get(name)
         if record is None:
             self.instances[name] = {"n": len(self.instances) + 1, "first": clock, "pid": pid, "uptime": up, "polls": 1, "restarts": 0,
-                                    "cpu_prev": None, "cpu": [], "max_rss": 0.0, "mem_limit": None, "cpu_limit": None, "throttled": 0.0}
+                                    "cpu_prev": None, "cpu": [], "life": None, "life_cap": None, "life_up": 0, "max_rss": 0.0, "mem_limit": None, "cpu_limit": None, "throttled": 0.0}
             flag = "  <- NEW instance" if len(self.instances) > 1 else "  <- first instance seen"
         else:
             if pid != record["pid"] or up < record["uptime"] - 1:
@@ -159,6 +169,11 @@ class AppWatch:
                 cap_pct = cpu_pct / (100.0 * cpu_limit) * 100.0 if cpu_limit else cpu_pct
                 record["cpu"].append(cpu_pct)
             record["cpu_prev"] = (cpu_s, now)
+        life_pct = life_cap = None
+        if isinstance(cpu_s, (int, float)) and up >= MIN_UPTIME_AVG:
+            life_pct = 100.0 * cpu_s / up                       # the share of one core since the process started
+            life_cap = life_pct / (100.0 * cpu_limit) * 100.0 if cpu_limit else life_pct
+            record["life"], record["life_cap"], record["life_up"] = life_pct, life_cap, up
         if isinstance(thr, (int, float)):
             if record["throttled"] and thr > record["throttled"] + 0.05:
                 flag += f"  THROTTLED +{thr - record['throttled']:.1f}s"
@@ -168,11 +183,18 @@ class AppWatch:
         record["mem_limit"], record["cpu_limit"] = mem_limit, cpu_limit
         if cap_pct is not None and cap_pct >= HIGH_CPU:
             flag += "  CPU HIGH"
+        elif cap_pct is None and life_cap is not None and up >= MIN_UPTIME_FLAG and life_cap >= HIGH_CPU:
+            flag += "  CPU HIGH (avg)"
         if isinstance(rss, (int, float)) and mem_limit and 100.0 * rss / mem_limit >= HIGH_MEM:
             flag += "  MEM HIGH"
         if ms > SLOW_MS:
             flag += "  SLOW"
-        cpu_text = f"cpu {cpu_pct:4.0f}%" if cpu_pct is not None else "cpu    -"
+        if cpu_pct is not None:
+            cpu_text = f"cpu {cpu_pct:4.0f}%"
+        elif life_pct is not None:
+            cpu_text = f"cpu~{life_pct:4.0f}%"                    # no earlier poll of this instance: the average since it started
+        else:
+            cpu_text = "cpu    -"
         if isinstance(rss, (int, float)):
             mem = f"{rss:4.0f}/{mem_limit} MB" if mem_limit else f"{rss:4.0f} MB"
         else:
@@ -182,11 +204,51 @@ class AppWatch:
                 f"{extras(self.name, body)}{flag}")
         row.update(instance=name, pid=pid, uptime=up, rss_mb=rss if rss is not None else "",
                    cpu_pct=round(cpu_pct, 1) if cpu_pct is not None else "", cpu_seconds=cpu_s if cpu_s is not None else "",
+                   cpu_life_pct=round(life_pct, 1) if life_pct is not None else "",
                    mem_limit_mb=mem_limit or "", cpu_limit_cores=cpu_limit or "", throttled_s=thr if thr is not None else "")
         return line, row, now
 
     def in_window(self, now):
         return sum(1 for t in self.recent.values() if now - t <= WINDOW_SECONDS)
+
+
+CSV_FIELDS = ["time", "app", "instance", "pid", "uptime", "rss_mb", "cpu_pct", "cpu_seconds", "mem_limit_mb",
+              "cpu_limit_cores", "throttled_s", "ms", "status", "cpu_life_pct"]
+
+
+def csv_fieldnames(path):
+    """The columns to write to a CSV file: this version's, or those of an older file's own header, so rows are never
+    written under the wrong heading when a file from before cpu_life_pct is appended to."""
+    try:
+        with open(path, encoding="utf-8", newline="") as handle:
+            header = next(csv.reader(handle), None)
+    except OSError:
+        header = None
+    return header if header else list(CSV_FIELDS)
+
+
+def summary_cpu_text(rec):
+    """The CPU part of an instance's summary line: the spread of its between-poll figures when it was polled more than
+    once, and always its average since start when there is one."""
+    cpu, life = rec["cpu"], rec["life"]
+    since = f"~{life:.0f}% since start" if life is not None else ""
+    if cpu:
+        return f"cpu avg {sum(cpu) / len(cpu):.0f}% max {max(cpu):.0f}%" + (f" ({since})" if since else "")
+    return f"cpu {since}" if since else "cpu -"
+
+
+def cpu_rollup(watch):
+    """One summary line on how the instances seen share the CPU, from each one's average since start at its last poll,
+    as a percent of its CPU limit (of one core when the limit is unknown). None when no instance has a usable figure.
+    Instances up less than MIN_UPTIME_ROLLUP seconds are left out: start-up work dominates their average."""
+    values = sorted(rec["life_cap"] for rec in watch.instances.values()
+                    if rec["life_cap"] is not None and rec["life_up"] >= MIN_UPTIME_ROLLUP)
+    if not values:
+        return None
+    busy = sum(1 for v in values if v >= BUSY_CPU)
+    return (f"      CPU since start, {len(values)} of {len(watch.instances)} instances (up {MIN_UPTIME_ROLLUP}s or more): "
+            f"median {percentile(values, 50):.0f}%, p90 {percentile(values, 90):.0f}%, max {values[-1]:.0f}%; "
+            f"{busy} at or above {BUSY_CPU:.0f}%")
 
 
 def percentile(values, p):
@@ -226,8 +288,10 @@ def main():
     if args.csv:
         fresh = not os.path.exists(args.csv) or os.path.getsize(args.csv) == 0
         out = open(args.csv, "a", newline="", encoding="utf-8")
-        writer = csv.DictWriter(out, fieldnames=["time", "app", "instance", "pid", "uptime", "rss_mb", "cpu_pct", "cpu_seconds", "mem_limit_mb",
-                                                  "cpu_limit_cores", "throttled_s", "ms", "status"])
+        fields = list(CSV_FIELDS) if fresh else csv_fieldnames(args.csv)
+        if not fresh and fields != CSV_FIELDS:
+            print(f"Note: {args.csv} was started by an older version, so its columns are kept and cpu_life_pct is not added.")
+        writer = csv.DictWriter(out, fieldnames=fields, extrasaction="ignore")
         if fresh:
             writer.writeheader()
 
@@ -265,12 +329,14 @@ def main():
         print(f"  {w.name:10s} polls {w.polls}, failed {w.failures}, instances seen {len(w.instances)}, "
               f"restarts {len(w.restarts)}; {health}")
         for name, rec in w.instances.items():
-            cpu = rec["cpu"]
-            cpu_text = f"cpu avg {sum(cpu) / len(cpu):.0f}% max {max(cpu):.0f}%" if cpu else "cpu -"
+            cpu_text = summary_cpu_text(rec)
             mem_text = f"memory max {rec['max_rss']:.0f}" + (f" of {rec['mem_limit']} MB" if rec["mem_limit"] else " MB")
             print(f"      #{rec['n']} {short(name):12s} first seen {rec['first']}, polled {rec['polls']}x, restarts {rec['restarts']}, "
                   f"last uptime {rec['uptime']}s, {cpu_text}, {mem_text}"
                   + (f", throttled {rec['throttled']:.1f}s in total" if rec["throttled"] else ""))
+        rollup = cpu_rollup(w)
+        if rollup:
+            print(rollup)
         for clock, name, why in w.restarts:
             print(f"      RESTART at {clock}: {short(name)} ({why})")
     quiet = [w.name for w in watches if len(w.instances) > 1 and not w.restarts]

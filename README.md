@@ -17,7 +17,7 @@ The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mc
 | Tool | Use it to |
 |---|---|
 | `search_sujeeth_foundation` | The main tool. Resolves the question through the ontology, searches website and wiki, de-duplicates by URL, and reports whether the answer needs clarification or a service failed |
-| `get_document` | Read more of a result. Pass the `url` or `chunk_id` exactly as returned. Foundation sites and the wiki return page text; third-party sites return a short excerpt only |
+| `get_documents` | Read more of the results. Pass up to three `urls` exactly as returned, in one call (they are read at the same time). Foundation sites and the wiki return page text; third-party sites return a short excerpt only |
 | `search_website` | Search ontology-approved websites only |
 | `search_wiki` | Search the GitHub wiki only |
 
@@ -33,7 +33,7 @@ The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mc
 ### What is never returned
 
 - Wiki pages about recorded circle sessions (recording links, meeting summaries). They are filtered here and in `wikisearch`.
-- Full text from third-party sites. `get_document` returns only a short excerpt for them, with a note to link to the source.
+- Full text from third-party sites. `get_documents` returns only a short excerpt for them, with a note to link to the source.
 - Function keys, internal URLs, or backend error details. Errors return only an HTTP status or a general message.
 
 ## Run locally (Windows PowerShell)
@@ -171,7 +171,7 @@ Local tests that use admin tools need `MCP_ADMIN_TOOLS=true`. Search results dep
 | 1 | `check_services` (admin) | none | `all_healthy: true` |
 | 2 | `search_sujeeth_foundation` | `how can i donate to the sujeeth foundation?` | `status: completed`, results with URLs, the FAQ wiki page with the donation link, `needs_clarification: false` |
 | 3 | `search_sujeeth_foundation` | `quantum cryptography` | `needs_clarification: true` and a suggested question |
-| 4 | `get_document` | a `url` from test 2 | page text, or an excerpt with `excerpt_only: true` for third-party sites |
+| 4 | `get_documents` | `urls`: a url from test 2 | page text, or an excerpt with `excerpt_only: true` for third-party sites |
 | 5 | `resolve_ontology` (admin) | `resume tips for students` | matched concepts and approved domains |
 | 6 | `get_ontology_context` (admin) | concept `leadership` | relationships |
 
@@ -182,7 +182,7 @@ Local tests that use admin tools need `MCP_ADMIN_TOOLS=true`. Search results dep
 | `Service returned HTTP 401` | A Function key is missing or wrong. Fix the app setting and restart |
 | `Service returned HTTP 502` from website search | The backend raised an error. Call its `/api/search` directly to see the message (a 429 inside means embedding quota) |
 | `needs_clarification` on a clear question | The ontology matched no concept. Add aliases for the topic in the ontology repo |
-| `get_document` says not found | The page is not indexed yet, or the `url` or `chunk_id` was not copied exactly from a result |
+| `get_documents` reports an error for a url | The page is not indexed yet, or the `url` was not copied exactly from a result |
 | HTTP 401 on every request | The Functions host requires a function key. Set `defaultAuthorizationLevel` to `anonymous` in `host.json` |
 | HTTP 421 "Invalid Host header" | The server is bound to `127.0.0.1` behind a custom domain. Use `MCP_HOST=0.0.0.0` |
 | Deployed app returns 502 or never becomes healthy | `MCP_PORT` does not match `port` in `host.json`, or the Python version in the workflow does not match the app's runtime |

@@ -138,7 +138,7 @@ TRUSTED_KEY_HEADER = setting("MCP_TRUSTED_KEY_HEADER", "x-mcp-client-key")
 TRUSTED_USER_AGENTS = setting("MCP_TRUSTED_USER_AGENTS")      # optional regex; a User-Agent can be faked
 
 # Token savings. Searches return short excerpts by default; the agent reads a whole page with
-# get_document only when it needs more. Set SEARCH_FULL_DOCUMENTS=true to attach full page
+# get_documents only when it needs more. Set SEARCH_FULL_DOCUMENTS=true to attach full page
 # text to search results again. SEARCH_VERBOSE_ONTOLOGY adds the per-concept match details
 # and a second copy of the domain list to each response (about 600 tokens).
 FULL_DOCUMENTS_DEFAULT = flag("SEARCH_FULL_DOCUMENTS", "false")
@@ -148,7 +148,7 @@ VERBOSE_ONTOLOGY = flag("SEARCH_VERBOSE_ONTOLOGY", "false")
 TIMINGS = flag("SEARCH_TIMINGS", "false")
 # Most pages one get_documents call will read (they are read in parallel).
 MAX_BATCH_DOCUMENTS = max(1, int(setting("MAX_BATCH_DOCUMENTS", "3") or 3))
-# Pages read through get_document and get_documents are kept in memory so a repeat read does not
+# Pages read through get_documents are kept in memory so a repeat read does not
 # call the search apps again. DOCUMENT_CACHE_SECONDS=0 turns this off. A page changed on the
 # site can show its old text for up to this long (a wiki page for up to this long plus the
 # wiki app's own 15 minutes). Each entry is one page, at most about 12 to 24 KB.
@@ -682,7 +682,7 @@ FULL_DOCUMENT_INSTRUCTIONS = (
     " Results with a document field carry the full page text for that result. Answer from "
     "the document, not the snippet, and cite the url. If a document has excerpt_only set to "
     "true, it is third-party content: summarize briefly and link to the source, do not "
-    "reproduce it. If a document is truncated, say so and call get_document for more."
+    "reproduce it. If a document is truncated, say so and call get_documents with its url for more."
 )
 
 # Used when a search returns excerpts only. This sits beside the results, which is where the
@@ -697,9 +697,9 @@ EXCERPT_INSTRUCTIONS = (
     "contain them."
 )
 
-GET_DOCUMENT_INSTRUCTIONS = DOCUMENT_INSTRUCTIONS + (
-    " If truncated is true and the part you need is missing, call get_document again with a "
-    "larger max_chars (up to 12000)."
+GET_DOCUMENTS_INSTRUCTIONS = DOCUMENT_INSTRUCTIONS + (
+    " If truncated is true and the part you need is missing, call get_documents again with that "
+    "url and a larger max_chars (up to 12000)."
 )
 
 PRIORITY_INSTRUCTIONS = (
@@ -1234,42 +1234,6 @@ def fetch_document(url=None, chunk_id=None, source=None, neighbors=1, max_chars=
     return result
 
 
-@mcp.tool()
-@in_thread
-def get_document(
-    url: str | None = None,
-    chunk_id: str | None = None,
-    source: str | None = None,
-    neighbors: int = 1,
-    max_chars: int = 6000,
-) -> dict[str, Any]:
-    """
-    Read the page behind a search result. Search results are excerpts; call this when they do
-    not fully answer the question. Pass the url (or chunk_id) exactly as the result returned it,
-    and its source, "website" or "wiki". Foundation sites and the wiki return the page text
-    (total_chars and truncated say whether more exists; raise max_chars up to 12000 for more).
-    Third-party sites return only a short excerpt around the matched passage, so link to the
-    source instead of reproducing it.
-    """
-    if not (url or chunk_id):
-        return {"error": "Provide a url or chunk_id from a search result."}
-
-    try:
-        result = fetch_document(url, chunk_id, source, neighbors, max_chars)
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else None
-        if status == 404:
-            return {"error": "That document was not found. Use a url or chunk_id from a search result."}
-        if status == 403:
-            return {"error": "That document is not available through this server."}
-        return error_result(exc)
-    except Exception as exc:
-        return error_result(exc)
-
-    result["agent_instructions"] = GET_DOCUMENT_INSTRUCTIONS
-    return result
-
-
 def explain_fetch_error(exc):
     """A short, user-safe reason a page could not be read."""
     if isinstance(exc, requests.HTTPError):
@@ -1285,11 +1249,12 @@ def explain_fetch_error(exc):
 @in_thread
 def get_documents(urls: list[str], max_chars: int = 6000) -> dict[str, Any]:
     """
-    Read the pages behind several search results in one call, all at the same time. Call it
-    once with every url you need (up to 3), exactly as the search results returned them,
-    instead of calling get_document more than once. Foundation sites and the wiki return the
-    page text; third-party sites return only a short excerpt, so link to the source instead
-    of reproducing it. Each document reports total_chars and truncated.
+    Read the pages behind search results. Search results are excerpts; call this when they do
+    not fully answer the question. Pass every url you need in one call (up to 3, read at the
+    same time), exactly as the search results returned them, rather than one call per page.
+    Foundation sites and the wiki return the page text; third-party sites return only a short
+    excerpt, so link to the source instead of reproducing it. Each document reports
+    total_chars and truncated; raise max_chars (up to 12000) to read more of a long page.
     """
     seen, wanted = set(), []
     for raw in urls or []:
@@ -1327,7 +1292,7 @@ def get_documents(urls: list[str], max_chars: int = 6000) -> dict[str, Any]:
     response = {
         "count": len(documents),
         "documents": documents,
-        "agent_instructions": GET_DOCUMENT_INSTRUCTIONS.replace("call get_document again", "call get_documents again"),
+        "agent_instructions": GET_DOCUMENTS_INSTRUCTIONS,
     }
     if skipped:
         response["not_read"] = skipped
