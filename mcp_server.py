@@ -142,6 +142,11 @@ TRUSTED_USER_AGENTS = setting("MCP_TRUSTED_USER_AGENTS")      # optional regex; 
 # text to search results again. SEARCH_VERBOSE_ONTOLOGY adds the per-concept match details
 # and a second copy of the domain list to each response (about 600 tokens).
 FULL_DOCUMENTS_DEFAULT = flag("SEARCH_FULL_DOCUMENTS", "false")
+# Wiki pages are short (the largest is about 13 KB), so wiki results carry their whole page up
+# front even while other results stay excerpts. That saves the agent a get_documents round trip
+# for the wiki. WIKI_FULL_TEXT=false returns wiki excerpts again. WIKI_FULL_TEXT_CHARS cuts each page.
+WIKI_FULL_TEXT = flag("WIKI_FULL_TEXT", "true")
+WIKI_FULL_TEXT_CHARS = max(500, min(int(setting("WIKI_FULL_TEXT_CHARS", "12000") or 12000), 20000))
 VERBOSE_ONTOLOGY = flag("SEARCH_VERBOSE_ONTOLOGY", "false")
 # SEARCH_TIMINGS=true adds a timings_ms block to each combined search response. The timings are
 # always written to the log, so you can read them in Application Insights without the flag.
@@ -781,6 +786,55 @@ def attach_full_documents(results, max_documents, per_document_chars):
     return summary
 
 
+WIKI_DOCUMENT_INSTRUCTIONS = (
+    " Wiki results carry the whole page in their document field. Answer from it, not the snippet, "
+    "and cite the url; call get_documents for a wiki page only if its document is truncated and the "
+    "part you need is missing. Every other result is an excerpt and may stop mid-sentence: if the "
+    "excerpts do not fully answer the question, call get_documents once, with the urls of every page "
+    "you need, before answering. Read at most two pages per question, and read them in one call. "
+    "Results whose domain is not sujeeth.org are third-party: summarize briefly and link instead of "
+    "reading them. Do not answer program details from an excerpt that does not contain them."
+)
+
+
+def attach_wiki_documents(results):
+    """Attach the page text the wiki search already returned to the wiki results that were kept.
+
+    No second request is made. Only wiki results are touched, so website results stay excerpts.
+    Returns the same summary shape as attach_full_documents.
+    """
+    summary = {
+        "requested": 0, "returned": 0, "excerpt_only": 0, "failed": 0,
+        "skipped_for_length": 0, "from_search_text": 0,
+    }
+    used, seen = 0, set()
+    for item in results:
+        if item.get("source") != "wiki" or not item.get("url"):
+            continue
+        key = page_identity(item)
+        if key in seen:
+            continue
+        seen.add(key)
+        summary["requested"] += 1
+        text = str(item.get("_full_text") or "")
+        if not text:
+            summary["failed"] += 1
+            continue
+        if used + len(text) > DOCUMENT_CHAR_BUDGET:
+            summary["skipped_for_length"] += 1
+            continue
+        used += len(text)
+        item["document"] = {
+            "text": text,
+            "excerpt_only": False,
+            "truncated": bool(item.get("_truncated")),
+            "note": None,
+        }
+        summary["returned"] += 1
+        summary["from_search_text"] += 1
+    return summary
+
+
 # ------------------------------------------------------------
 # MCP server
 # ------------------------------------------------------------
@@ -957,10 +1011,10 @@ def run_wiki_search(query, full_documents, document_max_chars):
     """Wiki search for the combined tool. Returns (payload, error) and never raises."""
     try:
         params = {"q": query, "limit": WIKI_POOL}
-        if full_documents:
+        if full_documents or WIKI_FULL_TEXT:
             params.update({
                 "full_text": "true",
-                "max_chars": max(500, min(int(document_max_chars), 20000)),
+                "max_chars": max(500, min(int(document_max_chars if full_documents else WIKI_FULL_TEXT_CHARS), 20000)),
             })
         else:
             params["full_text"] = "false"
@@ -987,6 +1041,7 @@ def search_wiki(
         return {"error": "Please provide a query."}
 
     document_max_chars = max(500, min(int(document_max_chars), 20000))
+    full_documents = bool(full_documents or WIKI_FULL_TEXT)
     try:
         params = {"q": query, "limit": max(1, min(int(limit), 10))}
         if full_documents:
@@ -1135,6 +1190,7 @@ def search_sujeeth_foundation(
         quality["agent_instructions"] += PRIORITY_INSTRUCTIONS
 
     documents_summary = None
+    wiki_only_documents = False
     if full_documents and results:
         documents_summary = attach_full_documents(
             results,
@@ -1143,8 +1199,16 @@ def search_sujeeth_foundation(
         )
         if documents_summary["returned"]:
             quality["agent_instructions"] = quality["agent_instructions"] + FULL_DOCUMENT_INSTRUCTIONS
+    elif WIKI_FULL_TEXT and results:
+        documents_summary = attach_wiki_documents(results)
+        wiki_only_documents = bool(documents_summary["returned"])
     lap("documents_ms")
-    if not (documents_summary and documents_summary["returned"]):
+    if wiki_only_documents:
+        quality["agent_instructions"] = quality["agent_instructions"].replace(
+            "Otherwise answer from the results and cite their URLs.",
+            "Otherwise answer from the results, reading pages as described below, and cite their URLs.",
+        ) + WIKI_DOCUMENT_INSTRUCTIONS
+    elif not (documents_summary and documents_summary["returned"]):
         quality["agent_instructions"] = quality["agent_instructions"].replace(
             "Otherwise answer from the results and cite their URLs.",
             "Otherwise answer from the results, reading pages as described below, and cite their URLs.",
