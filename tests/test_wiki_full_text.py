@@ -22,10 +22,9 @@ def wire(monkeypatch, wiki_text=PAGE, truncated=False, wiki_hits=1):
     seen = []
 
     def post(url, headers=None, json=None, timeout=None):
-        if url.endswith("/api/domain-resolution"):
-            return reply(b'{"status": "resolved", "matched_concepts": ["volunteer"], "domains": ["sujeeth.org"]}')
         return reply(
-            b'{"status": "completed", "results": [{"title": "Volunteer", "url": "https://sujeeth.org/volunteer", '
+            b'{"status": "completed", "resolution": {"status": "resolved", "matched_concepts": ["volunteer"], '
+            b'"domains": ["sujeeth.org"]}, "results": [{"title": "Volunteer", "url": "https://sujeeth.org/volunteer", '
             b'"snippet": "Our volunteer mission.", "source": "website", "domain": "sujeeth.org", "chunk_id": "w-0"}]}'
         )
 

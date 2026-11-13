@@ -16,12 +16,13 @@ def reply(body):
     return response
 
 
+RESOLUTION = '"resolution": {"status": "resolved", "matched_concepts": ["circle"], "domains": ["sujeeth.org"]}'
+
+
 def wire(monkeypatch, website_domain="sujeeth.org", wiki=True):
     def post(url, headers=None, json=None, timeout=None):
-        if url.endswith("/api/domain-resolution"):
-            return reply(b'{"status": "resolved", "matched_concepts": ["circle"], "domains": ["sujeeth.org"]}')
         return reply(
-            ('{"status": "completed", "results": [{"title": "Report", "url": "https://www.sujeeth.org/report.pdf", '
+            ('{"status": "completed", ' + RESOLUTION + ', "results": [{"title": "Report", "url": "https://www.sujeeth.org/report.pdf", '
              '"snippet": "Part of the report.", "source": "website", "domain": "%s", "chunk_id": "r-3"}]}'
              % website_domain).encode())
 

@@ -97,9 +97,9 @@ def test_warmup_runs_the_search_and_reads_the_pages_it_finds(monkeypatch, capsys
     """The warm-up runs on a plain thread. After the tools were wrapped it called the async wrapper, got a
     coroutine, and failed every query with: 'coroutine' object has no attribute 'get'."""
     def fake_post(url, payload, key="", timeout=None):
-        if url.endswith("/api/domain-resolution"):
-            return {"status": "resolved", "matched_concepts": ["circle"], "domains": ["sujeeth.org"]}
-        return {"status": "completed", "results": [{"title": "Career Circle", "url": "https://www.sujeeth.org/circle",
+        return {"status": "completed",
+                "resolution": {"status": "resolved", "matched_concepts": ["circle"], "domains": ["sujeeth.org"]},
+                "results": [{"title": "Career Circle", "url": "https://www.sujeeth.org/circle",
                                                     "snippet": "A six week program.", "source": "website",
                                                     "domain": "sujeeth.org", "chunk_id": "c-0"}]}
 

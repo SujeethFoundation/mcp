@@ -21,6 +21,8 @@ The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mc
 | `search_website` | Search ontology-approved websites only |
 | `search_wiki` | Search the GitHub wiki only |
 
+**One request to the Search App per search.** `search_sujeeth_foundation` sends the question to the Search App once. The Search App resolves it through the ontology and searches in the same request, and its answer carries the resolution (`ontology` in the response). The wiki is searched in parallel. If the Search App fails, the wiki results are still returned with `status: partial`, and the agent is told the service is degraded rather than asked to clarify. `retrieval.website_candidates` and `retrieval.wiki_candidates` count what each source found before the best results were chosen across sources; `count` is what the response returns.
+
 Wiki results carry their whole page in a `document` field (`WIKI_FULL_TEXT=true`, each page cut at `WIKI_FULL_TEXT_CHARS`, default 12000); other results are excerpts. The tool descriptions and the server `instructions` that agents read are built from one set of constants in `mcp_server.py`, so the page limit and the statistics rule read the same everywhere.
 
 **Admin tools** (hidden unless `MCP_ADMIN_TOOLS=true`, which is meant for local testing): `check_services`, `resolve_ontology`, `get_ontology_context`. They expose backend health and the ontology's internal structure, so they are off in production.

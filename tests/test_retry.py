@@ -205,21 +205,14 @@ def test_a_wiki_document_read_is_not_retried(monkeypatch):
 # -- the combined search --------------------------------------------------------------------------------------------
 
 def routed(monkeypatch, search_outcomes):
-    """The combined search with the ontology resolving, the wiki answering and /api/search following search_outcomes."""
+    """The combined search with the wiki answering and the one /api/search request following search_outcomes."""
     fake = Fake(monkeypatch, search_outcomes)
-    search_post = fake.post
-
-    def post(url, headers=None, json=None, timeout=None):
-        if url.endswith("/api/domain-resolution"):
-            return reply(body=b'{"status": "resolved", "matched_concepts": ["circle"], "domains": ["sujeeth.org"]}')
-        return search_post(url, headers=headers, json=json, timeout=timeout)
-
-    monkeypatch.setattr(server.http, "post", post)
     monkeypatch.setattr(server, "get_json", lambda url, key="", params=None: {"results": []})
     return fake
 
 
-WEBSITE_HIT = (b'{"status": "completed", "results": [{"title": "Career Circle", "url": "https://www.sujeeth.org/circle", '
+WEBSITE_HIT = (b'{"status": "completed", "resolution": {"status": "resolved", "matched_concepts": ["circle"], '
+               b'"domains": ["sujeeth.org"]}, "results": [{"title": "Career Circle", "url": "https://www.sujeeth.org/circle", '
                b'"snippet": "A six week program.", "source": "website", "domain": "sujeeth.org", "chunk_id": "c-0"}]}')
 
 

@@ -91,7 +91,7 @@ RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)   
 # MAX_RESULTS_PER_DOMAIN: ceiling per source. Results are picked one per source first, then a
 #   second per source, and so on, until SEARCH_RESULT_COUNT is reached.
 RESULT_COUNT = int(setting("SEARCH_RESULT_COUNT", "10") or 10)
-CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "50") or 50)
+CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "20") or 20)   # the Search App returns at most SEARCH_MAX_LIMIT (20)
 MAX_PER_DOMAIN = int(setting("MAX_RESULTS_PER_DOMAIN", "2") or 2)
 WIKI_POOL = MAX_PER_DOMAIN + 2  # the wiki counts as one source, so it needs only a few candidates
 # On Azure (App Service or Azure Functions) listen on all interfaces. Locally, listen on 127.0.0.1.
@@ -601,10 +601,12 @@ def assess_quality(resolution, results, errors):
     matches = resolution.get("concept_matches") or []
     reasons = []
 
-    if not concepts:
-        reasons.append("No clear ontology concept match.")
-    if not resolution.get("domains"):
-        reasons.append("No approved search domain was resolved.")
+    # When the Search App could not be reached nothing is known about the topic, so the question is not unclear.
+    if resolution.get("status") != "unavailable":
+        if not concepts:
+            reasons.append("No clear ontology concept match.")
+        if not resolution.get("domains"):
+            reasons.append("No approved search domain was resolved.")
     if not results:
         reasons.append("No usable search results were returned.")
     elif not any(str(x.get("snippet") or "").strip() for x in results):
@@ -736,6 +738,13 @@ PRIORITY_INSTRUCTIONS = (
     " Results flagged best_bet or spotlight are curated pages. Present them first, "
     "in the order returned. When one fits the question, include it with its link "
     "and one sentence on why it fits."
+)
+
+# A spotlight is a story about one volunteer. It is the Foundation's own proof of what mentoring leads to, so the
+# agent offers it as an example rather than burying it among the other links.
+SPOTLIGHT_INSTRUCTIONS = (
+    " A spotlight is the story of one volunteer's career path. When one fits the question, offer it as a "
+    "real example: say in one sentence what that person did, and give the link."
 )
 
 
@@ -1206,57 +1215,32 @@ def search_sujeeth_foundation(
     wiki_pool = ThreadPoolExecutor(max_workers=1)
     wiki_future = wiki_pool.submit(run_wiki_search, query, full_documents, document_max_chars)
 
-    # First resolve the query through the Search App's ontology resolver.
+    # One request to the Search App does the ontology resolution and the search, and its answer carries the
+    # resolution. Resolving first and sending the matched concepts back as explicit ones cost a second
+    # round trip and made concepts the ontology merely added by relationship count as concepts the question
+    # named. The Search App itself refuses to search when no concept or domain is authorized.
     try:
-        resolution = post_json(
-            f"{WEBSEARCH_URL}/api/domain-resolution",
-            {"query": query, "purpose": "search"},
+        website = post_json_with_retry(
+            f"{WEBSEARCH_URL}/api/search",
+            {"query": query, "purpose": "search", "limit": CANDIDATE_POOL},
             WEBSEARCH_KEY,
         )
-    except Exception as exc:
-        wiki_pool.shutdown(wait=False)
-        return {
-            "query": query,
-            "status": "resolution_failed",
-            "results": [],
-            "service_errors": [
-                {"service": "websearch_resolution", **error_result(exc)}
-            ],
-            "needs_clarification": False,
-            "service_degraded": True,
-            "suggested_question": None,
-            "agent_instructions": (
-                "The Foundation search service is temporarily unavailable. Tell the "
-                "user, suggest trying again shortly, and do not guess an answer. "
-                "Do not ask the user to clarify their question."
-            ),
+        resolution = website.get("resolution") or {
+            "status": website.get("status"),
+            "ontology_version": website.get("ontology_version"),
+            "matched_concepts": website.get("concepts") or [],
+            "domains": website.get("domains") or [],
+            "message": website.get("message"),
         }
-
-    lap("resolution_ms")
+    except Exception as exc:
+        # The wiki answer is still worth returning, so a Search App failure no longer ends the request.
+        website = {"results": []}
+        resolution = {"status": "unavailable"}
+        errors.append({"service": "websearch", **error_result(exc)})
     concepts = resolution.get("matched_concepts") or []
     domains = resolution.get("domains") or []
 
-    # Only search websites when the ontology authorizes a concept and domain.
-    if concepts and domains:
-        try:
-            website = post_json_with_retry(
-                f"{WEBSEARCH_URL}/api/search",
-                {
-                    "query": query,
-                    "concepts": concepts,
-                    "domains": domains,
-                    "purpose": "search",
-                    "limit": CANDIDATE_POOL,
-                },
-                WEBSEARCH_KEY,
-            )
-        except Exception as exc:
-            website = {"results": []}
-            errors.append({"service": "websearch", **error_result(exc)})
-    else:
-        website = {"results": [], "status": resolution.get("status")}
-
-    lap("website_ms")
+    lap("websearch_ms")
     wiki, wiki_error = wiki_future.result()
     wiki_pool.shutdown(wait=False)
     if wiki_error is not None:
@@ -1273,6 +1257,8 @@ def search_sujeeth_foundation(
     quality = assess_quality(resolution, results, errors)
     if best_bet_count or spotlight_count:
         quality["agent_instructions"] += PRIORITY_INSTRUCTIONS
+    if spotlight_count:
+        quality["agent_instructions"] += SPOTLIGHT_INSTRUCTIONS
 
     documents_summary = None
     if full_documents and results:
