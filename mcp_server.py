@@ -596,6 +596,30 @@ def resolution_summary(data):
     return summary
 
 
+# Concepts the ontology links with "illustrates" (for example Resume Resource and Week 3) are one answer, not two
+# competing readings. The pairs come from the public ontology file, loaded once. If it cannot be loaded the set
+# stays empty and the close-match question is asked as before.
+ONTOLOGY_URL = setting(
+    "MCP_ONTOLOGY_URL", "https://raw.githubusercontent.com/SujeethFoundation/ontology/main/ontology/ontology.json"
+)
+_linked_pairs: set | None = None
+
+
+def linked_concept_pairs():
+    global _linked_pairs
+    if _linked_pairs is None:
+        pairs = set()
+        try:
+            data = requests.get(ONTOLOGY_URL, timeout=min(5, TIMEOUT)).json()
+            for rel in data.get("relationships", []):
+                if rel.get("predicate") == "illustrates":
+                    pairs.add(frozenset((rel.get("subject"), rel.get("object"))))
+        except Exception:
+            return set()  # do not cache a failure; try again on the next question
+        _linked_pairs = pairs
+    return _linked_pairs
+
+
 def assess_quality(resolution, results, errors):
     concepts = resolution.get("matched_concepts") or []
     matches = resolution.get("concept_matches") or []
@@ -634,8 +658,10 @@ def assess_quality(resolution, results, errors):
     # "Week 3" are noise, not a competing reading. Only look for a tie when nothing was named.
     close_pair = None
     if not has_strong and len(weak) >= 2 and weak[0][0] - weak[1][0] <= 0.10:
-        reasons.append("Leading ontology matches are very close.")
-        close_pair = (weak[0][1], weak[1][1])
+        pair_ids = frozenset((weak[0][1].get("concept_id"), weak[1][1].get("concept_id")))
+        if pair_ids not in linked_concept_pairs():
+            reasons.append("Leading ontology matches are very close.")
+            close_pair = (weak[0][1], weak[1][1])
 
     # A service failure is not a reason to quiz the user about their topic.
     service_degraded = bool(errors)
@@ -665,6 +691,11 @@ def assess_quality(resolution, results, errors):
         "available concepts. Never guess a domain or search outside "
         "ontology-approved domains. Otherwise answer from the results, reading "
         "pages as described below, and cite their URLs. " + STATS_RULE
+    )
+    instructions += (
+        " When the matched concepts include both a skill and the program week that illustrates it "
+        "(for example Resume Resource and Week 3), do not ask which one the user meant. Lead with the "
+        "guidance, then use the week's agenda as the worked example."
     )
     if service_degraded:
         instructions += (
