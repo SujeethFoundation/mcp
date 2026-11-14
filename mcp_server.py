@@ -202,7 +202,8 @@ WARMUP_QUERIES = [
     for q in str(setting(
         "WARMUP_QUERIES",
         "Week 1 agenda; Week 2 agenda; Week 3 agenda; Week 4 agenda; Week 5 agenda; "
-        "Week 6 agenda; how Career Circles work; become a mentor volunteer; mentor FAQ",
+        "Week 6 agenda; how Career Circles work; become a mentor volunteer; mentor FAQ; "
+        "Career Circle six-week mentorship program; Career Circles six-week mentorship program",
     )).replace("\n", ";").split(";")
     if q.strip()
 ]
@@ -1647,7 +1648,7 @@ def warm_cache_once():
     seen, pages, failures = set(), 0, 0
     for query in WARMUP_QUERIES:
         try:
-            found = search_sujeeth_foundation.sync(query, limit=4, full_documents=False)
+            found = search_sujeeth_foundation.sync(query)  # same arguments as the agent, so the search cache gets the entry it will ask for
             targets = []
             for item in found.get("results", []) or []:
                 url = str(item.get("url") or "").strip()
