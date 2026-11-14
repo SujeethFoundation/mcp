@@ -178,10 +178,13 @@ DOCUMENT_CACHE_MAX = max(10, int(setting("DOCUMENT_CACHE_MAX_ENTRIES", "300") or
 SEARCH_CACHE_SECONDS = max(0, int(setting("SEARCH_CACHE_SECONDS", "300") or 0))
 SEARCH_CACHE_MAX = max(10, int(setting("SEARCH_CACHE_MAX_ENTRIES", "200") or 200))
 
-# The wiki is the Foundation's own content, so the combined search uses it only when the ontology says sujeeth.org is
-# an appropriate source for the question. Otherwise a keyword hit in the wiki (a partner FAQ turning up for a resume
-# question) is noise that also costs tokens. WIKI_NEEDS_FOUNDATION_DOMAIN=false puts the wiki back in every search.
-WIKI_NEEDS_FOUNDATION_DOMAIN = flag("WIKI_NEEDS_FOUNDATION_DOMAIN", "true")
+# The wiki is the Foundation's own content and is searched for every question the ontology recognizes as being about the
+# Foundation, whatever domains it approved: a concept with no approved domain ("week") used to leave the wiki out and the
+# answer empty. The wiki search runs alongside the website search either way, so this costs no time. A question that matches
+# no concept at all is still out of scope and returns nothing. WIKI_NEEDS_FOUNDATION_DOMAIN=true brings back the gate: the
+# wiki is used only when the ontology approved sujeeth.org (it kept a partner FAQ out of a resume question that resolved to
+# tealhq.com, at the cost of empty answers for concepts without a domain).
+WIKI_NEEDS_FOUNDATION_DOMAIN = flag("WIKI_NEEDS_FOUNDATION_DOMAIN", "false")
 
 # What the model reads. Every search result is read by the model on the next step, so extra bytes are extra seconds.
 # SLIM_RESULTS drops the per-result fields the model does not use (score, concept list, chunk id, empty flags).
