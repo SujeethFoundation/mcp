@@ -27,6 +27,8 @@ Wiki results carry their whole page in a `document` field (`WIKI_FULL_TEXT=true`
 
 **Admin tools** (hidden unless `MCP_ADMIN_TOOLS=true`, which is meant for local testing): `check_services`, `resolve_ontology`, `get_ontology_context`. They expose backend health and the ontology's internal structure, so they are off in production.
 
+**Tool annotations.** Every tool in `tools/list` carries `readOnlyHint: true` and `destructiveHint: false`, because none of them writes anything. `openWorldHint` is `true` for `search_sujeeth_foundation`, `search_website` and `get_documents` (results can come from approved third-party websites) and `false` for `search_wiki` and the admin tools (Foundation-owned data only). `tests/test_tool_annotations.py` checks all of this.
+
 ### What the results tell the agent
 
 - `needs_clarification` and `suggested_question`: set when no concept matched, no domain was approved, nothing useful came back, or two weaker concept matches are nearly tied. Explicit matches (for example both "Sujeeth Foundation" and "donation" named in the question) are not treated as ambiguity.

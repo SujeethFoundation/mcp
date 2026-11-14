@@ -26,6 +26,7 @@ if _VENDORED.is_dir() and str(_VENDORED) not in sys.path:
 
 import requests  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
+from mcp.types import ToolAnnotations  # noqa: E402
 
 from rate_limit import RateLimitMiddleware, TrustedRanges  # noqa: E402
 
@@ -966,7 +967,7 @@ def attach_wiki_documents(results):
 # ------------------------------------------------------------
 
 mcp = FastMCP(
-    "Sujeeth Foundation Search",
+    "Sujeeth Foundation Graph",
     instructions=SERVER_INSTRUCTIONS,
     host=MCP_HOST,
     port=MCP_PORT,
@@ -974,9 +975,24 @@ mcp = FastMCP(
 )
 
 
+def tool_annotations(open_world: bool) -> ToolAnnotations:
+    """Every tool here only reads. open_world is True when a result can come from a third-party website."""
+    return ToolAnnotations(
+        readOnlyHint=True,
+        destructiveHint=False,
+        openWorldHint=open_world,
+    )
+
+
+# Closed world: the Foundation's own wiki, ontology and Function Apps.
+CLOSED_WORLD = tool_annotations(open_world=False)
+# Open world: results can include pages from approved third-party partner websites.
+OPEN_WORLD = tool_annotations(open_world=True)
+
+
 def admin_tool(fn):
     """Register a diagnostic or ontology tool only when MCP_ADMIN_TOOLS is on."""
-    return mcp.tool()(in_thread(fn)) if ADMIN_TOOLS else fn
+    return mcp.tool(annotations=CLOSED_WORLD)(in_thread(fn)) if ADMIN_TOOLS else fn
 
 
 @mcp.custom_route("/healthz", methods=["GET"])
@@ -1105,7 +1121,7 @@ def get_ontology_context(
         return error_result(exc)
 
 
-@mcp.tool(description=WEBSITE_SEARCH_DESCRIPTION)
+@mcp.tool(description=WEBSITE_SEARCH_DESCRIPTION, annotations=OPEN_WORLD)
 @in_thread
 def search_website(
     query: str,
@@ -1153,7 +1169,7 @@ def run_wiki_search(query, full_documents, document_max_chars):
         return {"results": []}, exc
 
 
-@mcp.tool(description=WIKI_SEARCH_DESCRIPTION)
+@mcp.tool(description=WIKI_SEARCH_DESCRIPTION, annotations=CLOSED_WORLD)
 @in_thread
 def search_wiki(
     query: str,
@@ -1204,7 +1220,7 @@ def search_wiki(
         return error_result(exc)
 
 
-@mcp.tool(description=SEARCH_DESCRIPTION)
+@mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD)
 @in_thread
 def search_sujeeth_foundation(
     query: str,
@@ -1421,7 +1437,7 @@ def explain_fetch_error(exc):
     return error_result(exc).get("error", "Could not read the document.")
 
 
-@mcp.tool(description=GET_DOCUMENTS_DESCRIPTION)
+@mcp.tool(description=GET_DOCUMENTS_DESCRIPTION, annotations=OPEN_WORLD)
 @in_thread
 def get_documents(urls: list[str], max_chars: int = DOCUMENT_DEFAULT_CHARS) -> dict[str, Any]:
     """Read the full text of the pages behind search results. The agent-facing description is GET_DOCUMENTS_DESCRIPTION."""
