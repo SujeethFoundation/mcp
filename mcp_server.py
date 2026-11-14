@@ -622,12 +622,15 @@ def linked_concept_pairs():
 
 
 # What the customer is told when nothing in the ontology matches the question.
-OUT_OF_SCOPE_MESSAGE = "I can only help with information about the Foundation or services from the Foundation."
+OUT_OF_SCOPE_MESSAGE = (
+    "That's outside what I can help with. I answer questions about the Sujeeth Foundation and what it offers: "
+    "Career Circles, mentoring, volunteering, donating, partnering, and career resources. "
+    "Ask about any of those and I'll point you to the right page."
+)
 
 OUT_OF_SCOPE_INSTRUCTIONS = (
     "This question is not about the Foundation: no ontology concept matched it, so nothing was searched. "
-    f'Tell the person: "{OUT_OF_SCOPE_MESSAGE}" You may add one line on what you can help with (the Career Circles '
-    "program, mentoring, volunteering, donating, partnering, and career resources from the Foundation). Do not "
+    f'Reply with this message, in these words: "{OUT_OF_SCOPE_MESSAGE}" Add nothing to it. Do not '
     "answer the question from general knowledge, do not search again for it, and do not ask which area they mean."
 )
 
@@ -860,7 +863,7 @@ SERVER_INSTRUCTIONS = (
        else "Results are excerpts. ")
     + f"If the excerpts do not answer the question, call get_documents once with the urls you need "
     f"(at most {MAX_BATCH_DOCUMENTS}). Cite the url for every claim. " + STATS_RULE
-    + f' If a search comes back out_of_scope, answer with its message ("{OUT_OF_SCOPE_MESSAGE}") and nothing from '
+    + " If a search comes back out_of_scope, reply with its message as written and nothing from "
     "general knowledge. Ask a clarifying question only when the response has needs_clarification true."
 )
 

@@ -80,7 +80,7 @@ NO_MATCH = {"status": "no_ontology_concept_match", "concepts": [], "domains": []
             "resolution": {"status": "no_match", "matched_concepts": [], "domains": [], "concept_matches": []}}
 WIKI_HIT = {"title": "Donor FAQ", "url": "https://github.com/x/wiki/FAQ-for-Donors", "snippet": "Giving", "source": "wiki",
             "path": "FAQ.md", "chunk_id": "FAQ.md"}
-REFUSAL = "I can only help with information about the Foundation or services from the Foundation."
+REFUSAL = server.OUT_OF_SCOPE_MESSAGE
 
 
 def test_a_question_with_no_concept_is_refused_not_clarified(monkeypatch):
@@ -90,6 +90,7 @@ def test_a_question_with_no_concept_is_refused_not_clarified(monkeypatch):
     assert out["needs_clarification"] is False and out["suggested_question"] is None
     assert out["results"] == [] and out["count"] == 0
     assert REFUSAL in out["agent_instructions"] and "do not ask which area" in out["agent_instructions"]
+    assert out["message"].startswith("That's outside what I can help with.") and "Sujeeth Foundation" in out["message"]
 
 
 def test_a_refusal_returns_no_wiki_results_even_when_the_wiki_found_keyword_hits(monkeypatch):
@@ -137,7 +138,7 @@ def test_one_clear_match_with_a_weaker_one_is_not_ambiguous(monkeypatch):
 
 
 def test_the_server_instructions_tell_the_agent_how_to_refuse():
-    assert REFUSAL in server.SERVER_INSTRUCTIONS and "out_of_scope" in server.SEARCH_DESCRIPTION
+    assert "out_of_scope" in server.SEARCH_DESCRIPTION and "as written" in server.SERVER_INSTRUCTIONS
 
 
 def test_a_search_app_failure_still_returns_the_wiki_answer(monkeypatch):
