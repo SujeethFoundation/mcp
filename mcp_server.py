@@ -621,21 +621,48 @@ def linked_concept_pairs():
     return _linked_pairs
 
 
+# What the customer is told when nothing in the ontology matches the question.
+OUT_OF_SCOPE_MESSAGE = (
+    "That's outside what I can help with. I'm here to help you get ready for your first job: career guidance, "
+    "interview prep, resume feedback, and how to build a network of professionals. If you want to mentor, give, "
+    "or bring Career Circles to your school, ask me about that too."
+)
+
+OUT_OF_SCOPE_INSTRUCTIONS = (
+    "This question is not about the Foundation: no ontology concept matched it, so nothing was searched. "
+    f'Reply with this message, in these words: "{OUT_OF_SCOPE_MESSAGE}" Add nothing to it. Do not '
+    "answer the question from general knowledge, do not search again for it, and do not ask which area they mean."
+)
+
+NO_RESULTS_INSTRUCTIONS = (
+    " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
+    "Do not answer from general knowledge and do not ask a clarifying question."
+)
+
+
 def assess_quality(resolution, results, errors):
+    """Decide whether the question is out of scope, ambiguous, or fine.
+
+    Out of scope: no ontology concept matched, so the question is not about the Foundation. The answer is a refusal
+    with no results. Ambiguous: two weaker concept matches are nearly tied and the ontology does not link them, so
+    they could conflict. Only then is the person asked a question. Nothing else is a reason to ask: a question
+    that matched a concept but found little is answered with what there is, or with a plain "nothing found".
+    """
     concepts = resolution.get("matched_concepts") or []
     matches = resolution.get("concept_matches") or []
     reasons = []
 
-    # When the Search App could not be reached nothing is known about the topic, so the question is not unclear.
-    if resolution.get("status") != "unavailable":
-        if not concepts:
-            reasons.append("No clear ontology concept match.")
-        if not resolution.get("domains"):
-            reasons.append("No approved search domain was resolved.")
-    if not results:
-        reasons.append("No usable search results were returned.")
-    elif not any(str(x.get("snippet") or "").strip() for x in results):
-        reasons.append("Results contain no useful excerpts.")
+    # When the Search App could not be reached nothing is known about the topic, so it is not a refusal either.
+    out_of_scope = resolution.get("status") != "unavailable" and not concepts
+    if out_of_scope:
+        reasons.append("No ontology concept matched: the question is not about the Foundation.")
+    elif resolution.get("status") != "unavailable" and not resolution.get("domains"):
+        reasons.append("No approved search domain was resolved.")
+    if not out_of_scope:
+        if not results:
+            reasons.append("No usable search results were returned.")
+        elif not any(str(x.get("snippet") or "").strip() for x in results):
+            reasons.append("Results contain no useful excerpts.")
 
     # Matches at or above 1.0 are explicit term hits in the query (for example both
     # "Sujeeth Foundation" and "donation" were named), so they are not competing
@@ -667,24 +694,24 @@ def assess_quality(resolution, results, errors):
     # A service failure is not a reason to quiz the user about their topic.
     service_degraded = bool(errors)
     all_failed = service_degraded and not results
-    needs_clarification = bool(reasons) and not all_failed
+    needs_clarification = bool(close_pair) and not all_failed and not out_of_scope
     question = None
 
     if needs_clarification:
-        if not concepts:
-            question = (
-                "Which Foundation area are you asking about: the Career Circle "
-                "Program, students, volunteers, books, or resources?"
-            )
-        elif close_pair:
-            first = close_pair[0].get("name", "the first topic")
-            second = close_pair[1].get("name", "the second topic")
-            question = f"Are you asking about {first} or {second}?"
-        else:
-            question = (
-                "Could you clarify whether you mean the Career Circle Program, "
-                "a specific person, a book, or another Foundation resource?"
-            )
+        first = close_pair[0].get("name", "the first topic")
+        second = close_pair[1].get("name", "the second topic")
+        question = f"Are you asking about {first} or {second}?"
+
+    if out_of_scope:
+        return {
+            "out_of_scope": True,
+            "message": OUT_OF_SCOPE_MESSAGE,
+            "needs_clarification": False,
+            "service_degraded": service_degraded,
+            "reasons": reasons,
+            "suggested_question": None,
+            "agent_instructions": OUT_OF_SCOPE_INSTRUCTIONS,
+        }
 
     instructions = (
         "If needs_clarification is true, ask the suggested question before "
@@ -693,6 +720,8 @@ def assess_quality(resolution, results, errors):
         "ontology-approved domains. Otherwise answer from the results, reading "
         "pages as described below, and cite their URLs. " + STATS_RULE
     )
+    if not results and not service_degraded:
+        instructions += NO_RESULTS_INSTRUCTIONS
     instructions += (
         " When the matched concepts include both a skill and the program week that illustrates it "
         "(for example Resume Resource and Week 3), do not ask which one the user meant. Lead with the "
@@ -706,6 +735,7 @@ def assess_quality(resolution, results, errors):
         )
 
     return {
+        "out_of_scope": False,
         "needs_clarification": needs_clarification,
         "service_degraded": service_degraded,
         "reasons": reasons,
@@ -794,7 +824,9 @@ SEARCH_DESCRIPTION = (
     + ("A wiki result carries its whole page in a document field; every other result" if WIKI_FULL_TEXT
        else "Every result")
     + " is an excerpt that can stop mid-sentence, and get_documents reads the full page. The response "
-    "includes agent_instructions and, when the question is ambiguous, a suggested_question to ask. "
+    "includes agent_instructions and, only when two readings of the question could conflict, a "
+    "suggested_question to ask. If the response has out_of_scope true, the question is not about the Foundation: "
+    "relay its message and do not answer from other sources. "
     "Leave full_documents, max_documents and document_max_chars at their defaults."
 )
 
@@ -831,6 +863,8 @@ SERVER_INSTRUCTIONS = (
        else "Results are excerpts. ")
     + f"If the excerpts do not answer the question, call get_documents once with the urls you need "
     f"(at most {MAX_BATCH_DOCUMENTS}). Cite the url for every claim. " + STATS_RULE
+    + " If a search comes back out_of_scope, reply with its message as written and nothing from "
+    "general knowledge. Ask a clarifying question only when the response has needs_clarification true."
 )
 
 # Total characters of document text attached to one search response, so a broad question
@@ -1239,7 +1273,9 @@ def search_sujeeth_foundation(
     full page text instead: every best bet gets one, plus up to max_documents other results
     (default: all of them), each up to document_max_chars, within the response's total
     character budget (uses many tokens). Third-party pages are always excerpts.
-    Returns a suggested clarification question when search quality is weak.
+    Returns a suggested question only when two readings of the question could conflict. When no concept
+    matches, the question is not about the Foundation: the response has out_of_scope true, a message to
+    relay, and no results.
     """
     query = (query or "").strip()
     if not query:
@@ -1302,6 +1338,10 @@ def search_sujeeth_foundation(
         wiki_items, normalize_results(website, "website"), limit
     )
     quality = assess_quality(resolution, results, errors)
+    out_of_scope = quality["out_of_scope"]
+    if out_of_scope:
+        # Nothing in the ontology matched, so the wiki keyword hits are noise too: return no results at all.
+        results, best_bet_count, spotlight_count = [], 0, 0
     if best_bet_count or spotlight_count:
         quality["agent_instructions"] += PRIORITY_INSTRUCTIONS
     if spotlight_count:
@@ -1320,7 +1360,8 @@ def search_sujeeth_foundation(
         reading = WIKI_DOCUMENT_INSTRUCTIONS if documents_summary["returned"] else EXCERPT_INSTRUCTIONS
     else:
         reading = EXCERPT_INSTRUCTIONS
-    quality["agent_instructions"] += reading
+    if not out_of_scope:
+        quality["agent_instructions"] += reading
     lap("documents_ms")
     strip_internal(results)
     timings["total_ms"] = round((time.perf_counter() - started) * 1000)
@@ -1328,7 +1369,7 @@ def search_sujeeth_foundation(
 
     return {
         "query": query,
-        "status": "partial" if errors else "completed",
+        "status": "out_of_scope" if out_of_scope else "partial" if errors else "completed",
         "ontology": resolution_summary(resolution),
         # "count" is what this response returns. The candidates are what each source found before
         # the best results were chosen across sources, so they are usually larger.

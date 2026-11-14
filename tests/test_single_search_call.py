@@ -76,11 +76,69 @@ def test_the_ontology_block_is_the_search_apps_resolution(monkeypatch):
     assert out["needs_clarification"] is False and out["status"] == "completed"
 
 
-def test_a_question_with_no_concept_asks_for_clarification(monkeypatch):
-    wire(monkeypatch, {"status": "no_ontology_concept_match", "concepts": [], "domains": [], "count": 0, "results": [],
-                       "resolution": {"status": "no_match", "matched_concepts": [], "domains": [], "concept_matches": []}})
+NO_MATCH = {"status": "no_ontology_concept_match", "concepts": [], "domains": [], "count": 0, "results": [],
+            "resolution": {"status": "no_match", "matched_concepts": [], "domains": [], "concept_matches": []}}
+WIKI_HIT = {"title": "Donor FAQ", "url": "https://github.com/x/wiki/FAQ-for-Donors", "snippet": "Giving", "source": "wiki",
+            "path": "FAQ.md", "chunk_id": "FAQ.md"}
+REFUSAL = server.OUT_OF_SCOPE_MESSAGE
+
+
+def test_a_question_with_no_concept_is_refused_not_clarified(monkeypatch):
+    wire(monkeypatch, NO_MATCH)
     out = search("what is the weather")
-    assert out["needs_clarification"] is True and out["suggested_question"]
+    assert out["out_of_scope"] is True and out["status"] == "out_of_scope" and out["message"] == REFUSAL
+    assert out["needs_clarification"] is False and out["suggested_question"] is None
+    assert out["results"] == [] and out["count"] == 0
+    assert REFUSAL in out["agent_instructions"] and "do not ask which area" in out["agent_instructions"]
+    assert out["message"].startswith("That's outside what I can help with.") and "interview prep" in out["message"] and "mentor" in out["message"]
+
+
+def test_a_refusal_returns_no_wiki_results_even_when_the_wiki_found_keyword_hits(monkeypatch):
+    wire(monkeypatch, NO_MATCH, wiki=[WIKI_HIT])
+    out = search("directions to a bar")
+    assert out["out_of_scope"] is True and out["results"] == [] and out["best_bet_count"] == 0
+
+
+def test_a_search_app_outage_is_not_a_refusal(monkeypatch):
+    wire(monkeypatch, requests.ConnectionError("down"), wiki=[WIKI_HIT])
+    out = search()
+    assert out["out_of_scope"] is False and out["status"] == "partial" and "message" not in out
+    assert [r["source"] for r in out["results"]] == ["wiki"]
+
+
+def test_a_matched_question_is_never_marked_out_of_scope(monkeypatch):
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
+    out = search()
+    assert out["out_of_scope"] is False and "message" not in out
+
+
+def test_a_matched_question_with_no_results_says_so_and_does_not_ask(monkeypatch):
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": []})
+    out = search()
+    assert out["out_of_scope"] is False and out["needs_clarification"] is False and out["suggested_question"] is None
+    assert out["reasons"] and "sujeeth.org" in out["agent_instructions"]
+    assert "do not ask a clarifying question" in out["agent_instructions"]
+
+
+def test_a_matched_question_with_no_approved_domain_does_not_ask(monkeypatch):
+    resolution = dict(RESOLVED, domains=[])
+    wire(monkeypatch, {"status": "no_approved_domains_for_concepts", "resolution": resolution, "results": []})
+    out = search()
+    assert out["needs_clarification"] is False and out["suggested_question"] is None
+    assert "No approved search domain was resolved." in out["reasons"]
+
+
+def test_one_clear_match_with_a_weaker_one_is_not_ambiguous(monkeypatch):
+    monkeypatch.setattr(server, "_linked_pairs", set())
+    resolution = {"status": "resolved", "matched_concepts": ["a", "b"], "domains": ["sujeeth.org"],
+                  "concept_matches": [{"concept_id": "a", "name": "A", "confidence": 0.9},
+                                      {"concept_id": "b", "name": "B", "confidence": 0.4}]}
+    wire(monkeypatch, {"status": "completed", "resolution": resolution, "results": [HIT]})
+    assert search("something")["needs_clarification"] is False
+
+
+def test_the_server_instructions_tell_the_agent_how_to_refuse():
+    assert "out_of_scope" in server.SEARCH_DESCRIPTION and "as written" in server.SERVER_INSTRUCTIONS
 
 
 def test_a_search_app_failure_still_returns_the_wiki_answer(monkeypatch):
@@ -140,4 +198,6 @@ def test_unlinked_close_matches_still_ask(monkeypatch):
                   "concept_matches": [{"concept_id": "a", "name": "A", "confidence": 0.62},
                                       {"concept_id": "b", "name": "B", "confidence": 0.60}]}
     wire(monkeypatch, {"status": "completed", "resolution": resolution, "results": [HIT]})
-    assert search("something")["needs_clarification"] is True
+    out = search("something")
+    assert out["needs_clarification"] is True and out["out_of_scope"] is False
+    assert out["suggested_question"] == "Are you asking about A or B?"
