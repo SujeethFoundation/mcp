@@ -90,7 +90,7 @@ def test_a_question_with_no_concept_is_refused_not_clarified(monkeypatch):
     assert out["needs_clarification"] is False and out["suggested_question"] is None
     assert out["results"] == [] and out["count"] == 0
     assert REFUSAL in out["agent_instructions"] and "do not ask which area" in out["agent_instructions"]
-    assert out["message"].startswith("That's outside what I can help with.") and "Sujeeth Foundation" in out["message"]
+    assert out["message"].startswith("That's outside what I can help with.") and "interview prep" in out["message"]
 
 
 def test_a_refusal_returns_no_wiki_results_even_when_the_wiki_found_keyword_hits(monkeypatch):
