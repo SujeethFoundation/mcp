@@ -123,3 +123,21 @@ def test_a_spotlight_comes_first_and_the_agent_is_told_to_offer_it_as_an_example
 def test_without_a_spotlight_the_agent_is_not_told_about_one(monkeypatch):
     wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     assert "career path" not in search()["agent_instructions"]
+
+
+def test_concepts_the_ontology_links_with_illustrates_are_not_a_close_call(monkeypatch):
+    monkeypatch.setattr(server, "_linked_pairs", {frozenset(("resume_resource", "week_3"))})
+    resolution = {"status": "resolved", "matched_concepts": ["resume_resource", "week_3"], "domains": ["sujeeth.org"],
+                  "concept_matches": [{"concept_id": "resume_resource", "name": "Resume Resource", "confidence": 0.62},
+                                      {"concept_id": "week_3", "name": "Week 3", "confidence": 0.60}]}
+    wire(monkeypatch, {"status": "completed", "resolution": resolution, "results": [HIT]})
+    assert search("review my resume")["needs_clarification"] is False
+
+
+def test_unlinked_close_matches_still_ask(monkeypatch):
+    monkeypatch.setattr(server, "_linked_pairs", set())
+    resolution = {"status": "resolved", "matched_concepts": ["a", "b"], "domains": ["sujeeth.org"],
+                  "concept_matches": [{"concept_id": "a", "name": "A", "confidence": 0.62},
+                                      {"concept_id": "b", "name": "B", "confidence": 0.60}]}
+    wire(monkeypatch, {"status": "completed", "resolution": resolution, "results": [HIT]})
+    assert search("something")["needs_clarification"] is True
