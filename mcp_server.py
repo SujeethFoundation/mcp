@@ -95,6 +95,7 @@ RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)   
 RESULT_COUNT = int(setting("SEARCH_RESULT_COUNT", "10") or 10)
 CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "20") or 20)   # the Search App returns at most SEARCH_MAX_LIMIT (20)
 MAX_PER_DOMAIN = int(setting("MAX_RESULTS_PER_DOMAIN", "2") or 2)
+MAX_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))   # searches one tool call may combine (query + more_queries)
 WIKI_POOL = MAX_PER_DOMAIN + 2  # the wiki counts as one source, so it needs only a few candidates
 # When the best wiki result is an overview that links to the pages that answer the question ("weekly agendas" -> Weekly Content,
 # which links Week 1 to Week 6), the wiki app returns those pages with it (hub_pages / hub_of). They are kept together, outside the
@@ -903,7 +904,11 @@ SEARCH_DESCRIPTION = (
     "about the Foundation: the Career Circles program and its six-week curriculum, mentoring, "
     "volunteering, donating, partnering, annual reports, blog posts and career resources. Write the "
     "query as the few distinctive words a page would contain (for example 'week 3 resume agenda'), "
-    "not as a full sentence. Each result has a title, url, source (website or wiki) and matched "
+    "not as a full sentence. "
+    + (f"When the question has separate parts (for example a resume and an interview), put the first part in "
+       f"query and the others in more_queries, at most {MAX_QUERIES} searches in all: one call covers every part, so "
+       f"do not call this tool once per part. " if MAX_QUERIES > 1 else "")
+    + "Each result has a title, url, source (website or wiki) and matched "
     "concepts; results flagged best_bet or spotlight are curated pages. "
     + ("A wiki result carries its whole page in a document field; every other result" if WIKI_FULL_TEXT
        else "Every result")
@@ -942,7 +947,8 @@ GET_DOCUMENTS_DESCRIPTION = (
 SERVER_INSTRUCTIONS = (
     "Knowledge about the Sujeeth Foundation: its Career Circles student mentorship program, mentoring, "
     "volunteering, donating and partnering. Start with search_sujeeth_foundation; it searches the "
-    "website and the wiki together. "
+    "website and the wiki together"
+    + (", and takes the separate parts of a question in one call (more_queries). " if MAX_QUERIES > 1 else ". ")
     + ("Wiki results carry their whole page; other results are excerpts. " if WIKI_FULL_TEXT
        else "Results are excerpts. ")
     + f"If the excerpts do not answer the question, call get_documents once with the urls you need "
@@ -1380,17 +1386,9 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
-@mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD, structured_output=(REPLY_FORMAT == "both"))
-@in_thread
-def search_sujeeth_foundation(
-    query: str,
-    limit: int | None = None,
-    full_documents: bool = FULL_DOCUMENTS_DEFAULT,
-    max_documents: int | None = None,
-    document_max_chars: int = 12000,
-) -> dict[str, Any]:
+def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000):
     """
-    Search Website Search and Wiki Search together using ontology resolution.
+    One query: Search Website Search and Wiki Search together using ontology resolution.
     Results flagged best_bet or spotlight are curated pages; present them first.
     Results come from as many different sources as possible (at most MAX_RESULTS_PER_DOMAIN
     from any one). limit defaults to SEARCH_RESULT_COUNT.
@@ -1525,6 +1523,165 @@ def search_sujeeth_foundation(
     }
     _search_cache_put(cache_key, response)
     return response
+
+
+def _clean_queries(query, more_queries):
+    """The first query and the extra ones, trimmed, without repeats, at most MAX_QUERIES in all."""
+    queries, seen = [], set()
+    for text in [query] + [q for q in (more_queries or []) if isinstance(q, str)]:
+        text = (text or "").strip()
+        key = " ".join(text.lower().split())
+        if key and key not in seen:
+            seen.add(key)
+            queries.append(text)
+    return queries[:MAX_QUERIES]
+
+
+def _fit_documents(results):
+    """Keep the page text attached across several searches within one response's budget. A page that would pass the
+    budget is cut and marked truncated; when almost no room is left, it goes back to being an excerpt, or is dropped
+    if it has no excerpt left to show."""
+    kept, used = [], 0
+    for item in results:
+        text = (item.get("document") or {}).get("text")
+        if text:
+            room = DOCUMENT_CHAR_BUDGET - used
+            if len(text) > room:
+                if room >= 1000:
+                    item["document"] = {**item["document"], "text": text[:room], "truncated": True}
+                elif item.get("snippet"):
+                    item.pop("document")
+                else:
+                    continue
+            used += len((item.get("document") or {}).get("text") or "")
+        kept.append(item)
+    return kept
+
+
+def combine_searches(queries, parts, limit):
+    """One response from several searches (see search_sujeeth_foundation, more_queries).
+
+    Curated pages (best bets, spotlights) from every search come first. The rest are taken in turn, one search after
+    another, so each part of the question is represented, up to `limit`. Each page appears once, under the first
+    search that found it. A search that was out of scope adds nothing and is reported in `queries`; the whole
+    response is out of scope only when every search was. The visitor is asked to clarify only when every search
+    that found something would have asked."""
+    answered = [(q, p) for q, p in zip(queries, parts) if not p.get("error") and not p.get("out_of_scope")]
+    summary = [{
+        "query": q,
+        "status": "error" if p.get("error") else p.get("status"),
+        "matched_concepts": (p.get("ontology") or {}).get("matched_concepts", []),
+        **({"needs_clarification": True, "suggested_question": p.get("suggested_question")}
+           if p.get("needs_clarification") else {}),
+    } for q, p in zip(queries, parts)]
+    if not answered:
+        first = next((p for p in parts if not p.get("error")), parts[0])
+        return {**first, "queries": summary}
+
+    curated, rest, seen = [], [], set()
+    lists = [[dict(item, for_query=q) for item in p.get("results") or []] for q, p in answered]
+    for items in lists:
+        for item in items:
+            if item.get("best_bet") or item.get("spotlight"):
+                identity = page_identity(item)
+                if identity not in seen:
+                    seen.add(identity)
+                    curated.append(item)
+    plain = [[item for item in items if not (item.get("best_bet") or item.get("spotlight"))] for items in lists]
+    for index in range(max(len(items) for items in plain)):
+        for items in plain:
+            if index < len(items) and len(rest) < limit:
+                identity = page_identity(items[index])
+                if identity not in seen:
+                    seen.add(identity)
+                    rest.append(items[index])
+    curated.sort(key=lambda item: not item.get("best_bet"))  # best bets before spotlights, order otherwise kept
+    results = _fit_documents(curated + rest)
+
+    def union(values):
+        out = []
+        for value in values:
+            if value not in out:
+                out.append(value)
+        return out
+
+    errors = union(e for _, p in answered for e in p.get("service_errors") or [])
+    errors += [{"service": "search", "query": q, "error": p["error"]} for q, p in zip(queries, parts) if p.get("error")]
+    clarify = all(p.get("needs_clarification") for _, p in answered)
+    lead = next((p for _, p in answered if bool(p.get("needs_clarification")) == clarify), answered[0][1])
+    skipped = [q for q, p in zip(queries, parts) if p.get("out_of_scope")]
+    instructions = lead.get("agent_instructions", "") + (
+        f" This response combines {len(queries)} searches, listed in queries; each result names the search that found it "
+        "in for_query. Answer every part of the question from these results in one reply."
+    )
+    if skipped:
+        instructions += (" A search marked out_of_scope is not about the Foundation: answer the other parts, and for that "
+                         "part say only that it is outside what you can help with.")
+    documents = [item["document"] for item in results if item.get("document")]
+    return {
+        "query": queries[0],
+        "queries": summary,
+        "status": "partial" if errors else "completed",
+        "ontology": {
+            "status": (lead.get("ontology") or {}).get("status"),
+            "ontology_version": (lead.get("ontology") or {}).get("ontology_version"),
+            "matched_concepts": union(c for _, p in answered for c in (p.get("ontology") or {}).get("matched_concepts") or []),
+            "domains": union(d for _, p in answered for d in (p.get("ontology") or {}).get("domains") or []),
+            "message": (lead.get("ontology") or {}).get("message"),
+        },
+        "retrieval": {
+            "website_candidates": sum((p.get("retrieval") or {}).get("website_candidates") or 0 for _, p in answered),
+            "wiki_candidates": sum((p.get("retrieval") or {}).get("wiki_candidates") or 0 for _, p in answered),
+        },
+        "count": len(results),
+        "best_bet_count": sum(1 for item in results if item.get("best_bet")),
+        "spotlight_count": sum(1 for item in results if item.get("spotlight") and not item.get("best_bet")),
+        "full_documents": ({"returned": len(documents), "truncated": sum(1 for d in documents if d.get("truncated"))}
+                           if documents else None),
+        "results": results,
+        "service_errors": errors,
+        "out_of_scope": False,
+        "needs_clarification": clarify,
+        "service_degraded": bool(errors),
+        "reasons": union(r for _, p in answered for r in p.get("reasons") or []),
+        "suggested_question": lead.get("suggested_question") if clarify else None,
+        "agent_instructions": instructions,
+    }
+
+
+@mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD, structured_output=(REPLY_FORMAT == "both"))
+@in_thread
+def search_sujeeth_foundation(
+    query: str,
+    limit: int | None = None,
+    full_documents: bool = FULL_DOCUMENTS_DEFAULT,
+    max_documents: int | None = None,
+    document_max_chars: int = 12000,
+    more_queries: list[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Search Website Search and Wiki Search together using ontology resolution.
+    For a question with separate parts, put the first part in query and the others in more_queries
+    (at most MAX_QUERIES searches in all). They run at the same time and come back as one response:
+    one tool call, not one per part. Each search is resolved through the ontology by itself, exactly as
+    a single search is. See search_one for the rest.
+    """
+    queries = _clean_queries(query, more_queries)
+    if not queries:
+        return {"error": "Please provide a query."}
+    if len(queries) == 1:
+        return search_one(queries[0], limit, full_documents, max_documents, document_max_chars)
+
+    def run(text):
+        try:
+            return search_one(text, limit, full_documents, max_documents, document_max_chars)
+        except Exception as exc:  # one failed search must not lose the others; the cause goes to the log, not the client
+            print(f"search_part_failed {type(exc).__name__}", file=sys.stderr, flush=True)
+            return {"error": "Search failed."}
+
+    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+        parts = list(pool.map(run, queries))
+    return combine_searches(queries, parts, max(1, min(int(limit or RESULT_COUNT), 20)))
 
 
 def looks_like_wiki(url, chunk_id, source):
