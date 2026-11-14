@@ -178,6 +178,12 @@ SEARCH_CACHE_MAX = max(10, int(setting("SEARCH_CACHE_MAX_ENTRIES", "200") or 200
 # question) is noise that also costs tokens. WIKI_NEEDS_FOUNDATION_DOMAIN=false puts the wiki back in every search.
 WIKI_NEEDS_FOUNDATION_DOMAIN = flag("WIKI_NEEDS_FOUNDATION_DOMAIN", "true")
 
+# What the model reads. Every search result is read by the model on the next step, so extra bytes are extra seconds.
+# SLIM_RESULTS drops the per-result fields the model does not use (score, concept list, chunk id, empty flags).
+# The structured copy of the reply is off too: FastMCP otherwise sends the same JSON twice, as text and as
+# structuredContent, and the agent reads both. SLIM_RESULTS=false restores both.
+SLIM_RESULTS = flag("SLIM_RESULTS", "true")
+
 # Warm-up. Shortly after the server starts, and then every WARMUP_INTERVAL_SECONDS, a background
 # thread runs the common questions below and reads the Foundation's own pages they find, so the
 # page cache is filled before a user asks. It also keeps the search apps awake and rebuilds the
@@ -497,6 +503,20 @@ def normalize_results(payload, source):
             "_full_text": item.get("text") if item.get("snippet") and item.get("text") else None,
             "_truncated": bool(item.get("truncated")),
         })
+    return results
+
+
+def slim_results(results):
+    """Drop the per-result fields the model does not use. Run after everything that needs them (best-bet ordering,
+    full-document reads)."""
+    if not SLIM_RESULTS:
+        return results
+    for item in results:
+        for key in ("score", "concepts", "chunk_id"):
+            item.pop(key, None)
+        for key in ("best_bet", "spotlight", "domain"):
+            if not item.get(key):
+                item.pop(key, None)
     return results
 
 
@@ -1316,7 +1336,7 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
-@mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD)
+@mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD, structured_output=not SLIM_RESULTS)
 @in_thread
 def search_sujeeth_foundation(
     query: str,
@@ -1433,6 +1453,7 @@ def search_sujeeth_foundation(
         quality["agent_instructions"] += reading
     lap("documents_ms")
     strip_internal(results)
+    slim_results(results)
     timings["total_ms"] = round((time.perf_counter() - started) * 1000)
     print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
 
@@ -1549,7 +1570,7 @@ def explain_fetch_error(exc):
     return error_result(exc).get("error", "Could not read the document.")
 
 
-@mcp.tool(description=GET_DOCUMENTS_DESCRIPTION, annotations=OPEN_WORLD)
+@mcp.tool(description=GET_DOCUMENTS_DESCRIPTION, annotations=OPEN_WORLD, structured_output=not SLIM_RESULTS)
 @in_thread
 def get_documents(urls: list[str], max_chars: int = DOCUMENT_DEFAULT_CHARS) -> dict[str, Any]:
     """Read the full text of the pages behind search results. The agent-facing description is GET_DOCUMENTS_DESCRIPTION."""

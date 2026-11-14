@@ -66,3 +66,14 @@ def test_zero_seconds_turns_the_cache_off(monkeypatch):
 def test_excerpt_instructions_tell_the_agent_not_to_read_needlessly():
     assert "Never read a page just to confirm" in server.EXCERPT_INSTRUCTIONS
     assert "Never read a page just to confirm" in server.WIKI_DOCUMENT_INSTRUCTIONS
+
+
+def test_slimmed_results_drop_fields_the_model_does_not_use(monkeypatch):
+    monkeypatch.setattr(server, "SLIM_RESULTS", True)
+    rows = [{"title": "T", "url": "u", "snippet": "s", "source": "website", "score": 0.1, "domain": None,
+             "concepts": ["a"], "chunk_id": "c", "best_bet": False, "spotlight": True}]
+    out = server.slim_results(rows)
+    assert out == [{"title": "T", "url": "u", "snippet": "s", "source": "website", "spotlight": True}]
+    monkeypatch.setattr(server, "SLIM_RESULTS", False)
+    kept = [{"score": 0.1, "concepts": ["a"], "chunk_id": "c", "best_bet": False}]
+    assert server.slim_results(kept) == [{"score": 0.1, "concepts": ["a"], "chunk_id": "c", "best_bet": False}]
