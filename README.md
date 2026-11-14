@@ -31,7 +31,8 @@ Wiki results carry their whole page in a `document` field (`WIKI_FULL_TEXT=true`
 
 ### What the results tell the agent
 
-- `needs_clarification` and `suggested_question`: set when no concept matched, no domain was approved, nothing useful came back, or two weaker concept matches are nearly tied. Explicit matches (for example both "Sujeeth Foundation" and "donation" named in the question) are not treated as ambiguity.
+- `out_of_scope` and `message`: set when no ontology concept matched, which means the question is not about the Foundation. `status` is `out_of_scope`, `results` is empty (the wiki's keyword hits are dropped too), and the agent is told to answer with `message` ("I can only help with information about the Foundation or services from the Foundation.") and nothing from general knowledge. A backend outage is never a refusal.
+- `needs_clarification` and `suggested_question`: set only when two weaker concept matches are nearly tied and the ontology does not link them, so they could conflict ("Are you asking about A or B?"). Explicit matches (for example both "Sujeeth Foundation" and "donation" named in the question) are not treated as ambiguity. A matched question with weak or empty results is not a reason to ask: `reasons` records it and the agent says nothing was found and points to sujeeth.org.
 - `service_degraded` and `service_errors`: set when a backend failed. The agent is told results may be incomplete, to tell the user, and not to treat missing results as proof that nothing exists. An outage never turns into a question asking the customer to rephrase.
 - `agent_instructions`: every result tells the agent to cite URLs, never to search outside ontology-approved domains, and to quote program statistics (counts, rates, placement or engagement figures) only from a result on sujeeth.org (subdomains such as topics.sujeeth.org count), with its url. Statistics from the wiki or third-party pages are never quoted; the agent points to sujeeth.org instead.
 - Results carry `source`, `url`, `snippet`, `score`, `domain`, `concepts`, and `chunk_id`. Scores come from different engines for website and wiki results and cannot be compared.
@@ -176,7 +177,7 @@ Local tests that use admin tools need `MCP_ADMIN_TOOLS=true`. Search results dep
 |---|---|---|---|
 | 1 | `check_services` (admin) | none | `all_healthy: true` |
 | 2 | `search_sujeeth_foundation` | `how can i donate to the sujeeth foundation?` | `status: completed`, results with URLs, the FAQ wiki page with the donation link, `needs_clarification: false` |
-| 3 | `search_sujeeth_foundation` | `quantum cryptography` | `needs_clarification: true` and a suggested question |
+| 3 | `search_sujeeth_foundation` | `quantum cryptography` | `out_of_scope: true`, the refusal `message`, no results, `needs_clarification: false` |
 | 4 | `get_documents` | `urls`: a url from test 2 | page text, or an excerpt with `excerpt_only: true` for third-party sites |
 | 5 | `resolve_ontology` (admin) | `resume tips for students` | matched concepts and approved domains |
 | 6 | `get_ontology_context` (admin) | concept `leadership` | relationships |
@@ -187,7 +188,8 @@ Local tests that use admin tools need `MCP_ADMIN_TOOLS=true`. Search results dep
 |---|---|
 | `Service returned HTTP 401` | A Function key is missing or wrong. Fix the app setting and restart |
 | `Service returned HTTP 502` from website search | The backend raised an error. Call its `/api/search` directly to see the message (a 429 inside means embedding quota) |
-| `needs_clarification` on a clear question | The ontology matched no concept. Add aliases for the topic in the ontology repo |
+| `out_of_scope` on a question about the Foundation | The ontology matched no concept. Add aliases for the topic in the ontology repo |
+| `needs_clarification` on a clear question | Two unlinked concepts scored within 0.10 of each other. Add an `illustrates` relationship between them, or sharper aliases, in the ontology repo |
 | `get_documents` reports an error for a url | The page is not indexed yet, or the `url` was not copied exactly from a result |
 | HTTP 401 on every request | The Functions host requires a function key. Set `defaultAuthorizationLevel` to `anonymous` in `host.json` |
 | HTTP 421 "Invalid Host header" | The server is bound to `127.0.0.1` behind a custom domain. Use `MCP_HOST=0.0.0.0` |
