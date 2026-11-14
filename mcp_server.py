@@ -624,7 +624,8 @@ def linked_concept_pairs():
 # What the customer is told when nothing in the ontology matches the question.
 OUT_OF_SCOPE_MESSAGE = (
     "That's outside what I can help with. I'm here to help you get ready for your first job: career guidance, "
-    "interview prep, resume feedback, and how to build a network of professionals. Ask me about any of those."
+    "interview prep, resume feedback, and how to build a network of professionals. If you want to mentor, give, "
+    "or bring Career Circles to your school, ask me about that too."
 )
 
 OUT_OF_SCOPE_INSTRUCTIONS = (
