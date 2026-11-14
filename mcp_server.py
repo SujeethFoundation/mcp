@@ -27,7 +27,7 @@ if _VENDORED.is_dir() and str(_VENDORED) not in sys.path:
 
 import requests  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
-from mcp.types import ToolAnnotations  # noqa: E402
+from mcp.types import CallToolResult, ToolAnnotations  # noqa: E402
 
 from rate_limit import RateLimitMiddleware, TrustedRanges  # noqa: E402
 
@@ -180,9 +180,15 @@ WIKI_NEEDS_FOUNDATION_DOMAIN = flag("WIKI_NEEDS_FOUNDATION_DOMAIN", "true")
 
 # What the model reads. Every search result is read by the model on the next step, so extra bytes are extra seconds.
 # SLIM_RESULTS drops the per-result fields the model does not use (score, concept list, chunk id, empty flags).
-# The structured copy of the reply is off too: FastMCP otherwise sends the same JSON twice, as text and as
-# structuredContent, and the agent reads both. SLIM_RESULTS=false restores both.
+# REPLY_FORMAT is how the reply travels. "text" (default) sends one JSON text block. "structured" sends only the
+# structuredContent copy, with no text block. "both" is FastMCP's default, which sends the same JSON twice and the
+# agent reads both. The MCP spec says a structured reply should also carry a text copy for older clients, so check
+# the agent still answers properly before leaving "structured" on. It is separate from SLIM_RESULTS so each can be
+# switched back alone.
 SLIM_RESULTS = flag("SLIM_RESULTS", "true")
+REPLY_FORMAT = str(setting("REPLY_FORMAT", "text") or "text").strip().lower()
+if REPLY_FORMAT not in {"text", "structured", "both"}:
+    REPLY_FORMAT = "text"
 
 # Warm-up. Shortly after the server starts, and then every WARMUP_INTERVAL_SECONDS, a background
 # thread runs the common questions below and reads the Foundation's own pages they find, so the
@@ -304,7 +310,10 @@ def in_thread(fn):
             _tool_state["in_flight"] += 1
             _tool_state["peak_in_flight"] = max(_tool_state["peak_in_flight"], _tool_state["in_flight"])
         try:
-            return await loop.run_in_executor(_tool_pool, functools.partial(fn, *args, **kwargs))
+            result = await loop.run_in_executor(_tool_pool, functools.partial(fn, *args, **kwargs))
+            if REPLY_FORMAT == "structured" and isinstance(result, dict):
+                return CallToolResult(content=[], structuredContent=result)  # no text block, only the structured copy
+            return result
         finally:
             with _tool_lock:
                 _tool_state["in_flight"] -= 1
@@ -1336,7 +1345,7 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
-@mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD, structured_output=not SLIM_RESULTS)
+@mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD, structured_output=(REPLY_FORMAT == "both"))
 @in_thread
 def search_sujeeth_foundation(
     query: str,
@@ -1570,7 +1579,7 @@ def explain_fetch_error(exc):
     return error_result(exc).get("error", "Could not read the document.")
 
 
-@mcp.tool(description=GET_DOCUMENTS_DESCRIPTION, annotations=OPEN_WORLD, structured_output=not SLIM_RESULTS)
+@mcp.tool(description=GET_DOCUMENTS_DESCRIPTION, annotations=OPEN_WORLD, structured_output=(REPLY_FORMAT == "both"))
 @in_thread
 def get_documents(urls: list[str], max_chars: int = DOCUMENT_DEFAULT_CHARS) -> dict[str, Any]:
     """Read the full text of the pages behind search results. The agent-facing description is GET_DOCUMENTS_DESCRIPTION."""

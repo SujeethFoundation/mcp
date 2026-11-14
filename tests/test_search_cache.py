@@ -77,3 +77,18 @@ def test_slimmed_results_drop_fields_the_model_does_not_use(monkeypatch):
     monkeypatch.setattr(server, "SLIM_RESULTS", False)
     kept = [{"score": 0.1, "concepts": ["a"], "chunk_id": "c", "best_bet": False}]
     assert server.slim_results(kept) == [{"score": 0.1, "concepts": ["a"], "chunk_id": "c", "best_bet": False}]
+
+
+def test_reply_format_decides_what_the_tool_wrapper_returns(monkeypatch):
+    import asyncio
+
+    @server.in_thread
+    def tool():
+        return {"answer": 1}
+
+    monkeypatch.setattr(server, "REPLY_FORMAT", "text")
+    assert asyncio.run(tool()) == {"answer": 1}
+    monkeypatch.setattr(server, "REPLY_FORMAT", "structured")
+    out = asyncio.run(tool())
+    assert out.content == [] and out.structuredContent == {"answer": 1}
+    assert tool.sync() == {"answer": 1}  # the warm-up reads the plain result
