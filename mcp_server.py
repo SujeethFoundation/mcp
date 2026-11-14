@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import functools
 import json
 import os
@@ -165,6 +166,12 @@ DOCUMENT_DEFAULT_CHARS = max(500, min(int(setting("DOCUMENT_DEFAULT_CHARS", "120
 # wiki app's own 15 minutes). Each entry is one page, at most about 12 to 24 KB.
 DOCUMENT_CACHE_SECONDS = max(0, int(setting("DOCUMENT_CACHE_SECONDS", "900") or 0))
 DOCUMENT_CACHE_MAX = max(10, int(setting("DOCUMENT_CACHE_MAX_ENTRIES", "300") or 300))
+
+# Finished search answers are kept in memory by query, so a repeat of a common question ("what is Career Circles")
+# skips the search apps. SEARCH_CACHE_SECONDS=0 turns this off. Only complete answers are kept (never a partial one
+# after a service error). Each instance keeps its own copy, and a changed page shows up within this time.
+SEARCH_CACHE_SECONDS = max(0, int(setting("SEARCH_CACHE_SECONDS", "300") or 0))
+SEARCH_CACHE_MAX = max(10, int(setting("SEARCH_CACHE_MAX_ENTRIES", "200") or 200))
 
 # Warm-up. Shortly after the server starts, and then every WARMUP_INTERVAL_SECONDS, a background
 # thread runs the common questions below and reads the Foundation's own pages they find, so the
@@ -780,9 +787,17 @@ READ_PAGES_INSTRUCTIONS = (
     f"contain them."
 )
 
-EXCERPT_INSTRUCTIONS = (
-    " Results are excerpts and may stop mid-sentence. If they do not fully answer the question "
-    "(steps, an agenda, a list, dates, exact wording, or an excerpt that looks cut off), "
+# Each get_documents call is another model round trip, which is the slowest part of a turn. So the agent answers
+# from what it has whenever it can, and reads a page only when the answer needs text the results lack.
+FEWER_READS_INSTRUCTIONS = (
+    " Answer from the results you have when they cover the question: overviews, what something is, who it is for, "
+    "and where to go next are all fine from excerpts, with the link. Read a page only when the answer needs exact "
+    "text the results lack (steps, an agenda, a list, dates, wording) or an excerpt is cut off where the answer "
+    "should be. Never read a page just to confirm what an excerpt already says."
+)
+
+EXCERPT_INSTRUCTIONS = FEWER_READS_INSTRUCTIONS + (
+    " Results are excerpts and may stop mid-sentence. When you do need more, "
     + READ_PAGES_INSTRUCTIONS
 )
 
@@ -790,8 +805,8 @@ EXCERPT_INSTRUCTIONS = (
 WIKI_DOCUMENT_INSTRUCTIONS = (
     " Wiki results carry the whole page in their document field. Answer from it, not the snippet, "
     "and cite the url; read a wiki page with get_documents only if its document is truncated and "
-    "the part you need is missing. Every other result is an excerpt and may stop mid-sentence: if "
-    "the excerpts do not fully answer the question, " + READ_PAGES_INSTRUCTIONS
+    "the part you need is missing. Every other result is an excerpt and may stop mid-sentence."
+    + FEWER_READS_INSTRUCTIONS + " When you do need more, " + READ_PAGES_INSTRUCTIONS
 )
 
 GET_DOCUMENTS_INSTRUCTIONS = DOCUMENT_INSTRUCTIONS + " " + TRUNCATED_INSTRUCTIONS
@@ -1254,6 +1269,40 @@ def search_wiki(
         return error_result(exc)
 
 
+_search_cache = {}  # key -> (expires, finished response)
+_search_cache_lock = threading.Lock()
+
+
+def clear_search_cache():
+    with _search_cache_lock:
+        _search_cache.clear()
+
+
+def _search_cache_key(query, limit, full_documents, max_documents, document_max_chars):
+    # Case and spacing do not change what a search finds, so they must not split the cache.
+    return (" ".join(query.lower().split()), limit, bool(full_documents), max_documents, document_max_chars)
+
+
+def _search_cache_get(key):
+    if SEARCH_CACHE_SECONDS <= 0:
+        return None
+    with _search_cache_lock:
+        hit = _search_cache.get(key)
+    if hit and hit[0] > time.monotonic():
+        return copy.deepcopy(hit[1])
+    return None
+
+
+def _search_cache_put(key, response):
+    if SEARCH_CACHE_SECONDS <= 0 or response.get("status") not in ("completed", "out_of_scope"):
+        return
+    with _search_cache_lock:
+        _search_cache[key] = (time.monotonic() + SEARCH_CACHE_SECONDS, copy.deepcopy(response))
+        if len(_search_cache) > SEARCH_CACHE_MAX:
+            for old in list(_search_cache)[: max(1, SEARCH_CACHE_MAX // 10)]:
+                _search_cache.pop(old, None)
+
+
 @mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD)
 @in_thread
 def search_sujeeth_foundation(
@@ -1282,6 +1331,11 @@ def search_sujeeth_foundation(
         return {"error": "Please provide a query."}
 
     limit = max(1, min(int(limit or RESULT_COUNT), 20))
+    cache_key = _search_cache_key(query, limit, full_documents, max_documents, document_max_chars)
+    cached = _search_cache_get(cache_key)
+    if cached is not None:
+        print("search_cache_hit", file=sys.stderr, flush=True)
+        return cached
     errors = []
 
     # Timing: each lap records the milliseconds since the previous one.
@@ -1367,7 +1421,7 @@ def search_sujeeth_foundation(
     timings["total_ms"] = round((time.perf_counter() - started) * 1000)
     print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
 
-    return {
+    response = {
         "query": query,
         "status": "out_of_scope" if out_of_scope else "partial" if errors else "completed",
         "ontology": resolution_summary(resolution),
@@ -1389,6 +1443,8 @@ def search_sujeeth_foundation(
         **({"timings_ms": timings} if TIMINGS else {}),
         **quality,
     }
+    _search_cache_put(cache_key, response)
+    return response
 
 
 def looks_like_wiki(url, chunk_id, source):
