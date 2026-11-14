@@ -96,6 +96,11 @@ RESULT_COUNT = int(setting("SEARCH_RESULT_COUNT", "10") or 10)
 CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "20") or 20)   # the Search App returns at most SEARCH_MAX_LIMIT (20)
 MAX_PER_DOMAIN = int(setting("MAX_RESULTS_PER_DOMAIN", "2") or 2)
 WIKI_POOL = MAX_PER_DOMAIN + 2  # the wiki counts as one source, so it needs only a few candidates
+# When the best wiki result is an overview that links to the pages that answer the question ("weekly agendas" -> Weekly Content,
+# which links Week 1 to Week 6), the wiki app returns those pages with it (hub_pages / hub_of). They are kept together, outside the
+# per-source cap and the result count, up to this many pages (the overview included): capping them at MAX_RESULTS_PER_DOMAIN left
+# the agent with the overview alone, which says less about each week than the week's own page. 0 turns this off.
+WIKI_HUB_MAX = max(0, int(setting("WIKI_HUB_MAX_RESULTS", "8") or 0))
 # On Azure (App Service or Azure Functions) listen on all interfaces. Locally, listen on 127.0.0.1.
 # As an Azure Functions custom handler the port must match "port" in host.json (8000 here).
 HOSTED = bool(
@@ -512,6 +517,8 @@ def normalize_results(payload, source):
             # attach_full_documents and strip it before the response goes out.
             "_full_text": item.get("text") if item.get("snippet") and item.get("text") else None,
             "_truncated": bool(item.get("truncated")),
+            # Wiki Search marks an overview page with the addresses of the pages it links to that match (hub_pages).
+            "_hub_pages": item.get("hub_pages") if isinstance(item.get("hub_pages"), list) else None,
         })
     return results
 
@@ -535,6 +542,7 @@ def strip_internal(results):
     for item in results:
         item.pop("_full_text", None)
         item.pop("_truncated", None)
+        item.pop("_hub_pages", None)
     return results
 
 
@@ -599,10 +607,25 @@ def select_diverse(candidates, count, max_per_domain):
     return picked
 
 
+def wiki_hub_pages(wiki_items):
+    """(kept, linked): the best-ranked wiki overview and the pages it links to that the wiki search returned with it, in the
+    overview's link order, at most WIKI_HUB_MAX of them; and every page the overview links to, kept or not, so a page cut by
+    the maximum does not come back through the per-source selection. Both are empty when no wiki result is an overview."""
+    if not WIKI_HUB_MAX:
+        return [], []
+    hub = next((x for x in wiki_items if x.get("_hub_pages")), None)
+    if hub is None:
+        return [], []
+    by_url = {x.get("url"): x for x in wiki_items}
+    members = [hub] + [by_url[u] for u in hub["_hub_pages"] if u in by_url and by_url[u] is not hub]
+    return members[:WIKI_HUB_MAX], members
+
+
 def combine_with_best_bets(wiki_items, website_items, limit):
-    """Best bets first (hand-added pages the website search flagged), then spotlights, then up
-    to `limit` wiki and website results chosen across sources (see select_diverse). Best bets
-    and spotlights sit outside the limit and the per-source cap. Each URL appears once."""
+    """Best bets first (hand-added pages the website search flagged), then spotlights, then a wiki overview
+    with the pages it links to (see wiki_hub_pages), then up to `limit` wiki and website results chosen
+    across sources (see select_diverse). Best bets, spotlights and the overview's pages sit outside the
+    limit and the per-source cap. Each URL appears once."""
     best, spotlights, seen = [], [], set()
     for item in website_items:
         identity = page_identity(item) if item.get("url") else ""
@@ -616,6 +639,14 @@ def combine_with_best_bets(wiki_items, website_items, limit):
         if item.get("spotlight") and not item.get("best_bet") and identity and identity not in seen:
             seen.add(identity)
             spotlights.append(item)
+    hub_pages = []
+    kept, linked = wiki_hub_pages(wiki_items)
+    for item in kept:
+        identity = page_identity(item)
+        if identity and identity not in seen:
+            seen.add(identity)
+            hub_pages.append(item)
+    seen.update(page_identity(item) for item in linked if item.get("url"))
     normal = []
     prioritized = lambda x: x.get("best_bet") or x.get("spotlight")
     for item in merge_sources(wiki_items, [x for x in website_items if not prioritized(x)]):
@@ -623,7 +654,7 @@ def combine_with_best_bets(wiki_items, website_items, limit):
         if identity and identity not in seen:
             seen.add(identity)
             normal.append(item)
-    return best + spotlights + select_diverse(normal, limit, MAX_PER_DOMAIN), len(best), len(spotlights)
+    return best + spotlights + hub_pages + select_diverse(normal, limit, MAX_PER_DOMAIN), len(best), len(spotlights)
 
 
 def resolution_summary(data):
