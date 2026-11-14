@@ -173,6 +173,11 @@ DOCUMENT_CACHE_MAX = max(10, int(setting("DOCUMENT_CACHE_MAX_ENTRIES", "300") or
 SEARCH_CACHE_SECONDS = max(0, int(setting("SEARCH_CACHE_SECONDS", "300") or 0))
 SEARCH_CACHE_MAX = max(10, int(setting("SEARCH_CACHE_MAX_ENTRIES", "200") or 200))
 
+# The wiki is the Foundation's own content, so the combined search uses it only when the ontology says sujeeth.org is
+# an appropriate source for the question. Otherwise a keyword hit in the wiki (a partner FAQ turning up for a resume
+# question) is noise that also costs tokens. WIKI_NEEDS_FOUNDATION_DOMAIN=false puts the wiki back in every search.
+WIKI_NEEDS_FOUNDATION_DOMAIN = flag("WIKI_NEEDS_FOUNDATION_DOMAIN", "true")
+
 # Warm-up. Shortly after the server starts, and then every WARMUP_INTERVAL_SECONDS, a background
 # thread runs the common questions below and reads the Foundation's own pages they find, so the
 # page cache is filled before a user asks. It also keeps the search apps awake and rebuilds the
@@ -1269,6 +1274,14 @@ def search_wiki(
         return error_result(exc)
 
 
+def foundation_domain_allowed(resolution, domains):
+    """True when the wiki belongs in this search: the ontology approved sujeeth.org (or a subdomain) for the question.
+    When the Search App could not answer, there is no ontology verdict, so the wiki stays as the fallback."""
+    if not WIKI_NEEDS_FOUNDATION_DOMAIN or (resolution or {}).get("status") == "unavailable":
+        return True
+    return any(str(d).lower().rstrip("/") == "sujeeth.org" or str(d).lower().endswith(".sujeeth.org") for d in domains or [])
+
+
 _search_cache = {}  # key -> (expires, finished response)
 _search_cache_lock = threading.Lock()
 
@@ -1380,6 +1393,8 @@ def search_sujeeth_foundation(
     lap("websearch_ms")
     wiki, wiki_error = wiki_future.result()
     wiki_pool.shutdown(wait=False)
+    if not foundation_domain_allowed(resolution, domains):
+        wiki, wiki_error = {"results": []}, None   # sujeeth.org is not an appropriate source for this question
     if wiki_error is not None:
         errors.append({"service": "wikisearch", **error_result(wiki_error)})
     lap("wiki_wait_ms")
