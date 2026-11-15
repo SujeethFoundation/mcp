@@ -1393,7 +1393,6 @@ def resolve_ontology(
     purpose: str = "search",
 ) -> dict[str, Any]:
     """Resolve a query to ontology concepts and approved domains."""
-    request_started = _request_started if _request_started is not None else time.perf_counter()
     query = (query or "").strip()
     if not query:
         return {"error": "Please provide a query."}
@@ -1532,7 +1531,6 @@ def search_wiki(
     MCP resolves the question and generates related queries before the wiki is searched.
     Set full_documents to true to attach the full page text to every result (uses many tokens).
     """
-    request_started = _request_started if _request_started is not None else time.perf_counter()
     query = (query or "").strip()
     if not query:
         return {"error": "Please provide a query."}
