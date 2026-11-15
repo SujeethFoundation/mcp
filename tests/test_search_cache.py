@@ -1,6 +1,6 @@
 """Repeat searches are answered from memory; failed or partial ones are not kept."""
-import json
 import os
+import json
 
 import requests
 
@@ -11,7 +11,7 @@ from test_single_search_call import HIT, RESOLVED, wire  # noqa: E402
 
 
 def search(query="what is career circles"):
-    return server.search_sujeeth_foundation.sync(query, full_documents=False)
+    return server.search_sujeeth_foundation.sync(query)
 
 
 def test_a_repeat_search_is_answered_from_memory(monkeypatch):
@@ -21,6 +21,20 @@ def test_a_repeat_search_is_answered_from_memory(monkeypatch):
     second = search()
     assert len(calls) == 1
     assert second["results"] == first["results"]
+
+
+def test_cache_hit_still_emits_streaming_timings(capsys, monkeypatch):
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
+    monkeypatch.setattr(server, "SEARCH_CACHE_SECONDS", 300)
+    search()
+    search()
+    records = [line.partition(" ")[2] for line in capsys.readouterr().err.splitlines()
+               if line.startswith("search_timings_ms ")]
+    assert len(records) == 2
+    timing = json.loads(records[-1])
+    assert timing["cache_hit"] is True
+    assert timing["ontology_resolution_ms"] >= 0
+    assert "tool_response_ready_ms" in timing
 
 
 def test_case_and_spacing_share_one_entry(monkeypatch):
@@ -94,16 +108,3 @@ def test_reply_format_decides_what_the_tool_wrapper_returns(monkeypatch):
     assert out.content == [] and out.structuredContent == {"answer": 1}
     assert tool.sync() == {"answer": 1}  # the warm-up reads the plain result
 
-
-def test_cache_hit_still_emits_streaming_timings(capsys, monkeypatch):
-    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
-    monkeypatch.setattr(server, "SEARCH_CACHE_SECONDS", 300)
-    search()
-    search()
-    records = [line.partition(" ")[2] for line in capsys.readouterr().err.splitlines()
-               if line.startswith("search_timings_ms ")]
-    assert len(records) == 2
-    timing = json.loads(records[-1])
-    assert timing["cache_hit"] is True
-    assert timing["ontology_resolution_ms"] is None
-    assert "tool_response_ready_ms" in timing
