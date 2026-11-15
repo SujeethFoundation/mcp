@@ -685,7 +685,7 @@ def resolution_summary(data):
 # The pairs are loaded from the ontology file and refreshed every LINKED_PAIRS_REFRESH_HOURS (default 24), so a running
 # instance follows an ontology change without a restart. If the file cannot be loaded the set stays as it was (empty on
 # the first try) and the close-match question is asked as before.
-ONTOLOGY_URL = setting(
+MCP_ONTOLOGY_JSON_URL = setting(
     "MCP_ONTOLOGY_URL", "https://raw.githubusercontent.com/SujeethFoundation/ontology/main/ontology/ontology.json"
 )
 LINKED_PAIRS_REFRESH_SECONDS = max(60.0, float(setting("LINKED_PAIRS_REFRESH_HOURS", "24") or 24) * 3600)
@@ -724,7 +724,7 @@ def linked_concept_pairs():
     stale = _linked_pairs_loaded_at is not None and now - _linked_pairs_loaded_at > LINKED_PAIRS_REFRESH_SECONDS
     if _linked_pairs is None or stale:
         try:
-            data = requests.get(ONTOLOGY_URL, timeout=min(5, TIMEOUT)).json()
+            data = requests.get(MCP_ONTOLOGY_JSON_URL, timeout=min(5, TIMEOUT)).json()
             pairs = pairs_from_ontology(data)
         except Exception:
             # Do not cache a failure: keep the last good set (empty on the first try) and try again next question.
@@ -774,7 +774,7 @@ def ontology_catalog() -> dict | None:
     if _ontology_catalog is not None and _ontology_catalog_loaded_at is not None and now - _ontology_catalog_loaded_at < ONTOLOGY_CATALOG_REFRESH_SECONDS:
         return _ontology_catalog
     try:
-        response = requests.get(ONTOLOGY_URL, timeout=min(5, TIMEOUT))
+        response = requests.get(MCP_ONTOLOGY_JSON_URL, timeout=min(5, TIMEOUT))
         response.raise_for_status()
         data = response.json()
         if isinstance(data, dict) and isinstance(data.get("classes"), list):
