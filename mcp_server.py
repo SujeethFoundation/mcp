@@ -103,7 +103,7 @@ RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)   
 RESULT_COUNT = int(setting("SEARCH_RESULT_COUNT", "10") or 10)
 CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "20") or 20)   # the Search App returns at most SEARCH_MAX_LIMIT (20)
 MAX_PER_DOMAIN = int(setting("MAX_RESULTS_PER_DOMAIN", "2") or 2)
-MAX_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))   # same-topic query variants in one downstream search
+MAX_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))   # searches one tool call may combine (query + more_queries)
 WIKI_POOL = MAX_PER_DOMAIN + 2  # the wiki counts as one source, so it needs only a few candidates
 # When the best wiki result is an overview that links to the pages that answer the question ("weekly agendas" -> Weekly Content,
 # which links Week 1 to Week 6), the wiki app returns those pages with it (hub_pages / hub_of). They are kept together, outside the
@@ -525,8 +525,6 @@ def normalize_results(payload, source):
             "_truncated": bool(item.get("truncated")),
             # Wiki Search marks an overview page with the addresses of the pages it links to that match (hub_pages).
             "_hub_pages": item.get("hub_pages") if isinstance(item.get("hub_pages"), list) else None,
-            **({"for_query": item.get("for_query")} if item.get("for_query") else {}),
-            **({"for_queries": item.get("for_queries")} if isinstance(item.get("for_queries"), list) else {}),
         })
     return results
 
@@ -829,7 +827,7 @@ def compact_ontology_catalog(catalog):
             edge = {"subject": rel.get("subject"), "predicate": rel.get("predicate"),
                     "object": rel.get("object")}
             relationship_rule = rel.get("search_behavior")
-            if relationship_rule is not None and relationship_rule != predicate_rule:
+            if relationship_rule and relationship_rule != predicate_rule:
                 edge["search_behavior"] = relationship_rule
             edges.append(edge)
     domains = [{"domain": row.get("domain"), "associated_concepts": row.get("associated_concepts") or []}
@@ -857,7 +855,6 @@ def ontology_model_responses_url(endpoint):
     if endpoint.endswith("/openai/v1"):
         return endpoint + "/responses"
     return endpoint + "/openai/v1/responses"
-
 
 def clear_ontology_plan_cache():
     """Clear cached validated ontology plans, primarily for tests and local diagnostics."""
@@ -1161,6 +1158,7 @@ EXCERPT_INSTRUCTIONS = FEWER_READS_INSTRUCTIONS + (
     + READ_PAGES_INSTRUCTIONS
 )
 
+# Used when the wiki results carry their whole page and the other results are excerpts.
 WIKI_DOCUMENT_INSTRUCTIONS = (
     " Wiki results are excerpts. Answer from them when they cover the question; call get_documents "
     "only when the excerpt does not contain what you need."
@@ -1678,10 +1676,9 @@ def clear_search_cache():
         _search_cache.clear()
 
 
-def _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries=None):
+def _search_cache_key(query, limit, full_documents, max_documents, document_max_chars):
     # Case and spacing do not change what a search finds, so they must not split the cache.
-    variants = tuple(" ".join(q.lower().split()) for q in (queries or []))
-    return (" ".join(query.lower().split()), variants, limit, bool(full_documents), max_documents, document_max_chars)
+    return (" ".join(query.lower().split()), limit, bool(full_documents), max_documents, document_max_chars)
 
 
 def _search_cache_get(key):
@@ -2160,4 +2157,3 @@ if __name__ == "__main__":
             trusted_agents=TRUSTED_USER_AGENTS or None,
         )
     uvicorn.run(app, host=MCP_HOST, port=MCP_PORT, log_level="info")
-
