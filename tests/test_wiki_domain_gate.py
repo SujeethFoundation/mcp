@@ -98,4 +98,3 @@ def test_a_question_that_matches_no_concept_is_still_out_of_scope(monkeypatch):
     result = search()
     assert result["out_of_scope"] is True and result["results"] == []
 
-
