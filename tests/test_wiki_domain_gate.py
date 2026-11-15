@@ -24,7 +24,7 @@ def gate(monkeypatch):
 
 
 def search():
-    return server.search_sujeeth_foundation.sync("resume tips", full_documents=False)
+    return server.search_sujeeth_foundation.sync("resume tips")
 
 
 def plan(monkeypatch, domains, concepts=("resume_resource",)):
@@ -97,4 +97,5 @@ def test_a_question_that_matches_no_concept_is_still_out_of_scope(monkeypatch):
     plan(monkeypatch, [], concepts=())
     result = search()
     assert result["out_of_scope"] is True and result["results"] == []
+
 
