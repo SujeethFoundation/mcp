@@ -1532,6 +1532,7 @@ def search_wiki(
     MCP resolves the question and generates related queries before the wiki is searched.
     Set full_documents to true to attach the full page text to every result (uses many tokens).
     """
+    request_started = _request_started if _request_started is not None else time.perf_counter()
     query = (query or "").strip()
     if not query:
         return {"error": "Please provide a query."}
@@ -1690,18 +1691,6 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                 _search_cache_put(cache_key, response)
                 return response
     errors = []
-
-    # Timing: each lap records the milliseconds since the previous one.
-    started = request_started
-    mark = time.perf_counter()
-    timings["cache_hit"] = False
-    timings["ontology_resolution_ms"] = timings.get("ontology_resolution_ms", 0)
-
-    def lap(name):
-        nonlocal mark
-        now = time.perf_counter()
-        timings[name] = round((now - mark) * 1000)
-        mark = now
 
     # MCP's AI model decides relevance, then MCP validates every proposed ID against the ontology and
     # derives approved domains. An unavailable model is a service failure, never an out-of-scope verdict.
