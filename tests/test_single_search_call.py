@@ -357,3 +357,19 @@ def test_mcp_resolution_is_authoritative_over_search_app_resolution(monkeypatch)
     wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     out = search("something")
     assert out["out_of_scope"] is False and out["needs_clarification"] is False
+
+
+def test_search_timing_log_covers_ontology_services_and_response_ready(capsys, monkeypatch):
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
+    monkeypatch.setattr(server, "TIMINGS", False)
+    out = search("how do I volunteer")
+    records = [line.partition(" ")[2] for line in capsys.readouterr().err.splitlines()
+               if line.startswith("search_timings_ms ")]
+    assert len(records) == 1
+    timing = jsonlib.loads(records[0])
+    assert timing["cache_hit"] is False
+    assert timing["ontology_resolution_ms"] >= 0
+    assert timing["websearch_ms"] >= 0 and timing["wikisearch_ms"] >= 0
+    assert timing["result_processing_ms"] >= 0
+    assert timing["tool_response_ready_ms"] >= timing["ontology_resolution_ms"]
+    assert "timings_ms" not in out
