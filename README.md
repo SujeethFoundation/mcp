@@ -4,7 +4,7 @@ A Model Context Protocol (MCP) server that lets AI assistants search and read Su
 
 | Backend | Repo | What it provides |
 |---|---|---|
-| Web Search | `websearch` | Ontology-gated hybrid search and page text for approved Foundation and partner websites |
+| Web Search | `websearch` | MCP-filtered hybrid search and page text for approved Foundation and partner websites |
 | Wiki Search | `wikisearch` | Keyword search and page text for the GitHub wiki |
 | Ontology | `ontology` | Concepts, relationships, and which domains are approved |
 
@@ -21,9 +21,9 @@ The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mc
 | `search_website` | Search ontology-approved websites only |
 | `search_wiki` | Search the GitHub wiki only |
 
-**MCP resolves before search.** `search_sujeeth_foundation` matches the user's wording against the ontology catalog, applies relationship behavior, selects enabled domains associated with those concepts, then sends the concept and domain filters in the first Search App request. Websearch uses those supplied filters to search its index; MCP owns relevance and domain authorization. The wiki is searched in parallel. If the Search App fails, the wiki results are still returned with `status: partial`, and the agent is told the service is degraded rather than asked to clarify. `retrieval.website_candidates` and `retrieval.wiki_candidates` count what each source found before the best results were chosen across sources; `count` is what the response returns.
+**MCP resolves before search.** `search_sujeeth_foundation` sends the question and compact full ontology vocabulary and relevant relationship graph to the configured Azure GPT-6 Luna deployment. The model identifies direct concepts, useful related concepts, and query variants. MCP accepts only concept IDs present in the ontology, allows related concepts only when an enabled ontology relationship supports retrieval, and derives searchable domains from those validated concepts. It sends every generated query to Websearch with the approved concepts and domain filters; Wiki Search receives every query plus related query terms. A failed model call is a service failure, never an out-of-scope refusal. An actual no-concept match returns the exact refusal message without searching. If Websearch fails, Wiki Search results are still returned with `status: partial`. `retrieval.website_candidates` and `retrieval.wiki_candidates` count what each source found before the best results were chosen across sources; `count` is what the response returns.
 
-**Several parts in one call.** A question with separate parts ("fix my resume and get ready for an interview") goes in one call: the first part in `query`, the others in `more_queries`, at most `SEARCH_MAX_QUERIES` (default 3) searches in all. The searches run at the same time, each resolved through the ontology by itself exactly as a single search is, and each is cached by itself. The response is one list: curated pages first, then results taken in turn from each search up to `limit`, each page once, each naming its search in `for_query`. `queries` lists every search with its status and matched concepts. A part that is out of scope adds nothing and is marked in `queries`; the whole response is `out_of_scope` only when every part is. `needs_clarification` is true only when every part that found something would have asked. Attached page text across the searches stays within `FULL_DOCUMENT_CHAR_BUDGET`. One call counts once against the rate limits, but makes one Search App and one wiki request per part. A call with no `more_queries` behaves exactly as before.
+**Related searches.** The MCP model produces up to `SEARCH_MAX_QUERIES` (default 3) query variants for the same user question. MCP searches them concurrently with the same validated concept and domain filters, then deduplicates and combines their results. Each result carries the query that found it. This makes one model resolution per user question and one downstream search per generated query, rather than asking the Chat Agent to expand the query.
 
 Wiki results carry their whole page in a `document` field (`WIKI_FULL_TEXT=true`, each page cut at `WIKI_FULL_TEXT_CHARS`, default 12000); other results are excerpts. The tool descriptions and the server `instructions` that agents read are built from one set of constants in `mcp_server.py`, so the page limit and the statistics rule read the same everywhere.
 
@@ -78,6 +78,11 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 |---|---|---|
 | `WEBSEARCH_FUNCTION_KEY`, `WIKISEARCH_FUNCTION_KEY`, `ONTOLOGY_FUNCTION_KEY` | none | Function (host) keys for each app. A missing key makes calls to that app fail with HTTP 401 |
 | `WEBSEARCH_URL`, `WIKISEARCH_URL`, `ONTOLOGY_URL` | the deployed apps | Base URLs |
+| `MCP_ONTOLOGY_URL` | ontology JSON on the `main` branch of `SujeethFoundation/ontology` | Raw ontology file URL used by MCP's resolver and relationship checks; independent from the Ontology Function URL used by diagnostics/admin tools |
+| `MCP_ONTOLOGY_MODEL_ENDPOINT` | empty (required) | Azure OpenAI / Foundry resource endpoint. Accepts a resource base URL, `/openai/v1` base, or full `/openai/v1/responses` URL; MCP normalizes it to the Responses endpoint |
+| `MCP_ONTOLOGY_MODEL_API_KEY` | empty (required) | Secret key for the Azure model endpoint. Store it as a Function App setting or in ignored local settings; never commit it |
+| `MCP_ONTOLOGY_MODEL_NAME` | `gpt-6-luna` | Deployed Azure model name used for ontology resolution and query generation |
+| `MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS` | `25` | Maximum wait for one ontology-resolution request |
 | `MCP_HOST` | `127.0.0.1` locally; `0.0.0.0` when running on Azure | Interface to listen on. It must not be `127.0.0.1` behind a custom domain, because requests for another host name are then rejected with HTTP 421 |
 | `MCP_PORT` | `FUNCTIONS_CUSTOMHANDLER_PORT`, `PORT`, or `WEBSITES_PORT` if set, else `8000` | Port. On Azure Functions it must equal `port` in `host.json` (8000), so set it explicitly |
 | `MCP_ADMIN_TOOLS` | `false` | Show the admin tools |
