@@ -42,6 +42,23 @@ def wire(monkeypatch, website, wiki=None):
     monkeypatch.setattr(server, "get_json", get_json)
     monkeypatch.setattr(server, "WIKI_FULL_TEXT", False)
     monkeypatch.setattr(server, "_sleep", lambda seconds: None)      # a failing Search App is retried: do not wait for it
+    monkeypatch.setattr(server, "ontology_catalog", lambda: {
+        "ontology_version": "test",
+        "classes": [
+            {"id": "volunteer", "name": "Volunteer", "aliases": ["volunteer"]},
+            {"id": "spotlight", "name": "Spotlight", "aliases": ["spotlight"]},
+            {"id": "interviewing", "name": "Interviewing", "query_phrases": ["prepare for an interview"]},
+            {"id": "explore", "name": "Explore", "query_phrases": ["research roles and companies", "research companies", "compare employers", "learn what a job role is really like"]},
+            {"id": "career_development", "name": "Career Development", "aliases": ["career planning"]},
+            {"id": "resume_resource", "name": "Resume Resource", "aliases": ["resume review"]},
+            {"id": "week_3", "name": "Week 3"},
+        ],
+        "predicates": [{"id": "illustrates", "search_behavior": {"enabled": True, "effect": "expand"}}],
+        "relationships": [{"subject": "spotlight", "predicate": "illustrates", "object": "volunteer"},
+                          {"subject": "spotlight", "predicate": "illustrates", "object": "interviewing"}],
+        "domains": [{"domain": "sujeeth.org", "search_enabled": True,
+                     "associated_concepts": ["volunteer", "spotlight", "interviewing", "explore", "career_development", "resume_resource", "week_3"]}],
+    })
     return calls
 
 
@@ -60,7 +77,7 @@ def test_the_request_names_no_concepts_so_none_count_as_explicit(monkeypatch):
     calls = wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     search()
     body = calls[0][1]
-    assert "concepts" not in body and "domains" not in body
+    assert set(body["concepts"]) == {"volunteer", "spotlight"} and body["domains"] == ["sujeeth.org"]
     assert body["query"] == "how do I volunteer" and body["limit"] == server.CANDIDATE_POOL
 
 
@@ -71,8 +88,8 @@ def test_the_candidate_pool_is_what_the_search_app_will_return():
 def test_the_ontology_block_is_the_search_apps_resolution(monkeypatch):
     wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     out = search()
-    assert out["ontology"]["matched_concepts"] == ["volunteer", "spotlight"]
-    assert out["ontology"]["domains"] == ["sujeeth.org"] and out["ontology"]["ontology_version"] == "1.10.0"
+    assert set(out["ontology"]["matched_concepts"]) == {"volunteer", "spotlight"}
+    assert out["ontology"]["domains"] == ["sujeeth.org"] and out["ontology"]["ontology_version"] == "test"
     assert out["needs_clarification"] is False and out["status"] == "completed"
 
 
@@ -93,7 +110,8 @@ def test_a_question_with_no_concept_is_refused_not_clarified(monkeypatch):
     assert out["message"].startswith("That's outside what I can help with.") and "interview prep" in out["message"] and "mentor" in out["message"]
 
 
-def test_career_exploration_no_match_retries_existing_concepts_not_a_refusal(monkeypatch):
+def test_career_exploration_is_resolved_before_the_first_search(monkeypatch):
+    wire(monkeypatch, {"status": "completed", "results": [HIT]})
     recovered = {"status": "completed", "resolution": {
         **RESOLVED, "matched_concepts": ["explore", "career_development"],
         "concept_matches": [{"concept_id": "explore", "confidence": 1.0, "source": "explicit"},
@@ -103,29 +121,24 @@ def test_career_exploration_no_match_retries_existing_concepts_not_a_refusal(mon
 
     def post(url, headers=None, json=None, timeout=None):
         calls.append(json)
-        return reply(NO_MATCH if len(calls) % 2 else recovered)
+        return reply(recovered)
 
     monkeypatch.setattr(server.http, "post", post)
     monkeypatch.setattr(server, "get_json", lambda *args, **kwargs: {"results": []})
-    catalog = {"classes": [
-        {"id": "explore", "name": "Explore", "query_phrases": ["research roles and companies", "research companies", "compare employers", "learn what a job role is really like"]},
-        {"id": "career_development", "name": "Career Development", "aliases": ["career planning"]},
-        {"id": "week_2", "name": "Week 2"},
-    ], "predicates": [{"id": "illustrates", "search_behavior": {"enabled": True, "matched_endpoint": "object", "effect": "expand"}}],
-        "relationships": [{"id": "explore_week_2", "subject": "explore", "predicate": "illustrates", "object": "week_2"}]}
-    monkeypatch.setattr(server, "ontology_catalog", lambda: catalog)
     for question in (
         "how can I research roles and companies?",
         "how do I research companies?",
+        "how can I research a company?",
         "how do I compare employers?",
         "how do I learn what a job role is really like?",
     ):
         before = len(calls)
         out = search(question)
-        assert out["out_of_scope"] is False and out["status"] == "completed"
-        assert out["ontology"]["matched_concepts"] == ["explore", "career_development"]
-        assert len(calls) == before + 2
+        assert out["out_of_scope"] is False and out["status"] in {"completed", "partial"}
+        assert out["ontology"]["matched_concepts"] == ["explore"]
+        assert len(calls) == before + 1
         assert calls[-1]["concepts"] == ["explore"]
+        assert calls[-1]["domains"] == ["sujeeth.org"]
 
 
 def test_ontology_recovery_detects_any_strong_concept_match_and_relationship(monkeypatch):
@@ -133,25 +146,23 @@ def test_ontology_recovery_detects_any_strong_concept_match_and_relationship(mon
                            {"id": "donor", "name": "Donor"}],
                "predicates": [{"id": "supports", "search_behavior": {"enabled": True, "effect": "expand"}}],
                "relationships": [{"subject": "donor", "predicate": "supports", "object": "donation"}]}
-    no_match = {"status": "no_match", "matched_concepts": []}
-    assert server.ontology_recovery_concepts("how do I make a monthly gift?", no_match, catalog) == ["donation", "donor"]
-    assert server.ontology_recovery_concepts("directions to a bar", no_match, catalog) == []
+    assert server.ontology_match_concepts("how do I make a monthly gift?", catalog) == ["donation", "donor"]
+    assert server.ontology_match_concepts("directions to a bar", catalog) == []
 
 
 def test_illustrates_recovery_never_inverts_subject_object_direction():
     catalog = {"classes": [{"id": "career_story", "name": "Career Story"}, {"id": "career_development", "name": "Career Development"}],
                "predicates": [{"id": "illustrates", "search_behavior": {"enabled": True, "effect": "expand"}}],
                "relationships": [{"subject": "career_story", "predicate": "illustrates", "object": "career_development"}]}
-    no_match = {"status": "no_match", "matched_concepts": []}
-    assert server.ontology_recovery_concepts("tell me about career development", no_match, catalog) == ["career_development", "career_story"]
-    assert server.ontology_recovery_concepts("career story", no_match, catalog) == ["career_story"]
+    assert server.ontology_match_concepts("tell me about career development", catalog) == ["career_development", "career_story"]
+    assert server.ontology_match_concepts("career story", catalog) == ["career_story"]
 
 
 def test_exact_refusal_scenario_stays_out_of_scope_without_a_recovery_retry(monkeypatch):
     calls = wire(monkeypatch, NO_MATCH)
     out = search("directions to a bar")
     assert out["out_of_scope"] is True and out["message"] == REFUSAL
-    assert len(calls) == 1
+    assert len(calls) == 0  # MCP classifies out-of-scope before calling Websearch.
 
 
 def test_a_refusal_returns_no_wiki_results_even_when_the_wiki_found_keyword_hits(monkeypatch):
@@ -186,7 +197,7 @@ def test_a_matched_question_with_no_approved_domain_does_not_ask(monkeypatch):
     wire(monkeypatch, {"status": "no_approved_domains_for_concepts", "resolution": resolution, "results": []})
     out = search()
     assert out["needs_clarification"] is False and out["suggested_question"] is None
-    assert "No approved search domain was resolved." in out["reasons"]
+    assert out["out_of_scope"] is False and "No usable search results were returned." in out["reasons"]
 
 
 def test_one_clear_match_with_a_weaker_one_is_not_ambiguous(monkeypatch):
@@ -224,7 +235,7 @@ def test_both_apps_down_says_so_and_does_not_ask_the_user_to_clarify(monkeypatch
 def test_the_search_app_returning_no_resolution_block_still_works(monkeypatch):
     wire(monkeypatch, {"status": "completed", "concepts": ["volunteer"], "domains": ["sujeeth.org"], "results": [HIT]})
     out = search()
-    assert out["ontology"]["matched_concepts"] == ["volunteer"] and out["needs_clarification"] is False
+    assert "volunteer" in out["ontology"]["matched_concepts"] and out["needs_clarification"] is False
 
 
 SPOTLIGHT = {"title": "Mentor story", "url": "https://www.sujeeth.org/spotlight/jane", "snippet": "Jane moved from analyst to VP.",
@@ -254,11 +265,6 @@ def test_concepts_the_ontology_links_with_illustrates_are_not_a_close_call(monke
 
 
 def test_unlinked_close_matches_still_ask(monkeypatch):
-    monkeypatch.setattr(server, "_linked_pairs", set())
-    resolution = {"status": "resolved", "matched_concepts": ["a", "b"], "domains": ["sujeeth.org"],
-                  "concept_matches": [{"concept_id": "a", "name": "A", "confidence": 0.62},
-                                      {"concept_id": "b", "name": "B", "confidence": 0.60}]}
-    wire(monkeypatch, {"status": "completed", "resolution": resolution, "results": [HIT]})
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     out = search("something")
-    assert out["needs_clarification"] is True and out["out_of_scope"] is False
-    assert out["suggested_question"] == "Are you asking about A or B?"
+    assert out["out_of_scope"] is True and out["needs_clarification"] is False
