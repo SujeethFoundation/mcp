@@ -116,4 +116,3 @@ def test_warmup_runs_the_search_and_reads_the_pages_it_finds(monkeypatch, capsys
     assert reads and reads[0][0][0] == "https://www.sujeeth.org/circle" and reads[0][1].get("refresh") is True
     assert '"failed_queries": 0' in err
 
-
