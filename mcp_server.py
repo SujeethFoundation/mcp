@@ -1674,8 +1674,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         except Exception as exc:
             _plan = {"resolution": {"status": "unavailable", "matched_concepts": [], "domains": []},
                      "queries": [query], "error": exc}
-    timings["ontology_resolution_ms"] = round((time.perf_counter() - ontology_started) * 1000)
-    if _plan["resolution"].get("matched_concepts"):
+        timings["ontology_resolution_ms"] = round((time.perf_counter() - ontology_started) * 1000)
+        if _plan["resolution"].get("matched_concepts"):
             queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
             if len(queries) > 1:
                 with ThreadPoolExecutor(max_workers=len(queries)) as pool:
@@ -1689,6 +1689,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                     response["timings_ms"] = timings
                 _search_cache_put(cache_key, response)
                 return response
+    else:
+        timings["ontology_resolution_ms"] = 0
     errors = []
 
     # MCP's AI model decides relevance, then MCP validates every proposed ID against the ontology and
