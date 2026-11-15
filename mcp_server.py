@@ -527,6 +527,8 @@ def normalize_results(payload, source):
             "_truncated": bool(item.get("truncated")),
             # Wiki Search marks an overview page with the addresses of the pages it links to that match (hub_pages).
             "_hub_pages": item.get("hub_pages") if isinstance(item.get("hub_pages"), list) else None,
+            **({"for_query": item.get("for_query")} if item.get("for_query") else {}),
+            **({"for_queries": item.get("for_queries")} if isinstance(item.get("for_queries"), list) else {}),
         })
     return results
 
@@ -1477,19 +1479,17 @@ def search_website(
                     "ontology": resolution_summary(resolution), "count": 0, "results": [],
                     "agent_instructions": CITE_AND_STATS + EXCERPT_INSTRUCTIONS}
         queries = _clean_queries(query, [q for q in plan.get("queries", []) if q.casefold() != query.casefold()])
-        with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-            payloads = list(pool.map(lambda text: post_json_with_retry(
-                f"{WEBSEARCH_URL}/api/search",
-                {"query": text, "concepts": concepts, "domains": domains,
-                 "ontology_version": resolution.get("ontology_version"), "purpose": "search",
-                 "limit": max(1, min(int(limit), 5))}, WEBSEARCH_KEY), queries))
+        payload = post_json_with_retry(
+            f"{WEBSEARCH_URL}/api/search",
+            {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
+             "ontology_version": resolution.get("ontology_version"), "purpose": "search",
+             "limit": max(1, min(int(limit), 5))}, WEBSEARCH_KEY)
         items, seen = [], set()
-        for payload in payloads:
-            for item in payload.get("results", []) or []:
-                identity = page_identity(item)
-                if identity not in seen:
-                    seen.add(identity)
-                    items.append(item)
+        for item in payload.get("results", []) or []:
+            identity = page_identity(item)
+            if identity not in seen:
+                seen.add(identity)
+                items.append(item)
         result = {"query": query, "queries": queries, "status": "completed", "resolution": resolution,
                   "concepts": concepts, "domains": domains, "count": len(items), "results": items}
         if isinstance(result, dict) and "agent_instructions" not in result:
@@ -1502,9 +1502,19 @@ def search_website(
 def run_wiki_search(query, full_documents, document_max_chars, concepts=None, domains=None, also=None):
     """Wiki search for the combined tool. Returns (payload, error) and never raises."""
     try:
-        params = {"q": query, "limit": WIKI_POOL,
-                  "concepts": ",".join(concepts or []), "domains": ",".join(domains or []),
-                  "also": " ".join(also or [])}
+        queries = _clean_queries(query, also or [])
+        if len(queries) == 1:
+            params = {"q": query, "limit": WIKI_POOL,
+                      "concepts": ",".join(concepts or []), "domains": ",".join(domains or [])}
+            if also:
+                params["also"] = " ".join(also)
+            if full_documents or WIKI_FULL_TEXT:
+                params.update({"full_text": "true", "max_chars": max(500, min(int(document_max_chars), 20000))})
+            else:
+                params["full_text"] = "false"
+            return get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params), None
+        params = {"query": query, "queries": queries, "limit": WIKI_POOL,
+                  "concepts": concepts or [], "domains": domains or []}
         if full_documents or WIKI_FULL_TEXT:
             params.update({
                 "full_text": "true",
@@ -1512,7 +1522,7 @@ def run_wiki_search(query, full_documents, document_max_chars, concepts=None, do
             })
         else:
             params["full_text"] = "false"
-        return get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params), None
+        return post_json_with_retry(f"{WIKISEARCH_URL}/api/search", params, WIKISEARCH_KEY), None
     except Exception as exc:
         return {"results": []}, exc
 
@@ -1549,27 +1559,24 @@ def search_wiki(
             return {"query": query, "ontology": resolution_summary(resolution), "count": 0, "results": [],
                     "agent_instructions": CITE_AND_STATS + WIKI_DOCUMENT_INSTRUCTIONS}
         queries = _clean_queries(query, [q for q in plan.get("queries", []) if q.casefold() != query.casefold()])
-        sibling_queries = [q for q in queries if q.casefold() != query.casefold()]
-        def get_wiki(text):
-            params = {"q": text, "limit": max(1, min(int(limit), 10)),
+        if len(queries) == 1:
+            params = {"q": query, "limit": max(1, min(int(limit), 10)),
                       "concepts": ",".join(concepts), "domains": ",".join(domains),
-                      "also": " ".join(sibling_queries)}
-            if full_documents:
-                params.update({"full_text": "true", "max_chars": document_max_chars})
-            else:
-                params["full_text"] = "false"
-            return get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params)
-        with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-            payloads = list(pool.map(get_wiki, queries))
+                      "full_text": str(full_documents).lower(), "max_chars": document_max_chars}
+            payload = get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params)
+        else:
+            params = {"query": query, "queries": queries, "limit": max(1, min(int(limit), 10)),
+                      "concepts": concepts, "domains": domains, "full_text": full_documents,
+                      "max_chars": document_max_chars}
+            payload = post_json_with_retry(f"{WIKISEARCH_URL}/api/search", params, WIKISEARCH_KEY)
         items, seen = [], set()
-        for payload in payloads:
-            for item in drop_excluded_wiki(normalize_results(payload, "wiki")):
-                if item.get("source") not in {"wiki", None, ""}:
-                    continue
-                identity = page_identity(item)
-                if identity not in seen:
-                    seen.add(identity)
-                    items.append(item)
+        for item in drop_excluded_wiki(normalize_results(payload, "wiki")):
+            if item.get("source") not in {"wiki", None, ""}:
+                continue
+            identity = page_identity(item)
+            if identity not in seen:
+                seen.add(identity)
+                items.append(item)
         results = items[:max(1, min(int(limit), 10))]
         response = {
             "query": query,
@@ -1666,15 +1673,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         except Exception as exc:
             _plan = {"resolution": {"status": "unavailable", "matched_concepts": [], "domains": []},
                      "queries": [query], "error": exc}
-        if _plan["resolution"].get("matched_concepts"):
-            queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
-            if len(queries) > 1:
-                with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-                    parts = list(pool.map(lambda text: search_one(text, limit, full_documents, max_documents,
-                                                                  document_max_chars, _plan=_plan), queries))
-                response = combine_searches(queries, parts, limit)
-                _search_cache_put(cache_key, response)
-                return response
+    queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
     errors = []
 
     # Timing: each lap records the milliseconds since the previous one.
@@ -1703,7 +1702,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
 
     if concepts:
         wiki_pool = ThreadPoolExecutor(max_workers=1)
-        sibling_queries = [q for q in (_plan.get("queries") or []) if q.casefold() != query.casefold()]
+        sibling_queries = queries[1:]
         wiki_future = wiki_pool.submit(run_wiki_search, query, full_documents, document_max_chars,
                                        concepts, domains, sibling_queries)
     else:
@@ -1714,7 +1713,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         try:
             website = post_json_with_retry(
                 f"{WEBSEARCH_URL}/api/search",
-                {"query": query, "concepts": concepts, "domains": domains,
+                {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
                  "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
                 WEBSEARCH_KEY,
             )
