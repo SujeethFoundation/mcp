@@ -2,6 +2,7 @@
 import json as jsonlib
 import os
 
+import pytest
 import requests
 
 os.environ.setdefault("MCP_TRUSTED_RANGE_URLS", "none")
@@ -298,6 +299,37 @@ def test_ontology_resolution_calls_the_configured_azure_gpt6_luna_endpoint(monke
     assert list(model_input) == ["ontology", "question"]
     assert len(request["json"]["prompt_cache_key"]) == 64
     assert request["json"]["reasoning"] == {"effort": "low"}
+
+
+def test_ontology_model_429_logs_safe_rate_limit_details(monkeypatch, capsys):
+    response = reply({"error": {"message": "Rate limit is exceeded"}}, status=429)
+    response.headers.update({
+        "retry-after-ms": "2000",
+        "x-ratelimit-remaining-requests": "0",
+        "x-ratelimit-remaining-tokens": "0",
+        "apim-request-id": "request-123",
+    })
+    response.url = "https://models.example/openai/v1/responses"
+
+    def post(url, **kwargs):
+        response.request = requests.Request("POST", url).prepare()
+        return response
+
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_ENDPOINT", "https://models.example")
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_API_KEY", "test-secret")
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_NAME", "gpt-6-luna")
+    monkeypatch.setattr(server.http, "post", post)
+
+    with pytest.raises(requests.HTTPError):
+        server.call_ontology_model("do not log this question", {"classes": [], "relationships": []})
+
+    logged = capsys.readouterr().err
+    assert "ontology_model_http_error" in logged
+    assert '"status": 429' in logged
+    assert '"retry-after-ms": "2000"' in logged
+    assert '"x-ratelimit-remaining-tokens": "0"' in logged
+    assert '"message": "Rate limit is exceeded"' in logged
+    assert "do not log this question" not in logged and "test-secret" not in logged
 
 
 def test_ontology_model_endpoint_accepts_resource_base_and_full_responses_url():
