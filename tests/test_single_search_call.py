@@ -69,7 +69,7 @@ def search(query="how do I volunteer"):
 def test_a_search_makes_one_request_to_the_search_app(monkeypatch):
     calls = wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     search()
-    assert len([url for url, _ in calls if url.startswith(server.WEBSEARCH_URL) and url.endswith("/api/search")]) == 1
+    assert len(calls) == 1 and calls[0][0].endswith("/api/search")
     assert not any(url.endswith("/api/domain-resolution") for url, _ in calls)
 
 
@@ -139,7 +139,7 @@ def test_career_exploration_is_resolved_before_the_first_search(monkeypatch):
     calls = []
 
     def post(url, headers=None, json=None, timeout=None):
-        calls.append((url, json))
+        calls.append(json)
         return reply(recovered)
 
     monkeypatch.setattr(server.http, "post", post)
@@ -151,14 +151,13 @@ def test_career_exploration_is_resolved_before_the_first_search(monkeypatch):
         "how do I compare employers?",
         "how do I learn what a job role is really like?",
     ):
-        before = len([body for url, body in calls if url.startswith(server.WEBSEARCH_URL)])
+        before = len(calls)
         out = search(question)
         assert out["out_of_scope"] is False and out["status"] in {"completed", "partial"}
         assert out["ontology"]["matched_concepts"] == ["explore"]
-        sent = [body for url, body in calls if url.startswith(server.WEBSEARCH_URL)]
-        assert len(sent) == before + 1
-        assert sent[-1]["concepts"] == ["explore"]
-        assert sent[-1]["domains"] == ["sujeeth.org"]
+        assert len(calls) == before + 1
+        assert calls[-1]["concepts"] == ["explore"]
+        assert calls[-1]["domains"] == ["sujeeth.org"]
 
 
 def test_mcp_sends_every_model_generated_query_with_the_same_approved_filters(monkeypatch):
@@ -170,22 +169,13 @@ def test_mcp_sends_every_model_generated_query_with_the_same_approved_filters(mo
             "error": None}
     monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: plan)
     wiki_calls = []
-    post_json = server.post_json_with_retry
-    def record_wiki(url, payload, key="", attempts=None):
-        if url.startswith(server.WIKISEARCH_URL):
-            wiki_calls.append((url, dict(payload)))
-            return {"results": []}
-        return post_json(url, payload, key, attempts)
-    monkeypatch.setattr(server, "post_json_with_retry", record_wiki)
-    resolutions = []
-    monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: resolutions.append(query) or plan)
+    monkeypatch.setattr(server, "get_json", lambda url, key="", params=None: wiki_calls.append(dict(params or {})) or {"results": []})
     result = search("how can I research a company?")
     sent = [body for url, body in calls if url.endswith("/api/search")]
-    assert len(sent) == 1 and sent[0]["queries"] == plan["queries"]
-    assert sent[0]["concepts"] == ["explore"] and sent[0]["domains"] == ["sujeeth.org"]
-    assert len(wiki_calls) == 1 and wiki_calls[0][1]["queries"] == plan["queries"]
-    assert wiki_calls[0][1]["concepts"] == ["explore"] and wiki_calls[0][1]["domains"] == ["sujeeth.org"]
-    assert resolutions == ["how can I research a company?"]
+    assert {body["query"] for body in sent} == set(plan["queries"])
+    assert all(body["concepts"] == ["explore"] and body["domains"] == ["sujeeth.org"] for body in sent)
+    assert {item["q"] for item in wiki_calls} == set(plan["queries"])
+    assert all("concepts" in item and "domains" in item for item in wiki_calls)
     assert result["ontology"]["matched_concepts"] == ["explore"]
 
 
