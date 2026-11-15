@@ -1,4 +1,4 @@
-"""What the agent reads: one set of instructions, consistent limits, whole pages, one read per page."""
+"""What the agent reads: consistent search instructions and explicit page reads."""
 import os
 import re
 
@@ -33,9 +33,8 @@ def wire(monkeypatch, website_domain="sujeeth.org", wiki=True):
 # -- instructions ---------------------------------------------------------------------------------------------------
 
 def test_every_instruction_names_the_same_page_limit(monkeypatch):
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", False)
     wire(monkeypatch)
-    text = server.search_sujeeth_foundation.sync("report", full_documents=False)["agent_instructions"]
+    text = server.search_sujeeth_foundation.sync("report")["agent_instructions"]
     assert f"at most {server.MAX_BATCH_DOCUMENTS} pages" in text
     assert f"at most {server.MAX_BATCH_DOCUMENTS}," in server.GET_DOCUMENTS_DESCRIPTION
     assert f"at most {server.MAX_BATCH_DOCUMENTS}" in server.SERVER_INSTRUCTIONS
@@ -92,40 +91,35 @@ def test_tool_descriptions_are_the_agent_facing_text():
 # -- the response ---------------------------------------------------------------------------------------------------
 
 def test_candidates_are_named_so_they_are_not_read_as_results(monkeypatch):
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", False)
     wire(monkeypatch)
-    result = server.search_sujeeth_foundation.sync("report", full_documents=False)
+    result = server.search_sujeeth_foundation.sync("report")
     assert result["count"] == len(result["results"])
     assert set(result["retrieval"]) >= {"website_candidates", "wiki_candidates"}
     assert "wiki_search" not in result and "website_search" not in result
 
 
-def test_a_complete_page_drops_its_snippet_and_a_cut_page_keeps_it(monkeypatch):
+def test_search_never_reads_page_text_automatically(monkeypatch):
     wire(monkeypatch)
-    for truncated, expect_snippet in ((False, False), (True, True)):
-        monkeypatch.setattr(server, "fetch_document",
-                            lambda url, *a, _t=truncated, **k: {"text": "whole page", "truncated": _t})
-        result = server.search_sujeeth_foundation.sync("report", full_documents=True)
-        item = result["results"][0]
-        assert item["document"]["text"] == "whole page"
-        assert ("snippet" in item) is expect_snippet
+    calls = []
+    monkeypatch.setattr(server, "fetch_document", lambda *a, **k: calls.append(a) or {"text": "whole page"})
+    result = server.search_sujeeth_foundation.sync("report")
+    assert calls == []
+    assert result["full_documents"] is None
+    assert "document" not in result["results"][0]
 
 
 def test_a_foundation_page_is_read_whole_by_url_not_as_a_passage(monkeypatch):
-    wire(monkeypatch)
     calls = []
     monkeypatch.setattr(server, "fetch_document", lambda *a, **k: calls.append(a) or {"text": "page"})
-    server.search_sujeeth_foundation.sync("report", full_documents=True)
-    url, chunk_id = calls[0][0], calls[0][1]
-    assert url == "https://www.sujeeth.org/report.pdf" and chunk_id is None
+    server.get_documents.sync(["https://www.sujeeth.org/report.pdf"])
+    assert calls[0][0] == "https://www.sujeeth.org/report.pdf" and calls[0][1] is None
 
 
-def test_a_third_party_page_is_still_read_around_the_matched_passage(monkeypatch):
-    wire(monkeypatch, website_domain="example.com")
+def test_a_third_party_page_is_read_only_when_requested_by_url(monkeypatch):
     calls = []
     monkeypatch.setattr(server, "fetch_document", lambda *a, **k: calls.append(a) or {"text": "excerpt", "excerpt_only": True})
-    server.search_sujeeth_foundation.sync("report", full_documents=True)
-    assert calls[0][1] == "r-3"
+    server.get_documents.sync(["https://example.com/report"])
+    assert calls[0][0] == "https://example.com/report"
 
 
 # -- the page cache -------------------------------------------------------------------------------------------------
@@ -170,3 +164,4 @@ def test_diagnostics_reach_the_agent_only_when_timings_are_on(monkeypatch):
     monkeypatch.setattr(server, "TIMINGS", True)
     doc = server.get_documents.sync(url)["documents"][0]
     assert doc["cached"] is True and "ms" in doc
+
