@@ -74,6 +74,10 @@ ONTOLOGY_URL = setting(
 WEBSEARCH_KEY = setting("WEBSEARCH_FUNCTION_KEY")
 WIKISEARCH_KEY = setting("WIKISEARCH_FUNCTION_KEY")
 ONTOLOGY_KEY = setting("ONTOLOGY_FUNCTION_KEY")
+ONTOLOGY_MODEL_ENDPOINT = setting("MCP_ONTOLOGY_MODEL_ENDPOINT").rstrip("/")
+ONTOLOGY_MODEL_API_KEY = setting("MCP_ONTOLOGY_MODEL_API_KEY")
+ONTOLOGY_MODEL_NAME = setting("MCP_ONTOLOGY_MODEL_NAME", "gpt-6-luna")
+ONTOLOGY_MODEL_TIMEOUT = max(5, int(setting("MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS", "25") or 25))
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
 
@@ -745,24 +749,26 @@ OUT_OF_SCOPE_INSTRUCTIONS = (
 _ontology_catalog: dict | None = None
 _ontology_catalog_loaded_at: float | None = None
 ONTOLOGY_CATALOG_REFRESH_SECONDS = 300
-RECOVERY_STOPWORDS = set("a an the and or but if of to in on at by for from with into about is are was were be do does did can could should would will i me my we us our you your what which who when where why how tell show find learn understand know help please".split())
+MAX_RESOLVED_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))
+ONTOLOGY_RESOLUTION_PROMPT = """You route questions for the Sujeeth Foundation. Determine whether the user's actual topic is represented by any concepts in the supplied ontology, including its definitions, aliases, query phrases, and relevant relationships. The ontology catalog is the authority; do not use general knowledge to invent Foundation topics.
+Return direct matched concept IDs for what the user asks about, related concept IDs only when the ontology connects them in a way useful for retrieval, and up to the requested number of concise search queries that cover the original ask and likely relevant Foundation guidance. Set needs_clarification only when the wording leaves two materially different in-scope interpretations unresolved, and then provide one short suggested_question. Preserve the question's intent and do not broaden to unrelated advice. An empty direct matched_concepts list means out of scope.
+Relationship direction is semantic. For `illustrates`, only a matched object may retrieve its subject as an illustration; never reverse that edge. Use other relationships only as their declared search behavior allows. Return only IDs present in the catalog. Do not treat absence of a search result as evidence that a topic is out of scope."""
 
-
-def ontology_match_tokens(words):
-    """Normalize common English plurals when matching user wording to ontology phrases."""
-    out = set()
-    for word in words:
-        if len(word) > 4 and word.endswith("ies"):
-            out.add(word[:-3] + "y")
-        elif len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
-            out.add(word[:-1])
-        else:
-            out.add(word)
-    return out
+ONTOLOGY_PLAN_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "matched_concepts": {"type": "array", "items": {"type": "string"}},
+        "related_concepts": {"type": "array", "items": {"type": "string"}},
+        "queries": {"type": "array", "items": {"type": "string"}},
+        "needs_clarification": {"type": "boolean"},
+        "suggested_question": {"type": ["string", "null"]},
+    },
+    "required": ["matched_concepts", "related_concepts", "queries", "needs_clarification", "suggested_question"],
+}
 
 
 def ontology_catalog() -> dict | None:
-    """Load the public ontology catalog for a bounded no-match relevance check."""
+    """Load the public ontology catalog used by the AI resolver and domain authorization."""
     global _ontology_catalog, _ontology_catalog_loaded_at
     now = time.monotonic()
     if _ontology_catalog is not None and _ontology_catalog_loaded_at is not None and now - _ontology_catalog_loaded_at < ONTOLOGY_CATALOG_REFRESH_SECONDS:
@@ -778,42 +784,82 @@ def ontology_catalog() -> dict | None:
     return _ontology_catalog
 
 
-def ontology_match_concepts(query: str, catalog: dict | None = None) -> list[str]:
-    """Match the query to declared concepts, then include linked concepts that can expand retrieval."""
-    catalog = catalog if catalog is not None else ontology_catalog()
-    if not catalog:
-        return []
-    query_words = set(re.findall(r"[a-z0-9]+", (query or "").lower())) - RECOVERY_STOPWORDS
-    if not query_words:
-        return []
-    selected = set()
+def compact_ontology_catalog(catalog):
+    """Keep the full searchable vocabulary and relevant edges while avoiding unrelated ontology metadata."""
+    classes = []
     for item in catalog.get("classes", []):
         if not isinstance(item, dict) or not item.get("id"):
             continue
-        phrases = [item.get("id", "").replace("_", " "), item.get("name", ""), item.get("definition", "")]
-        for key in ("aliases", "synonyms", "alternative_terms", "alternate_names", "query_phrases"):
-            val = item.get(key, [])
-            phrases.extend([val] if isinstance(val, str) else val if isinstance(val, list) else [])
-        for phrase in phrases:
-            phrase_words = set(re.findall(r"[a-z0-9]+", str(phrase).lower())) - RECOVERY_STOPWORDS
-            if not phrase_words:
-                continue
-            exact = " " + " ".join(re.findall(r"[a-z0-9]+", str(phrase).lower())) + " "
-            query_text = " " + " ".join(re.findall(r"[a-z0-9]+", (query or "").lower())) + " "
-            if exact in query_text or len(ontology_match_tokens(query_words) & ontology_match_tokens(phrase_words)) >= 2:
-                selected.add(str(item["id"]))
-                break
-    if not selected:
-        return []
+        keep = {key: item[key] for key in ("id", "name", "category", "definition", "aliases", "synonyms",
+                                            "alternative_terms", "alternate_names", "query_phrases") if key in item}
+        classes.append(keep)
+    predicates = catalog.get("predicates", [])
+    if isinstance(predicates, dict):
+        predicates = [{"id": key, **(value if isinstance(value, dict) else {})} for key, value in predicates.items()]
+    predicate_map = {str(p.get("id", "")).lower(): p for p in predicates if isinstance(p, dict)}
+    edges = []
+    for rel in catalog.get("relationships", []):
+        if not isinstance(rel, dict):
+            continue
+        pred = str(rel.get("predicate", "")).lower()
+        p = predicate_map.get(pred, {})
+        behavior = rel.get("search_behavior", p.get("search_behavior", {}))
+        if behavior or p.get("expands_search"):
+            edges.append({"subject": rel.get("subject"), "predicate": rel.get("predicate"),
+                          "object": rel.get("object"), "search_behavior": behavior or {"effect": "expand"}})
+    domains = [{"domain": row.get("domain"), "associated_concepts": row.get("associated_concepts") or []}
+               for row in catalog.get("domains", []) if isinstance(row, dict) and row.get("search_enabled") and row.get("domain")]
+    return {"ontology_version": catalog.get("ontology_version"), "classes": classes,
+            "relationships": edges, "search_domains": domains}
+
+
+def _responses_output_text(payload):
+    if isinstance(payload.get("output_text"), str):
+        return payload["output_text"]
+    for item in payload.get("output", []):
+        for part in item.get("content", []) if isinstance(item, dict) else []:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                return part["text"]
+    raise ValueError("Azure model response contained no text output")
+
+
+def call_ontology_model(query, catalog):
+    """Call the configured Azure GPT-6 Luna deployment with the searchable ontology catalog."""
+    if not ONTOLOGY_MODEL_ENDPOINT or not ONTOLOGY_MODEL_API_KEY:
+        raise RuntimeError("Azure ontology model is not configured")
+    url = ONTOLOGY_MODEL_ENDPOINT
+    if not url.endswith("/openai/v1"):
+        url += "/openai/v1"
+    response = requests.post(
+        f"{url}/responses",
+        headers={"api-key": ONTOLOGY_MODEL_API_KEY, "Content-Type": "application/json"},
+        json={"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
+              "input": json.dumps({"question": query, "ontology": compact_ontology_catalog(catalog)}, ensure_ascii=False),
+              "max_output_tokens": 1200, "store": False,
+              "text": {"format": {"type": "json_schema", "name": "ontology_search_plan", "strict": True,
+                                   "schema": ONTOLOGY_PLAN_SCHEMA}}},
+        timeout=ONTOLOGY_MODEL_TIMEOUT,
+    )
+    response.raise_for_status()
+    return json.loads(_responses_output_text(response.json()))
+
+
+def validate_ontology_plan(result, query, catalog):
+    """Validate model-selected concepts, relationship expansions, domains, and query variants."""
+    valid_ids = {str(row["id"]) for row in catalog["classes"] if isinstance(row, dict) and row.get("id")}
+    matched = list(dict.fromkeys(x for x in result.get("matched_concepts", []) if isinstance(x, str) and x in valid_ids))
+    related = list(dict.fromkeys(x for x in result.get("related_concepts", []) if isinstance(x, str) and x in valid_ids))
+    # A model may identify a concept as related only when an enabled ontology edge supports retrieval.
     predicates = catalog.get("predicates", [])
     if isinstance(predicates, dict):
         predicates = [{"id": k, **(v if isinstance(v, dict) else {})} for k, v in predicates.items()]
-    behaviors = {str(p.get("id", "")).lower(): p.get("search_behavior", {}) for p in predicates if isinstance(p, dict)}
+    behavior_map = {str(p.get("id", "")).lower(): p.get("search_behavior", {}) for p in predicates if isinstance(p, dict)}
+    allowed_related = set()
     for rel in catalog.get("relationships", []):
         if not isinstance(rel, dict):
             continue
         predicate = str(rel.get("predicate", "")).lower()
-        spec = rel.get("search_behavior", behaviors.get(predicate, {}))
+        spec = rel.get("search_behavior", behavior_map.get(predicate, {}))
         if not isinstance(spec, dict) or spec.get("enabled") is False:
             continue
         effect = str(spec.get("effect") or ("expand" if predicate == "illustrates" else "")).lower()
@@ -821,14 +867,50 @@ def ontology_match_concepts(query: str, catalog: dict | None = None) -> list[str
             continue
         subject, obj = rel.get("subject"), rel.get("object")
         if predicate == "illustrates":
-            if obj in selected and subject:
-                selected.add(str(subject))
-        elif subject in selected and obj:
-            selected.add(str(obj))
-        elif obj in selected and subject:
-            selected.add(str(subject))
-    valid_ids = {str(c["id"]) for c in catalog["classes"] if isinstance(c, dict) and c.get("id")}
-    return sorted(selected & valid_ids)
+            if obj in matched and subject:
+                allowed_related.add(str(subject))
+        elif subject in matched and obj:
+            allowed_related.add(str(obj))
+        elif obj in matched and subject:
+            allowed_related.add(str(subject))
+    related = [x for x in related if x in allowed_related and x not in matched]
+    concepts = matched + related
+    domains = list(dict.fromkeys(
+        row["domain"] for row in catalog.get("domains", [])
+        if isinstance(row, dict) and row.get("search_enabled") and row.get("domain")
+        and set(concepts).intersection(row.get("associated_concepts") or [])
+    ))
+    queries = []
+    for candidate in result.get("queries", []):
+        if not isinstance(candidate, str):
+            continue
+        candidate = " ".join(candidate.split())
+        if candidate and len(candidate) <= 300 and candidate.casefold() not in {q.casefold() for q in queries}:
+            queries.append(candidate)
+        if len(queries) >= MAX_RESOLVED_QUERIES:
+            break
+    if matched and query.strip() and query.casefold() not in {q.casefold() for q in queries}:
+        queries.insert(0, query.strip())
+        queries = queries[:MAX_RESOLVED_QUERIES]
+    suggested = result.get("suggested_question")
+    suggested = " ".join(suggested.split()) if isinstance(suggested, str) else None
+    needs_clarification = bool(result.get("needs_clarification") and matched and suggested and len(suggested) <= 300)
+    return {"resolution": {"status": "resolved" if matched else "no_match",
+                           "ontology_version": catalog.get("ontology_version"),
+                           "matched_concepts": concepts, "domains": domains,
+                           "needs_clarification": needs_clarification,
+                           "suggested_question": suggested if needs_clarification else None,
+                           "concept_matches": ([{"concept_id": x, "source": "azure_model"} for x in matched] +
+                                               [{"concept_id": x, "source": "ontology_relationship"} for x in related])},
+            "queries": queries, "error": None}
+
+
+def resolve_ontology_plan(query, catalog=None):
+    """Ask Azure GPT-6 Luna to resolve the query against ontology concepts and suggest retrieval queries."""
+    catalog = catalog if catalog is not None else ontology_catalog()
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("classes"), list):
+        raise RuntimeError("Ontology catalog is unavailable")
+    return validate_ontology_plan(call_ontology_model(query, catalog), query, catalog)
 
 NO_RESULTS_INSTRUCTIONS = (
     " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
@@ -890,10 +972,10 @@ def assess_quality(resolution, results, errors):
     # A service failure is not a reason to quiz the user about their topic.
     service_degraded = bool(errors)
     all_failed = service_degraded and not results
-    needs_clarification = bool(close_pair) and not all_failed and not out_of_scope
-    question = None
+    needs_clarification = (bool(close_pair) or bool(resolution.get("needs_clarification"))) and not all_failed and not out_of_scope
+    question = resolution.get("suggested_question") if resolution.get("needs_clarification") else None
 
-    if needs_clarification:
+    if needs_clarification and not question:
         first = close_pair[0].get("name", "the first topic")
         second = close_pair[1].get("name", "the second topic")
         question = f"Are you asking about {first} or {second}?"
@@ -1019,14 +1101,11 @@ CITE_AND_STATS = "Cite the url. " + STATS_RULE
 # What the agent reads when it lists the tools. They are written for the agent: what each tool is
 # for, when to use it, and what to do with what comes back. Implementation detail stays in code comments.
 SEARCH_DESCRIPTION = (
-    "Search the Sujeeth Foundation website and GitHub wiki together. Use this first for any question "
-    "about the Foundation: the Career Circles program and its six-week curriculum, mentoring, "
-    "volunteering, donating, partnering, annual reports, blog posts and career resources. Write the "
-    "query as the few distinctive words a page would contain (for example 'week 3 resume agenda'), "
-    "not as a full sentence. "
-    + (f"When the question has separate parts (for example a resume and an interview), put the first part in "
-       f"query and the others in more_queries, at most {MAX_QUERIES} searches in all: one call covers every part, so "
-       f"do not call this tool once per part. " if MAX_QUERIES > 1 else "")
+    "Search the Sujeeth Foundation website and GitHub wiki together. Use this first for the visitor's "
+    "question. MCP uses Azure GPT-6 Luna to resolve the wording against the full ontology, follow "
+    "enabled concept relationships, and generate related search queries. It validates the selected "
+    "concept IDs and approved website domains before sending each query to both search services. "
+    "Do not classify a question as out of scope yourself; rely on this tool's out_of_scope result. "
     + "Each result has a title, url, source (website or wiki) and matched "
     "concepts; results flagged best_bet or spotlight are curated pages. "
     + ("A wiki result carries its whole page in a document field; every other result" if WIKI_FULL_TEXT
@@ -1035,13 +1114,16 @@ SEARCH_DESCRIPTION = (
     "includes agent_instructions and, only when two readings of the question could conflict, a "
     "suggested_question to ask. If the response has out_of_scope true, the question is not about the Foundation: "
     "relay its message and do not answer from other sources. "
-    "Leave full_documents, max_documents and document_max_chars at their defaults."
+    + (f"For truly separate parts of one request, you may pass the first in query and the others in more_queries "
+       f"(up to {MAX_QUERIES} searches total); related-query expansion is handled inside MCP. " if MAX_QUERIES > 1 else "")
+    + "Leave full_documents, max_documents and document_max_chars at their defaults."
 )
 
 WEBSITE_SEARCH_DESCRIPTION = (
-    "Search only the ontology-approved Foundation websites (not the wiki). Prefer "
-    "search_sujeeth_foundation. Use this only when you already hold concepts and domains from an "
-    "earlier search and want website results alone. Results are excerpts; get_documents reads full pages."
+    "Search only ontology-approved Foundation websites (not the wiki). MCP resolves the query, "
+    "generates related queries, and supplies validated concepts and domains. Prefer "
+    "search_sujeeth_foundation unless website-only results are needed. Results are excerpts; "
+    "get_documents reads full pages."
 )
 
 WIKI_SEARCH_DESCRIPTION = (
@@ -1368,27 +1450,41 @@ def get_ontology_context(
 @in_thread
 def search_website(
     query: str,
-    concepts: list[str] | None = None,
-    domains: list[str] | None = None,
     limit: int = 5,
 ) -> dict[str, Any]:
-    """Search ontology-approved Sujeeth Foundation websites."""
+    """Resolve the question in MCP, then search approved websites with MCP-derived filters."""
     query = (query or "").strip()
     if not query:
         return {"error": "Please provide a query."}
 
     try:
-        result = post_json_with_retry(
-            f"{WEBSEARCH_URL}/api/search",
-            {
-                "query": query,
-                "concepts": concepts or [],
-                "domains": domains or [],
-                "purpose": "search",
-                "limit": max(1, min(int(limit), 5)),
-            },
-            WEBSEARCH_KEY,
-        )
+        plan = resolve_ontology_plan(query)
+        resolution = plan["resolution"]
+        concepts, domains = resolution.get("matched_concepts") or [], resolution.get("domains") or []
+        if not concepts:
+            return {"status": "out_of_scope", "out_of_scope": True, "message": OUT_OF_SCOPE_MESSAGE,
+                    "ontology": resolution_summary(resolution), "count": 0, "results": [],
+                    "agent_instructions": OUT_OF_SCOPE_INSTRUCTIONS}
+        if not domains:
+            return {"status": "no_approved_domains_for_concepts", "out_of_scope": False,
+                    "ontology": resolution_summary(resolution), "count": 0, "results": [],
+                    "agent_instructions": CITE_AND_STATS + EXCERPT_INSTRUCTIONS}
+        queries = _clean_queries(query, [q for q in plan.get("queries", []) if q.casefold() != query.casefold()])
+        with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+            payloads = list(pool.map(lambda text: post_json_with_retry(
+                f"{WEBSEARCH_URL}/api/search",
+                {"query": text, "concepts": concepts, "domains": domains,
+                 "ontology_version": resolution.get("ontology_version"), "purpose": "search",
+                 "limit": max(1, min(int(limit), 5))}, WEBSEARCH_KEY), queries))
+        items, seen = [], set()
+        for payload in payloads:
+            for item in payload.get("results", []) or []:
+                identity = page_identity(item)
+                if identity not in seen:
+                    seen.add(identity)
+                    items.append(item)
+        result = {"query": query, "queries": queries, "status": "completed", "resolution": resolution,
+                  "concepts": concepts, "domains": domains, "count": len(items), "results": items}
         if isinstance(result, dict) and "agent_instructions" not in result:
             result["agent_instructions"] = CITE_AND_STATS + EXCERPT_INSTRUCTIONS
         return result
@@ -1396,10 +1492,12 @@ def search_website(
         return error_result(exc)
 
 
-def run_wiki_search(query, full_documents, document_max_chars):
+def run_wiki_search(query, full_documents, document_max_chars, concepts=None, domains=None, also=None):
     """Wiki search for the combined tool. Returns (payload, error) and never raises."""
     try:
-        params = {"q": query, "limit": WIKI_POOL}
+        params = {"q": query, "limit": WIKI_POOL,
+                  "concepts": ",".join(concepts or []), "domains": ",".join(domains or []),
+                  "also": " ".join(also or [])}
         if full_documents or WIKI_FULL_TEXT:
             params.update({
                 "full_text": "true",
@@ -1423,6 +1521,7 @@ def search_wiki(
     """
     Search the Sujeeth Foundation GitHub wiki. Returns short excerpts that can stop
     mid-sentence. To read pages, call get_documents once with their urls.
+    MCP resolves the question and generates related queries before the wiki is searched.
     Set full_documents to true to attach the full page text to every result (uses many tokens).
     """
     query = (query or "").strip()
@@ -1432,19 +1531,43 @@ def search_wiki(
     document_max_chars = max(500, min(int(document_max_chars), 20000))
     full_documents = bool(full_documents or WIKI_FULL_TEXT)
     try:
-        params = {"q": query, "limit": max(1, min(int(limit), 10))}
-        if full_documents:
-            params.update({"full_text": "true", "max_chars": document_max_chars})
-        else:
-            params["full_text"] = "false"
-        payload = get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params)
-
-        results = drop_excluded_wiki([
-            item for item in normalize_results(payload, "wiki")
-            if item.get("source") == "wiki"
-        ])
+        plan = resolve_ontology_plan(query)
+        resolution = plan["resolution"]
+        concepts, domains = resolution.get("matched_concepts") or [], resolution.get("domains") or []
+        if not concepts:
+            return {"status": "out_of_scope", "out_of_scope": True, "message": OUT_OF_SCOPE_MESSAGE,
+                    "ontology": resolution_summary(resolution), "count": 0, "results": [],
+                    "agent_instructions": OUT_OF_SCOPE_INSTRUCTIONS}
+        if not foundation_domain_allowed(resolution, domains):
+            return {"query": query, "ontology": resolution_summary(resolution), "count": 0, "results": [],
+                    "agent_instructions": CITE_AND_STATS + WIKI_DOCUMENT_INSTRUCTIONS}
+        queries = _clean_queries(query, [q for q in plan.get("queries", []) if q.casefold() != query.casefold()])
+        sibling_queries = [q for q in queries if q.casefold() != query.casefold()]
+        def get_wiki(text):
+            params = {"q": text, "limit": max(1, min(int(limit), 10)),
+                      "concepts": ",".join(concepts), "domains": ",".join(domains),
+                      "also": " ".join(sibling_queries)}
+            if full_documents:
+                params.update({"full_text": "true", "max_chars": document_max_chars})
+            else:
+                params["full_text"] = "false"
+            return get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params)
+        with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+            payloads = list(pool.map(get_wiki, queries))
+        items, seen = [], set()
+        for payload in payloads:
+            for item in drop_excluded_wiki(normalize_results(payload, "wiki")):
+                if item.get("source") not in {"wiki", None, ""}:
+                    continue
+                identity = page_identity(item)
+                if identity not in seen:
+                    seen.add(identity)
+                    items.append(item)
+        results = items[:max(1, min(int(limit), 10))]
         response = {
-            "query": payload.get("query", query),
+            "query": query,
+            "queries": queries,
+            "ontology": resolution_summary(resolution),
             "count": len(results),
             "results": results,
         }
@@ -1505,7 +1628,7 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
-def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000):
+def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000, _plan=None):
     """
     One query: Search Website Search and Wiki Search together using ontology resolution.
     Results flagged best_bet or spotlight are curated pages; present them first.
@@ -1530,6 +1653,21 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     if cached is not None:
         print("search_cache_hit", file=sys.stderr, flush=True)
         return cached
+    if _plan is None:
+        try:
+            _plan = resolve_ontology_plan(query)
+        except Exception as exc:
+            _plan = {"resolution": {"status": "unavailable", "matched_concepts": [], "domains": []},
+                     "queries": [query], "error": exc}
+        if _plan["resolution"].get("matched_concepts"):
+            queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
+            if len(queries) > 1:
+                with ThreadPoolExecutor(max_workers=len(queries)) as pool:
+                    parts = list(pool.map(lambda text: search_one(text, limit, full_documents, max_documents,
+                                                                  document_max_chars, _plan=_plan), queries))
+                response = combine_searches(queries, parts, limit)
+                _search_cache_put(cache_key, response)
+                return response
     errors = []
 
     # Timing: each lap records the milliseconds since the previous one.
@@ -1542,28 +1680,25 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         timings[name] = round((now - mark) * 1000)
         mark = now
 
-    # MCP owns relevance and domain authorization. Websearch receives the approved concept and domain filters.
+    # MCP's AI model decides relevance, then MCP validates every proposed ID against the ontology and
+    # derives approved domains. An unavailable model is a service failure, never an out-of-scope verdict.
     try:
-        catalog = ontology_catalog()
-        if not catalog:
-            raise RuntimeError("Ontology catalog is unavailable")
-        concepts = ontology_match_concepts(query, catalog)
-        domain_rows = [d for d in (catalog or {}).get("domains", []) if d.get("search_enabled") and
-                       set(concepts).intersection(d.get("associated_concepts") or [])]
-        domains = list(dict.fromkeys(d.get("domain") for d in domain_rows if d.get("domain")))
-        resolution = {"status": "resolved" if concepts and domains else "no_match",
-                      "ontology_version": (catalog or {}).get("ontology_version"),
-                      "matched_concepts": concepts, "domains": domains,
-                      "concept_matches": [{"concept_id": c, "source": "ontology_match"} for c in concepts]}
+        resolution = _plan["resolution"]
+        concepts = resolution.get("matched_concepts") or []
+        domains = resolution.get("domains") or []
+        if resolution.get("status") == "unavailable":
+            raise _plan.get("error") or RuntimeError("Ontology resolution is unavailable")
     except Exception as exc:
         website = {"results": []}
         resolution = {"status": "unavailable"}
         concepts, domains = [], []
         errors.append({"service": "ontology", **error_result(exc)})
 
-    if concepts and domains:
+    if concepts:
         wiki_pool = ThreadPoolExecutor(max_workers=1)
-        wiki_future = wiki_pool.submit(run_wiki_search, query, full_documents, document_max_chars)
+        sibling_queries = [q for q in (_plan.get("queries") or []) if q.casefold() != query.casefold()]
+        wiki_future = wiki_pool.submit(run_wiki_search, query, full_documents, document_max_chars,
+                                       concepts, domains, sibling_queries)
     else:
         wiki_pool = None
         wiki_future = None

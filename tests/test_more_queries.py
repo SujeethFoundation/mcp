@@ -114,11 +114,21 @@ def test_every_part_out_of_scope_is_the_usual_refusal(monkeypatch):
 
 def test_clarification_is_asked_only_when_every_part_would_ask(monkeypatch):
     wire(monkeypatch, {"resume": RESUME, "feedback": CLOSE, "feedback form": CLOSE})
+    def model_plan(query):
+        concept = "resume_resource" if "resume" in query else "feedback_form"
+        clarify = "feedback" in query
+        return {"resolution": {"status": "resolved", "ontology_version": "test",
+                               "matched_concepts": [concept], "domains": ["sujeeth.org"],
+                               "concept_matches": [{"concept_id": concept, "source": "test_model"}],
+                               "needs_clarification": clarify,
+                               "suggested_question": "Do you mean a feedback form or general feedback?" if clarify else None},
+                "queries": [query], "error": None}
+    monkeypatch.setattr(server, "resolve_ontology_plan", model_plan)
     mixed = search("resume", ["feedback"])
     assert not mixed["needs_clarification"] and mixed["suggested_question"] is None
     assert mixed["queries"][1]["needs_clarification"] and mixed["queries"][1]["suggested_question"]
     both = search("feedback", ["feedback form"])
-    assert both["needs_clarification"] and both["suggested_question"] == "Are you asking about Survey or Portal?"
+    assert both["needs_clarification"] and both["suggested_question"] == "Do you mean a feedback form or general feedback?"
 
 
 def test_a_failed_search_app_on_one_part_is_partial_not_lost(monkeypatch):

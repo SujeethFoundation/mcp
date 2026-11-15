@@ -73,12 +73,22 @@ def test_a_search_makes_one_request_to_the_search_app(monkeypatch):
     assert not any(url.endswith("/api/domain-resolution") for url, _ in calls)
 
 
-def test_the_request_names_no_concepts_so_none_count_as_explicit(monkeypatch):
+def test_the_request_carries_only_concepts_selected_by_mcp(monkeypatch):
     calls = wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     search()
     body = calls[0][1]
-    assert set(body["concepts"]) == {"volunteer", "spotlight"} and body["domains"] == ["sujeeth.org"]
+    assert body["concepts"] == ["volunteer"] and body["domains"] == ["sujeeth.org"]
     assert body["query"] == "how do I volunteer" and body["limit"] == server.CANDIDATE_POOL
+
+
+def test_website_only_tool_uses_mcp_derived_filters(monkeypatch):
+    calls = wire(monkeypatch, {"status": "completed", "results": [HIT]})
+    result = server.search_website.sync("how can I research a company?")
+    search_calls = [body for url, body in calls if url.endswith("/api/search")]
+    assert result["status"] == "completed"
+    assert len(search_calls) == 1
+    assert search_calls[0]["concepts"] == ["explore"]
+    assert search_calls[0]["domains"] == ["sujeeth.org"]
 
 
 def test_the_candidate_pool_is_what_the_search_app_will_return():
@@ -88,7 +98,7 @@ def test_the_candidate_pool_is_what_the_search_app_will_return():
 def test_the_ontology_block_is_the_search_apps_resolution(monkeypatch):
     wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     out = search()
-    assert set(out["ontology"]["matched_concepts"]) == {"volunteer", "spotlight"}
+    assert out["ontology"]["matched_concepts"] == ["volunteer"]
     assert out["ontology"]["domains"] == ["sujeeth.org"] and out["ontology"]["ontology_version"] == "test"
     assert out["needs_clarification"] is False and out["status"] == "completed"
 
@@ -108,6 +118,15 @@ def test_a_question_with_no_concept_is_refused_not_clarified(monkeypatch):
     assert out["results"] == [] and out["count"] == 0
     assert REFUSAL in out["agent_instructions"] and "do not ask which area" in out["agent_instructions"]
     assert out["message"].startswith("That's outside what I can help with.") and "interview prep" in out["message"] and "mentor" in out["message"]
+
+
+def test_an_azure_model_failure_is_not_treated_as_out_of_scope(monkeypatch):
+    calls = wire(monkeypatch, {"status": "completed", "results": [HIT]})
+    monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: (_ for _ in ()).throw(RuntimeError("model offline")))
+    out = search("how can I research a company?")
+    assert out["out_of_scope"] is False and out["service_degraded"] is True
+    assert out["service_errors"][0]["service"] == "ontology"
+    assert calls == []
 
 
 def test_career_exploration_is_resolved_before_the_first_search(monkeypatch):
@@ -141,21 +160,85 @@ def test_career_exploration_is_resolved_before_the_first_search(monkeypatch):
         assert calls[-1]["domains"] == ["sujeeth.org"]
 
 
-def test_ontology_recovery_detects_any_strong_concept_match_and_relationship(monkeypatch):
-    catalog = {"classes": [{"id": "donation", "name": "Donation", "aliases": ["monthly gift"]},
-                           {"id": "donor", "name": "Donor"}],
-               "predicates": [{"id": "supports", "search_behavior": {"enabled": True, "effect": "expand"}}],
-               "relationships": [{"subject": "donor", "predicate": "supports", "object": "donation"}]}
-    assert server.ontology_match_concepts("how do I make a monthly gift?", catalog) == ["donation", "donor"]
-    assert server.ontology_match_concepts("directions to a bar", catalog) == []
+def test_mcp_sends_every_model_generated_query_with_the_same_approved_filters(monkeypatch):
+    calls = wire(monkeypatch, {"status": "completed", "results": [HIT]})
+    plan = {"resolution": {"status": "resolved", "ontology_version": "test",
+                            "matched_concepts": ["explore"], "domains": ["sujeeth.org"],
+                            "concept_matches": [{"concept_id": "explore", "source": "azure_model"}]},
+            "queries": ["how can I research a company?", "research roles and companies", "compare employers"],
+            "error": None}
+    monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: plan)
+    wiki_calls = []
+    monkeypatch.setattr(server, "get_json", lambda url, key="", params=None: wiki_calls.append(dict(params or {})) or {"results": []})
+    result = search("how can I research a company?")
+    sent = [body for url, body in calls if url.endswith("/api/search")]
+    assert {body["query"] for body in sent} == set(plan["queries"])
+    assert all(body["concepts"] == ["explore"] and body["domains"] == ["sujeeth.org"] for body in sent)
+    assert {item["q"] for item in wiki_calls} == set(plan["queries"])
+    assert all("concepts" in item and "domains" in item for item in wiki_calls)
+    assert result["ontology"]["matched_concepts"] == ["explore"]
 
 
-def test_illustrates_recovery_never_inverts_subject_object_direction():
+def test_model_resolution_accepts_related_ontology_concepts_and_generates_queries():
+    catalog = {"ontology_version": "test",
+               "classes": [{"id": "career_development", "name": "Career Development"},
+                           {"id": "career_story", "name": "Career Story"}],
+               "predicates": [{"id": "illustrates", "search_behavior": {"enabled": True, "effect": "expand",
+                             "matched_endpoint": "object", "retrieve_endpoint": "subject"}}],
+               "relationships": [{"subject": "career_story", "predicate": "illustrates", "object": "career_development"}],
+               "domains": [{"domain": "sujeeth.org", "search_enabled": True,
+                            "associated_concepts": ["career_development", "career_story"]}]}
+    plan = server.validate_ontology_plan({"matched_concepts": ["career_development", "not_in_ontology"],
+                                          "related_concepts": ["career_story", "not_in_ontology"],
+                                          "queries": ["research companies", "compare employers"]},
+                                         "how can I research a company?", catalog)
+    assert plan["resolution"]["matched_concepts"] == ["career_development", "career_story"]
+    assert plan["resolution"]["domains"] == ["sujeeth.org"]
+    assert plan["queries"] == ["how can I research a company?", "research companies", "compare employers"]
+
+
+def test_illustrates_matches_the_object_and_retrieves_its_subject_only():
     catalog = {"classes": [{"id": "career_story", "name": "Career Story"}, {"id": "career_development", "name": "Career Development"}],
                "predicates": [{"id": "illustrates", "search_behavior": {"enabled": True, "effect": "expand"}}],
-               "relationships": [{"subject": "career_story", "predicate": "illustrates", "object": "career_development"}]}
-    assert server.ontology_match_concepts("tell me about career development", catalog) == ["career_development", "career_story"]
-    assert server.ontology_match_concepts("career story", catalog) == ["career_story"]
+               "relationships": [{"subject": "career_story", "predicate": "illustrates", "object": "career_development"}],
+               "domains": [{"domain": "sujeeth.org", "search_enabled": True,
+                            "associated_concepts": ["career_story", "career_development"]}]}
+    object_match = server.validate_ontology_plan({"matched_concepts": ["career_development"],
+                                                  "related_concepts": ["career_story"], "queries": []}, "role", catalog)
+    subject_match = server.validate_ontology_plan({"matched_concepts": ["career_story"],
+                                                   "related_concepts": ["career_development"], "queries": []}, "story", catalog)
+    assert object_match["resolution"]["matched_concepts"] == ["career_development", "career_story"]
+    assert subject_match["resolution"]["matched_concepts"] == ["career_story"]
+
+
+def test_invalid_or_empty_model_matches_remain_a_no_match():
+    catalog = {"classes": [{"id": "donation"}], "domains": []}
+    plan = server.validate_ontology_plan({"matched_concepts": ["invented"], "related_concepts": [], "queries": []},
+                                         "directions to a bar", catalog)
+    assert plan["resolution"]["status"] == "no_match"
+    assert plan["resolution"]["matched_concepts"] == [] and plan["queries"] == []
+
+
+def test_ontology_resolution_calls_the_configured_azure_gpt6_luna_endpoint(monkeypatch):
+    requests_seen = []
+    class Response:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"output_text": '{"matched_concepts":[],"related_concepts":[],"queries":[]}'}
+    def post(url, **kwargs):
+        requests_seen.append((url, kwargs))
+        return Response()
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_ENDPOINT", "https://models.example")
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_API_KEY", "test-secret")
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_NAME", "gpt-6-luna")
+    monkeypatch.setattr(server.requests, "post", post)
+    server.call_ontology_model("research a company", {"classes": [{"id": "explore"}], "relationships": []})
+    url, request = requests_seen[0]
+    assert url == "https://models.example/openai/v1/responses"
+    assert request["headers"]["api-key"] == "test-secret"
+    assert request["json"]["model"] == "gpt-6-luna" and request["json"]["store"] is False
+    assert '"id": "explore"' in request["json"]["input"]
 
 
 def test_exact_refusal_scenario_stays_out_of_scope_without_a_recovery_retry(monkeypatch):
@@ -264,7 +347,7 @@ def test_concepts_the_ontology_links_with_illustrates_are_not_a_close_call(monke
     assert search("review my resume")["needs_clarification"] is False
 
 
-def test_unlinked_close_matches_still_ask(monkeypatch):
+def test_mcp_resolution_is_authoritative_over_search_app_resolution(monkeypatch):
     wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     out = search("something")
-    assert out["out_of_scope"] is True and out["needs_clarification"] is False
+    assert out["out_of_scope"] is False and out["needs_clarification"] is False
