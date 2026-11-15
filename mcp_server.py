@@ -748,6 +748,19 @@ ONTOLOGY_CATALOG_REFRESH_SECONDS = 300
 RECOVERY_STOPWORDS = set("a an the and or but if of to in on at by for from with into about is are was were be do does did can could should would will i me my we us our you your what which who when where why how tell show find learn understand know help please".split())
 
 
+def ontology_match_tokens(words):
+    """Normalize common English plurals when matching user wording to ontology phrases."""
+    out = set()
+    for word in words:
+        if len(word) > 4 and word.endswith("ies"):
+            out.add(word[:-3] + "y")
+        elif len(word) > 3 and word.endswith("s") and not word.endswith(("ss", "us", "is")):
+            out.add(word[:-1])
+        else:
+            out.add(word)
+    return out
+
+
 def ontology_catalog() -> dict | None:
     """Load the public ontology catalog for a bounded no-match relevance check."""
     global _ontology_catalog, _ontology_catalog_loaded_at
@@ -765,12 +778,8 @@ def ontology_catalog() -> dict | None:
     return _ontology_catalog
 
 
-def ontology_recovery_concepts(query: str, resolution: dict, catalog: dict | None = None) -> list[str]:
-    """Strongly match any declared ontology concept, then include linked concepts that can expand retrieval."""
-    if (resolution.get("matched_concepts") or []) or resolution.get("status") not in {
-        "no_match", "no_ontology_concept_match", "the ontology matched no concepts or no domains, so nothing is searched"
-    }:
-        return []
+def ontology_match_concepts(query: str, catalog: dict | None = None) -> list[str]:
+    """Match the query to declared concepts, then include linked concepts that can expand retrieval."""
     catalog = catalog if catalog is not None else ontology_catalog()
     if not catalog:
         return []
@@ -791,7 +800,7 @@ def ontology_recovery_concepts(query: str, resolution: dict, catalog: dict | Non
                 continue
             exact = " " + " ".join(re.findall(r"[a-z0-9]+", str(phrase).lower())) + " "
             query_text = " " + " ".join(re.findall(r"[a-z0-9]+", (query or "").lower())) + " "
-            if exact in query_text or len(query_words & phrase_words) >= 2:
+            if exact in query_text or len(ontology_match_tokens(query_words) & ontology_match_tokens(phrase_words)) >= 2:
                 selected.add(str(item["id"]))
                 break
     if not selected:
@@ -1533,54 +1542,57 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         timings[name] = round((now - mark) * 1000)
         mark = now
 
-    # The wiki search does not depend on the ontology, so run it alongside the steps below.
-    wiki_pool = ThreadPoolExecutor(max_workers=1)
-    wiki_future = wiki_pool.submit(run_wiki_search, query, full_documents, document_max_chars)
-
-    # One request to the Search App does the ontology resolution and the search, and its answer carries the
-    # resolution. Resolving first and sending the matched concepts back as explicit ones cost a second
-    # round trip and made concepts the ontology merely added by relationship count as concepts the question
-    # named. The Search App itself refuses to search when no concept or domain is authorized.
+    # MCP owns relevance and domain authorization. Websearch receives the approved concept and domain filters.
     try:
-        website = post_json_with_retry(
-            f"{WEBSEARCH_URL}/api/search",
-            {"query": query, "purpose": "search", "limit": CANDIDATE_POOL},
-            WEBSEARCH_KEY,
-        )
-        resolution = website.get("resolution") or {
-            "status": website.get("status"),
-            "ontology_version": website.get("ontology_version"),
-            "matched_concepts": website.get("concepts") or [],
-            "domains": website.get("domains") or [],
-            "message": website.get("message"),
-        }
-        recovery_concepts = ontology_recovery_concepts(query, resolution)
-        if recovery_concepts:
-            # A no-match is evidence of an ontology vocabulary/cache miss, not proof that this clearly career-focused
-            # question is out of scope. The retry is still constrained by ontology-approved domains.
-            website = post_json_with_retry(
-                f"{WEBSEARCH_URL}/api/search",
-                {"query": query, "concepts": recovery_concepts, "purpose": "search", "limit": CANDIDATE_POOL},
-                WEBSEARCH_KEY,
-            )
-            resolution = website.get("resolution") or {
-                "status": website.get("status"),
-                "ontology_version": website.get("ontology_version"),
-                "matched_concepts": website.get("concepts") or [],
-                "domains": website.get("domains") or [],
-                "message": website.get("message"),
-            }
+        catalog = ontology_catalog()
+        if not catalog:
+            raise RuntimeError("Ontology catalog is unavailable")
+        concepts = ontology_match_concepts(query, catalog)
+        domain_rows = [d for d in (catalog or {}).get("domains", []) if d.get("search_enabled") and
+                       set(concepts).intersection(d.get("associated_concepts") or [])]
+        domains = list(dict.fromkeys(d.get("domain") for d in domain_rows if d.get("domain")))
+        resolution = {"status": "resolved" if concepts and domains else "no_match",
+                      "ontology_version": (catalog or {}).get("ontology_version"),
+                      "matched_concepts": concepts, "domains": domains,
+                      "concept_matches": [{"concept_id": c, "source": "ontology_match"} for c in concepts]}
     except Exception as exc:
-        # The wiki answer is still worth returning, so a Search App failure no longer ends the request.
         website = {"results": []}
         resolution = {"status": "unavailable"}
-        errors.append({"service": "websearch", **error_result(exc)})
-    concepts = resolution.get("matched_concepts") or []
-    domains = resolution.get("domains") or []
+        concepts, domains = [], []
+        errors.append({"service": "ontology", **error_result(exc)})
+
+    if concepts and domains:
+        wiki_pool = ThreadPoolExecutor(max_workers=1)
+        wiki_future = wiki_pool.submit(run_wiki_search, query, full_documents, document_max_chars)
+    else:
+        wiki_pool = None
+        wiki_future = None
+
+    if concepts and domains:
+        try:
+            website = post_json_with_retry(
+                f"{WEBSEARCH_URL}/api/search",
+                {"query": query, "concepts": concepts, "domains": domains,
+                 "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
+                WEBSEARCH_KEY,
+            )
+            # MCP's authorization decision remains authoritative; Websearch only reports/filter-searches results.
+            website["resolution"] = resolution
+        except Exception as exc:
+            website = {"results": [], "resolution": resolution}
+            errors.append({"service": "websearch", **error_result(exc)})
+    else:
+        website = {"results": [], "status": "no_ontology_concept_match" if not concepts else "no_approved_domains_for_concepts",
+                   "resolution": resolution}
+    if wiki_future:
+        try:
+            wiki, wiki_error = wiki_future.result()
+        finally:
+            wiki_pool.shutdown(wait=False)
+    else:
+        wiki, wiki_error = {"results": []}, None
 
     lap("websearch_ms")
-    wiki, wiki_error = wiki_future.result()
-    wiki_pool.shutdown(wait=False)
     if not foundation_domain_allowed(resolution, domains):
         wiki, wiki_error = {"results": []}, None   # sujeeth.org is not an appropriate source for this question
     if wiki_error is not None:
