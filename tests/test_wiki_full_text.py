@@ -1,4 +1,4 @@
-"""Wiki results carry their whole page up front; website results stay excerpts."""
+"""The combined search returns excerpts; full pages stay an explicit follow-up."""
 import os
 
 import requests
@@ -49,48 +49,40 @@ def by_source(result):
     return {r["source"]: r for r in result["results"]}
 
 
-def test_wiki_result_carries_the_whole_page_and_website_stays_an_excerpt(monkeypatch):
+def test_combined_search_never_reads_full_text_automatically(monkeypatch):
     seen = wire(monkeypatch)
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", True)
-    result = server.search_sujeeth_foundation.sync("volunteer", full_documents=False)
+    result = server.search_sujeeth_foundation.sync("volunteer")
     items = by_source(result)
-    assert items["wiki"]["document"]["text"] == PAGE
-    assert items["wiki"]["document"]["truncated"] is False
+    assert "document" not in items["wiki"]
     assert "document" not in items["website"]
-    assert seen[0]["full_text"] == "true" and seen[0]["max_chars"] == server.WIKI_FULL_TEXT_CHARS
-    assert result["full_documents"]["from_search_text"] == 1
-    assert "whole page in their document field" in result["agent_instructions"]
+    assert seen[0]["full_text"] == "false"
+    assert result["full_documents"] is None
     assert "_full_text" not in items["wiki"]
 
 
-def test_a_truncated_wiki_page_says_so(monkeypatch):
+def test_combined_search_keeps_wiki_as_excerpt(monkeypatch):
     wire(monkeypatch, truncated=True)
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", True)
-    result = server.search_sujeeth_foundation.sync("volunteer", full_documents=False)
-    assert by_source(result)["wiki"]["document"]["truncated"] is True
+    result = server.search_sujeeth_foundation.sync("volunteer")
+    assert "document" not in by_source(result)["wiki"]
 
 
-def test_turning_it_off_returns_wiki_excerpts_again(monkeypatch):
+def test_wiki_search_returns_excerpts_and_leaves_page_reads_to_get_documents(monkeypatch):
     seen = wire(monkeypatch)
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", False)
-    result = server.search_sujeeth_foundation.sync("volunteer", full_documents=False)
+    result = server.search_wiki.sync("volunteer")
     assert "document" not in by_source(result)["wiki"]
     assert seen[0]["full_text"] == "false"
+
+
+def test_combined_search_does_not_attach_text_that_exceeds_the_budget(monkeypatch):
+    wire(monkeypatch)
+    result = server.search_sujeeth_foundation.sync("volunteer")
+    assert "document" not in by_source(result)["wiki"]
     assert result["full_documents"] is None
 
 
-def test_the_response_stays_inside_the_character_budget(monkeypatch):
-    wire(monkeypatch)
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", True)
-    monkeypatch.setattr(server, "DOCUMENT_CHAR_BUDGET", 100)
-    result = server.search_sujeeth_foundation.sync("volunteer", full_documents=False)
-    assert "document" not in by_source(result)["wiki"]
-    assert result["full_documents"]["skipped_for_length"] == 1
-
-
-def test_search_wiki_tool_returns_the_page_by_default(monkeypatch):
+def test_search_wiki_tool_never_returns_full_page_text(monkeypatch):
     seen = wire(monkeypatch)
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", True)
     result = server.search_wiki.sync("volunteer")
-    assert result["results"][0]["document"]["text"] == PAGE
-    assert seen[0]["full_text"] == "true"
+    assert "document" not in result["results"][0]
+    assert seen[0]["full_text"] == "false"
+

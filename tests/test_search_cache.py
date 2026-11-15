@@ -11,7 +11,7 @@ from test_single_search_call import HIT, RESOLVED, wire  # noqa: E402
 
 
 def search(query="what is career circles"):
-    return server.search_sujeeth_foundation.sync(query, full_documents=False)
+    return server.search_sujeeth_foundation.sync(query)
 
 
 def test_a_repeat_search_is_answered_from_memory(monkeypatch):
@@ -105,5 +105,5 @@ def test_cache_hit_still_emits_streaming_timings(capsys, monkeypatch):
     assert len(records) == 2
     timing = json.loads(records[-1])
     assert timing["cache_hit"] is True
-    assert timing["ontology_resolution_ms"] is None
+    assert timing["ontology_resolution_ms"] >= 0
     assert "tool_response_ready_ms" in timing

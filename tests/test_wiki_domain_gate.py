@@ -24,7 +24,7 @@ def gate(monkeypatch):
 
 
 def search():
-    return server.search_sujeeth_foundation.sync("resume tips", full_documents=False)
+    return server.search_sujeeth_foundation.sync("resume tips")
 
 
 def plan(monkeypatch, domains, concepts=("resume_resource",)):

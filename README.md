@@ -5,7 +5,7 @@ A Model Context Protocol (MCP) server that lets AI assistants search and read Su
 | Backend | Repo | What it provides |
 |---|---|---|
 | Web Search | `websearch` | MCP-filtered hybrid search and page text for approved Foundation and partner websites |
-| Wiki Search | `wikisearch` | Keyword search and page text for the GitHub wiki |
+| Wiki Search | `wikisearch` | Keyword search excerpts for the GitHub wiki; `get_documents` reads selected pages |
 | Ontology | `ontology` | Concepts, relationships, and which domains are approved |
 
 The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mcp` locally and `https://mcp.sujeeth.org/mcp` in production.
@@ -21,11 +21,14 @@ The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mc
 | `search_website` | Search ontology-approved websites only |
 | `search_wiki` | Search the GitHub wiki only |
 
-**MCP resolves before search.** `search_sujeeth_foundation` sends the question and compact full ontology vocabulary and relevant relationship graph to the configured Azure GPT-6 Luna deployment. The model identifies direct concepts, useful related concepts, and query variants. MCP accepts only concept IDs present in the ontology, allows related concepts only when an enabled ontology relationship supports retrieval, and derives searchable domains from those validated concepts. It sends every generated query to Websearch with the approved concepts and domain filters; Wiki Search receives every query plus related query terms. A failed model call is a service failure, never an out-of-scope refusal. An actual no-concept match returns the exact refusal message without searching. If Websearch fails, Wiki Search results are still returned with `status: partial`. `retrieval.website_candidates` and `retrieval.wiki_candidates` count what each source found before the best results were chosen across sources; `count` is what the response returns.
+**MCP resolves before search.** `search_sujeeth_foundation` sends the question and compact ontology vocabulary and relationship graph to the configured Azure GPT-6 Luna deployment. The model identifies direct concepts, useful related concepts, and query variants. MCP accepts only concept IDs present in the ontology, allows related concepts only when an enabled ontology relationship supports retrieval, and derives searchable domains from those validated concepts. MCP sends the primary query, its variants, and shared approved filters in one request to Websearch and one to Wiki Search. A failed model call is a service failure, never an out-of-scope refusal. An actual no-concept match returns the exact refusal message without searching. If Websearch fails, Wiki Search results are still returned with `status: partial`. `retrieval.website_candidates` and `retrieval.wiki_candidates` count what each source found before the best results were chosen across sources; `count` is what the response returns.
 
-**Related searches.** The MCP model produces up to `SEARCH_MAX_QUERIES` (default 3) query variants for the same user question. MCP searches them concurrently with the same validated concept and domain filters, then deduplicates and combines their results. Each result carries the query that found it. This makes one model resolution per user question and one downstream search per generated query, rather than asking the Chat Agent to expand the query.
 
-Wiki results carry their whole page in a `document` field (`WIKI_FULL_TEXT=true`, each page cut at `WIKI_FULL_TEXT_CHARS`, default 12000); other results are excerpts. The tool descriptions and the server `instructions` that agents read are built from one set of constants in `mcp_server.py`, so the page limit and the statistics rule read the same everywhere.
+**Related searches.** The MCP model produces up to `SEARCH_MAX_QUERIES` (default 3) query variants for the same user question. MCP sends those variants together in one request to each search service. Same-topic variants can also be supplied with `more_queries`; separate topics should use separate tool calls so each gets its own ontology validation and filters.
+
+
+All search tools return excerpts. They do not fetch page text automatically. The Chat Agent calls `get_documents` for selected result URLs when the excerpts do not answer the question. The tool descriptions and server instructions that agents read are built from one set of constants in `mcp_server.py`.
+
 
 **Admin tools** (hidden unless `MCP_ADMIN_TOOLS=true`, which is meant for local testing): `check_services`, `resolve_ontology`, `get_ontology_context`. They expose backend health and the ontology's internal structure, so they are off in production.
 

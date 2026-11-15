@@ -153,16 +153,10 @@ TRUSTED_KEY = setting("MCP_TRUSTED_KEY")                      # shared secret th
 TRUSTED_KEY_HEADER = setting("MCP_TRUSTED_KEY_HEADER", "x-mcp-client-key")
 TRUSTED_USER_AGENTS = setting("MCP_TRUSTED_USER_AGENTS")      # optional regex; a User-Agent can be faked
 
-# Token savings. Searches return short excerpts by default; the agent reads a whole page with
-# get_documents only when it needs more. Set SEARCH_FULL_DOCUMENTS=true to attach full page
-# text to search results again. SEARCH_VERBOSE_ONTOLOGY adds the per-concept match details
-# and a second copy of the domain list to each response (about 600 tokens).
-FULL_DOCUMENTS_DEFAULT = flag("SEARCH_FULL_DOCUMENTS", "false")
-# Wiki pages are short (the largest is about 13 KB), so wiki results carry their whole page up
-# front even while other results stay excerpts. That saves the agent a get_documents round trip
-# for the wiki. WIKI_FULL_TEXT=false returns wiki excerpts again. WIKI_FULL_TEXT_CHARS cuts each page.
-WIKI_FULL_TEXT = flag("WIKI_FULL_TEXT", "true")
-WIKI_FULL_TEXT_CHARS = max(500, min(int(setting("WIKI_FULL_TEXT_CHARS", "12000") or 12000), 20000))
+# Search tools return excerpts. The chat agent reads full pages separately with get_documents only
+# when it needs more. SEARCH_VERBOSE_ONTOLOGY adds per-concept match details and a second domain
+# list to each response (about 600 tokens).
+FULL_DOCUMENTS_DEFAULT = False
 VERBOSE_ONTOLOGY = flag("SEARCH_VERBOSE_ONTOLOGY", "false")
 # SEARCH_TIMINGS=true adds a timings_ms block to each combined search response. The timings are
 # always written to the log, so you can read them in Application Insights without the flag.
@@ -1166,9 +1160,8 @@ EXCERPT_INSTRUCTIONS = FEWER_READS_INSTRUCTIONS + (
 
 # Used when the wiki results carry their whole page and the other results are excerpts.
 WIKI_DOCUMENT_INSTRUCTIONS = (
-    " Wiki results carry the whole page in their document field. Answer from it, not the snippet, "
-    "and cite the url; read a wiki page with get_documents only if its document is truncated and "
-    "the part you need is missing. Every other result is an excerpt and may stop mid-sentence."
+    " Wiki results are excerpts. Answer from them when they cover the question; call get_documents "
+    "only when the excerpt does not contain what you need."
     + FEWER_READS_INSTRUCTIONS + " When you do need more, " + READ_PAGES_INSTRUCTIONS
 )
 
@@ -1196,19 +1189,17 @@ SEARCH_DESCRIPTION = (
     "Search the Sujeeth Foundation website and GitHub wiki together. Use this first for the visitor's "
     "question. MCP uses Azure GPT-6 Luna to resolve the wording against the full ontology, follow "
     "enabled concept relationships, and generate related search queries. It validates the selected "
-    "concept IDs and approved website domains before sending each query to both search services. "
+    "concept IDs and approved website domains, then sends the primary query and its related variants together "
+    "in one request to each search service. "
     "Do not classify a question as out of scope yourself; rely on this tool's out_of_scope result. "
     + "Each result has a title, url, source (website or wiki) and matched "
     "concepts; results flagged best_bet or spotlight are curated pages. "
-    + ("A wiki result carries its whole page in a document field; every other result" if WIKI_FULL_TEXT
-       else "Every result")
-    + " is an excerpt that can stop mid-sentence, and get_documents reads the full page. The response "
+    + "Every result is an excerpt that can stop mid-sentence; call get_documents separately only when needed. The response "
     "includes agent_instructions and, only when two readings of the question could conflict, a "
     "suggested_question to ask. If the response has out_of_scope true, the question is not about the Foundation: "
     "relay its message and do not answer from other sources. "
-    + (f"For truly separate parts of one request, you may pass the first in query and the others in more_queries "
-       f"(up to {MAX_QUERIES} searches total); related-query expansion is handled inside MCP. " if MAX_QUERIES > 1 else "")
-    + "Leave full_documents, max_documents and document_max_chars at their defaults."
+    + (f"You may pass same-topic wording variants in more_queries (up to {MAX_QUERIES} queries in one search request). " if MAX_QUERIES > 1 else "")
+    + "For separate topics, call this tool separately. Do not request page text here; use get_documents only when the excerpts are insufficient."
 )
 
 WEBSITE_SEARCH_DESCRIPTION = (
@@ -1222,8 +1213,7 @@ WIKI_SEARCH_DESCRIPTION = (
     "Search only the Foundation's GitHub wiki: mentor, student, donor and partner FAQs, the weekly "
     "agendas for weeks 1 to 6, and essays on the program's ideas. Prefer search_sujeeth_foundation "
     "unless you want wiki pages alone. "
-    + ("The best wiki results carry their whole page in a document field."
-       if WIKI_FULL_TEXT else "Results are excerpts; get_documents reads full pages.")
+    + "Results are excerpts; get_documents reads full pages."
 )
 
 GET_DOCUMENTS_DESCRIPTION = (
@@ -1241,9 +1231,8 @@ SERVER_INSTRUCTIONS = (
     "Knowledge about the Sujeeth Foundation: its Career Circles student mentorship program, mentoring, "
     "volunteering, donating and partnering. Start with search_sujeeth_foundation; it searches the "
     "website and the wiki together"
-    + (", and takes the separate parts of a question in one call (more_queries). " if MAX_QUERIES > 1 else ". ")
-    + ("Wiki results carry their whole page; other results are excerpts. " if WIKI_FULL_TEXT
-       else "Results are excerpts. ")
+    + (", and can send same-topic query variants together in one search request. " if MAX_QUERIES > 1 else ". ")
+    + "Results are excerpts. "
     + f"If the excerpts do not answer the question, call get_documents once with the urls you need "
     f"(at most {MAX_BATCH_DOCUMENTS}). Cite the url for every claim. " + STATS_RULE
     + " If a search comes back out_of_scope, reply with its message as written and nothing from "
@@ -1562,19 +1551,17 @@ def search_website(
                     "ontology": resolution_summary(resolution), "count": 0, "results": [],
                     "agent_instructions": CITE_AND_STATS + EXCERPT_INSTRUCTIONS}
         queries = _clean_queries(query, [q for q in plan.get("queries", []) if q.casefold() != query.casefold()])
-        with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-            payloads = list(pool.map(lambda text: post_json_with_retry(
-                f"{WEBSEARCH_URL}/api/search",
-                {"query": text, "concepts": concepts, "domains": domains,
-                 "ontology_version": resolution.get("ontology_version"), "purpose": "search",
-                 "limit": max(1, min(int(limit), 5))}, WEBSEARCH_KEY), queries))
+        payload = post_json_with_retry(
+            f"{WEBSEARCH_URL}/api/search",
+            {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
+             "ontology_version": resolution.get("ontology_version"), "purpose": "search",
+             "limit": max(1, min(int(limit), 5))}, WEBSEARCH_KEY)
         items, seen = [], set()
-        for payload in payloads:
-            for item in payload.get("results", []) or []:
-                identity = page_identity(item)
-                if identity not in seen:
-                    seen.add(identity)
-                    items.append(item)
+        for item in payload.get("results", []) or []:
+            identity = page_identity(item)
+            if identity not in seen:
+                seen.add(identity)
+                items.append(item)
         result = {"query": query, "queries": queries, "status": "completed", "resolution": resolution,
                   "concepts": concepts, "domains": domains, "count": len(items), "results": items}
         if isinstance(result, dict) and "agent_instructions" not in result:
@@ -1584,20 +1571,31 @@ def search_website(
         return error_result(exc)
 
 
-def run_wiki_search(query, full_documents, document_max_chars, concepts=None, domains=None, also=None):
+def run_wiki_search(query, full_documents, document_max_chars, concepts=None, domains=None, also=None,
+                    include_documents=True):
     """Wiki search for the combined tool. Returns (payload, error) and never raises."""
     try:
-        params = {"q": query, "limit": WIKI_POOL,
-                  "concepts": ",".join(concepts or []), "domains": ",".join(domains or []),
-                  "also": " ".join(also or [])}
-        if full_documents or WIKI_FULL_TEXT:
+        queries = _clean_queries(query, also or [])
+        if len(queries) == 1:
+            params = {"q": query, "limit": WIKI_POOL,
+                      "concepts": ",".join(concepts or []), "domains": ",".join(domains or [])}
+            if also:
+                params["also"] = " ".join(also)
+            if include_documents and full_documents:
+                params.update({"full_text": "true", "max_chars": max(500, min(int(document_max_chars), 20000))})
+            else:
+                params["full_text"] = "false"
+            return get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params), None
+        params = {"query": query, "queries": queries, "limit": WIKI_POOL,
+                  "concepts": concepts or [], "domains": domains or []}
+        if include_documents and full_documents:
             params.update({
                 "full_text": "true",
-                "max_chars": max(500, min(int(document_max_chars if full_documents else WIKI_FULL_TEXT_CHARS), 20000)),
+                "max_chars": max(500, min(int(document_max_chars), 20000)),
             })
         else:
             params["full_text"] = "false"
-        return get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params), None
+        return post_json_with_retry(f"{WIKISEARCH_URL}/api/search", params, WIKISEARCH_KEY), None
     except Exception as exc:
         return {"results": []}, exc
 
@@ -1607,21 +1605,17 @@ def run_wiki_search(query, full_documents, document_max_chars, concepts=None, do
 def search_wiki(
     query: str,
     limit: int = 5,
-    full_documents: bool = FULL_DOCUMENTS_DEFAULT,
-    document_max_chars: int = 12000,
 ) -> dict[str, Any]:
     """
     Search the Sujeeth Foundation GitHub wiki. Returns short excerpts that can stop
     mid-sentence. To read pages, call get_documents once with their urls.
     MCP resolves the question and generates related queries before the wiki is searched.
-    Set full_documents to true to attach the full page text to every result (uses many tokens).
+    Results contain excerpts. To read pages, call get_documents for selected result URLs.
     """
     query = (query or "").strip()
     if not query:
         return {"error": "Please provide a query."}
 
-    document_max_chars = max(500, min(int(document_max_chars), 20000))
-    full_documents = bool(full_documents or WIKI_FULL_TEXT)
     try:
         plan = resolve_ontology_plan(query)
         resolution = plan["resolution"]
@@ -1634,27 +1628,22 @@ def search_wiki(
             return {"query": query, "ontology": resolution_summary(resolution), "count": 0, "results": [],
                     "agent_instructions": CITE_AND_STATS + WIKI_DOCUMENT_INSTRUCTIONS}
         queries = _clean_queries(query, [q for q in plan.get("queries", []) if q.casefold() != query.casefold()])
-        sibling_queries = [q for q in queries if q.casefold() != query.casefold()]
-        def get_wiki(text):
-            params = {"q": text, "limit": max(1, min(int(limit), 10)),
-                      "concepts": ",".join(concepts), "domains": ",".join(domains),
-                      "also": " ".join(sibling_queries)}
-            if full_documents:
-                params.update({"full_text": "true", "max_chars": document_max_chars})
-            else:
-                params["full_text"] = "false"
-            return get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params)
-        with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-            payloads = list(pool.map(get_wiki, queries))
+        if len(queries) == 1:
+            params = {"q": query, "limit": max(1, min(int(limit), 10)),
+                      "concepts": ",".join(concepts), "domains": ",".join(domains), "full_text": "false"}
+            payload = get_json(f"{WIKISEARCH_URL}/api/search", WIKISEARCH_KEY, params)
+        else:
+            params = {"query": query, "queries": queries, "limit": max(1, min(int(limit), 10)),
+                      "concepts": concepts, "domains": domains, "full_text": False}
+            payload = post_json_with_retry(f"{WIKISEARCH_URL}/api/search", params, WIKISEARCH_KEY)
         items, seen = [], set()
-        for payload in payloads:
-            for item in drop_excluded_wiki(normalize_results(payload, "wiki")):
-                if item.get("source") not in {"wiki", None, ""}:
-                    continue
-                identity = page_identity(item)
-                if identity not in seen:
-                    seen.add(identity)
-                    items.append(item)
+        for item in drop_excluded_wiki(normalize_results(payload, "wiki")):
+            if item.get("source") not in {"wiki", None, ""}:
+                continue
+            identity = page_identity(item)
+            if identity not in seen:
+                seen.add(identity)
+                items.append(item)
         results = items[:max(1, min(int(limit), 10))]
         response = {
             "query": query,
@@ -1663,15 +1652,7 @@ def search_wiki(
             "count": len(results),
             "results": results,
         }
-        has_documents = False
-        if full_documents:
-            response["full_documents"] = attach_full_documents(
-                results, len(results) or 1, document_max_chars
-            )
-            has_documents = bool(response["full_documents"]["returned"])
-        response["agent_instructions"] = CITE_AND_STATS + (
-            WIKI_DOCUMENT_INSTRUCTIONS if has_documents else EXCERPT_INSTRUCTIONS
-        )
+        response["agent_instructions"] = CITE_AND_STATS + WIKI_DOCUMENT_INSTRUCTIONS
         strip_internal(results)
         return response
     except Exception as exc:
@@ -1720,7 +1701,8 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
-def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000, _plan=None, _request_started=None):
+def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000,
+               _plan=None, _request_started=None, _include_documents=True, _ontology_resolution_ms=None):
     """
     One query: Search Website Search and Wiki Search together using ontology resolution.
     Results flagged best_bet or spotlight are curated pages; present them first.
@@ -1741,16 +1723,6 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         return {"error": "Please provide a query."}
 
     limit = max(1, min(int(limit or RESULT_COUNT), 20))
-    cache_key = _search_cache_key(query, limit, full_documents, max_documents, document_max_chars)
-    cached = _search_cache_get(cache_key)
-    if cached is not None:
-        timings = {"cache_hit": True, "ontology_resolution_ms": None, "websearch_ms": None, "wikisearch_ms": None,
-                   "tool_response_ready_ms": round((time.perf_counter() - request_started) * 1000)}
-        timings["total_ms"] = timings["tool_response_ready_ms"]
-        print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
-        if TIMINGS:
-            cached["timings_ms"] = timings
-        return cached
     timings = {"cache_hit": False}
     ontology_started = time.perf_counter()
     if _plan is None:
@@ -1759,23 +1731,26 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         except Exception as exc:
             _plan = {"resolution": {"status": "unavailable", "matched_concepts": [], "domains": []},
                      "queries": [query], "error": exc}
-        timings["ontology_resolution_ms"] = round((time.perf_counter() - ontology_started) * 1000)
-        if _plan["resolution"].get("matched_concepts"):
-            queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
-            if len(queries) > 1:
-                with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-                    parts = list(pool.map(lambda text: search_one(text, limit, full_documents, max_documents,
-                                                                  document_max_chars, _plan=_plan), queries))
-                response = combine_searches(queries, parts, limit)
-                timings["tool_response_ready_ms"] = round((time.perf_counter() - request_started) * 1000)
-                timings["total_ms"] = timings["tool_response_ready_ms"]
-                print(f"search_timings_ms {json.dumps({**timings, 'scope': 'combined_tool', 'query_variants': len(queries)})}", file=sys.stderr, flush=True)
-                if TIMINGS:
-                    response["timings_ms"] = timings
-                _search_cache_put(cache_key, response)
-                return response
-    else:
-        timings["ontology_resolution_ms"] = 0
+    timings["ontology_resolution_ms"] = (
+        _ontology_resolution_ms if _ontology_resolution_ms is not None
+        else round((time.perf_counter() - ontology_started) * 1000)
+    )
+    queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
+    full_documents = bool(full_documents and _include_documents)
+    cache_key = _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries)
+    cached = _search_cache_get(cache_key)
+    if cached is not None:
+        timings = {"cache_hit": True, "ontology_resolution_ms": (
+                       _ontology_resolution_ms if _ontology_resolution_ms is not None
+                       else round((time.perf_counter() - ontology_started) * 1000)),
+                   "query_variants": len(queries), "websearch_ms": None, "wikisearch_ms": None,
+                   "tool_response_ready_ms": round((time.perf_counter() - request_started) * 1000)}
+        timings["total_ms"] = timings["tool_response_ready_ms"]
+        print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
+        if TIMINGS:
+            cached["timings_ms"] = timings
+        return cached
+    timings["query_variants"] = len(queries)
     errors = []
 
     # MCP's AI model decides relevance, then MCP validates every proposed ID against the ontology and
@@ -1794,10 +1769,11 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
 
     if concepts:
         wiki_pool = ThreadPoolExecutor(max_workers=1)
-        sibling_queries = [q for q in (_plan.get("queries") or []) if q.casefold() != query.casefold()]
+        sibling_queries = queries[1:]
         def timed_wiki_search():
             began = time.perf_counter()
-            value = run_wiki_search(query, full_documents, document_max_chars, concepts, domains, sibling_queries)
+            value = run_wiki_search(query, full_documents, document_max_chars,
+                                    concepts, domains, sibling_queries, include_documents=_include_documents)
             return value, round((time.perf_counter() - began) * 1000)
         wiki_future = wiki_pool.submit(timed_wiki_search)
     else:
@@ -1809,7 +1785,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         try:
             website = post_json_with_retry(
                 f"{WEBSEARCH_URL}/api/search",
-                {"query": query, "concepts": concepts, "domains": domains,
+                {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
                  "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
                 WEBSEARCH_KEY,
             )
@@ -1826,7 +1802,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     if wiki_future:
         wiki_wait_started = time.perf_counter()
         try:
-            (wiki, wiki_error), timings["wikisearch_ms"] = wiki_future.result()
+            (wiki, wiki_error), wiki_elapsed = wiki_future.result()
+            timings["wikisearch_ms"] = wiki_elapsed
         finally:
             wiki_pool.shutdown(wait=False)
         timings["wiki_wait_ms"] = round((time.perf_counter() - wiki_wait_started) * 1000)
@@ -1834,8 +1811,6 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         wiki, wiki_error = {"results": []}, None
         timings["wikisearch_ms"] = None
         timings["wiki_wait_ms"] = None
-
-    # Backend durations are measured separately because both searches run concurrently.
     if not foundation_domain_allowed(resolution, domains):
         wiki, wiki_error = {"results": []}, None   # sujeeth.org is not an appropriate source for this question
     if wiki_error is not None:
@@ -1861,16 +1836,13 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     timings["result_processing_ms"] = round((time.perf_counter() - processing_started) * 1000)
     document_started = time.perf_counter()
     documents_summary = None
-    if full_documents and results:
+    if _include_documents and full_documents and results:
         documents_summary = attach_full_documents(
             results,
             max(1, min(int(max_documents or limit), 20)),
             max(500, min(int(document_max_chars), DOCUMENT_MAX_CHARS)),
         )
         reading = FULL_DOCUMENT_INSTRUCTIONS if documents_summary["returned"] else EXCERPT_INSTRUCTIONS
-    elif WIKI_FULL_TEXT and results:
-        documents_summary = attach_wiki_documents(results)
-        reading = WIKI_DOCUMENT_INSTRUCTIONS if documents_summary["returned"] else EXCERPT_INSTRUCTIONS
     else:
         reading = EXCERPT_INSTRUCTIONS
     if not out_of_scope:
@@ -1878,9 +1850,9 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     timings["document_fetch_ms"] = round((time.perf_counter() - document_started) * 1000)
     strip_internal(results)
     slim_results(results)
-
     response = {
         "query": query,
+        "queries": queries,
         "status": "out_of_scope" if out_of_scope else "partial" if errors else "completed",
         "ontology": resolution_summary(resolution),
         # "count" is what this response returns. The candidates are what each source found before
@@ -1921,159 +1893,40 @@ def _clean_queries(query, more_queries):
     return queries[:MAX_QUERIES]
 
 
-def _fit_documents(results):
-    """Keep the page text attached across several searches within one response's budget. A page that would pass the
-    budget is cut and marked truncated; when almost no room is left, it goes back to being an excerpt, or is dropped
-    if it has no excerpt left to show."""
-    kept, used = [], 0
-    for item in results:
-        text = (item.get("document") or {}).get("text")
-        if text:
-            room = DOCUMENT_CHAR_BUDGET - used
-            if len(text) > room:
-                if room >= 1000:
-                    item["document"] = {**item["document"], "text": text[:room], "truncated": True}
-                elif item.get("snippet"):
-                    item.pop("document")
-                else:
-                    continue
-            used += len((item.get("document") or {}).get("text") or "")
-        kept.append(item)
-    return kept
-
-
-def combine_searches(queries, parts, limit):
-    """One response from several searches (see search_sujeeth_foundation, more_queries).
-
-    Curated pages (best bets, spotlights) from every search come first. The rest are taken in turn, one search after
-    another, so each part of the question is represented, up to `limit`. Each page appears once, under the first
-    search that found it. A search that was out of scope adds nothing and is reported in `queries`; the whole
-    response is out of scope only when every search was. The visitor is asked to clarify only when every search
-    that found something would have asked."""
-    answered = [(q, p) for q, p in zip(queries, parts) if not p.get("error") and not p.get("out_of_scope")]
-    summary = [{
-        "query": q,
-        "status": "error" if p.get("error") else p.get("status"),
-        "matched_concepts": (p.get("ontology") or {}).get("matched_concepts", []),
-        **({"needs_clarification": True, "suggested_question": p.get("suggested_question")}
-           if p.get("needs_clarification") else {}),
-    } for q, p in zip(queries, parts)]
-    if not answered:
-        first = next((p for p in parts if not p.get("error")), parts[0])
-        return {**first, "queries": summary}
-
-    curated, rest, seen = [], [], set()
-    lists = [[dict(item, for_query=q) for item in p.get("results") or []] for q, p in answered]
-    for items in lists:
-        for item in items:
-            if item.get("best_bet") or item.get("spotlight"):
-                identity = page_identity(item)
-                if identity not in seen:
-                    seen.add(identity)
-                    curated.append(item)
-    plain = [[item for item in items if not (item.get("best_bet") or item.get("spotlight"))] for items in lists]
-    for index in range(max(len(items) for items in plain)):
-        for items in plain:
-            if index < len(items) and len(rest) < limit:
-                identity = page_identity(items[index])
-                if identity not in seen:
-                    seen.add(identity)
-                    rest.append(items[index])
-    curated.sort(key=lambda item: not item.get("best_bet"))  # best bets before spotlights, order otherwise kept
-    results = _fit_documents(curated + rest)
-
-    def union(values):
-        out = []
-        for value in values:
-            if value not in out:
-                out.append(value)
-        return out
-
-    errors = union(e for _, p in answered for e in p.get("service_errors") or [])
-    errors += [{"service": "search", "query": q, "error": p["error"]} for q, p in zip(queries, parts) if p.get("error")]
-    clarify = all(p.get("needs_clarification") for _, p in answered)
-    lead = next((p for _, p in answered if bool(p.get("needs_clarification")) == clarify), answered[0][1])
-    skipped = [q for q, p in zip(queries, parts) if p.get("out_of_scope")]
-    instructions = lead.get("agent_instructions", "") + (
-        f" This response combines {len(queries)} searches, listed in queries; each result names the search that found it "
-        "in for_query. Answer every part of the question from these results in one reply."
-    )
-    if skipped:
-        instructions += (" A search marked out_of_scope is not about the Foundation: answer the other parts, and for that "
-                         "part say only that it is outside what you can help with.")
-    documents = [item["document"] for item in results if item.get("document")]
-    return {
-        "query": queries[0],
-        "queries": summary,
-        "status": "partial" if errors else "completed",
-        "ontology": {
-            "status": (lead.get("ontology") or {}).get("status"),
-            "ontology_version": (lead.get("ontology") or {}).get("ontology_version"),
-            "matched_concepts": union(c for _, p in answered for c in (p.get("ontology") or {}).get("matched_concepts") or []),
-            "domains": union(d for _, p in answered for d in (p.get("ontology") or {}).get("domains") or []),
-            "message": (lead.get("ontology") or {}).get("message"),
-        },
-        "retrieval": {
-            "website_candidates": sum((p.get("retrieval") or {}).get("website_candidates") or 0 for _, p in answered),
-            "wiki_candidates": sum((p.get("retrieval") or {}).get("wiki_candidates") or 0 for _, p in answered),
-        },
-        "count": len(results),
-        "best_bet_count": sum(1 for item in results if item.get("best_bet")),
-        "spotlight_count": sum(1 for item in results if item.get("spotlight") and not item.get("best_bet")),
-        "full_documents": ({"returned": len(documents), "truncated": sum(1 for d in documents if d.get("truncated"))}
-                           if documents else None),
-        "results": results,
-        "service_errors": errors,
-        "out_of_scope": False,
-        "needs_clarification": clarify,
-        "service_degraded": bool(errors),
-        "reasons": union(r for _, p in answered for r in p.get("reasons") or []),
-        "suggested_question": lead.get("suggested_question") if clarify else None,
-        "agent_instructions": instructions,
-    }
-
-
 @mcp.tool(description=SEARCH_DESCRIPTION, annotations=OPEN_WORLD, structured_output=(REPLY_FORMAT == "both"))
 @in_thread
 def search_sujeeth_foundation(
     query: str,
     limit: int | None = None,
-    full_documents: bool = FULL_DOCUMENTS_DEFAULT,
-    max_documents: int | None = None,
-    document_max_chars: int = 12000,
     more_queries: list[str] | None = None,
 ) -> dict[str, Any]:
-    """
-    Search Website Search and Wiki Search together using ontology resolution.
-    For a question with separate parts, put the first part in query and the others in more_queries
-    (at most MAX_QUERIES searches in all). They run at the same time and come back as one response:
-    one tool call, not one per part. Each search is resolved through the ontology by itself, exactly as
-    a single search is. See search_one for the rest.
+    """Resolve once, then send the query and same-topic variants in one request to each search service.
+
+    Page text is not fetched by this tool. The chat agent can call get_documents for selected results when
+    their excerpts are not enough. Separate topics should use separate tool calls.
     """
     request_started = time.perf_counter()
-    queries = _clean_queries(query, more_queries)
-    if not queries:
+    query = (query or "").strip()
+    if not query:
         return {"error": "Please provide a query."}
-    if len(queries) == 1:
-        return search_one(queries[0], limit, full_documents, max_documents, document_max_chars,
-                          _request_started=request_started)
-
-    def run(text):
-        try:
-            return search_one(text, limit, full_documents, max_documents, document_max_chars)
-        except Exception as exc:  # one failed search must not lose the others; the cause goes to the log, not the client
-            print(f"search_part_failed {type(exc).__name__}", file=sys.stderr, flush=True)
-            return {"error": "Search failed."}
-
-    with ThreadPoolExecutor(max_workers=len(queries)) as pool:
-        parts = list(pool.map(run, queries))
-    response = combine_searches(queries, parts, max(1, min(int(limit or RESULT_COUNT), 20)))
-    timing = {"scope": "combined_tool", "queries": len(queries),
-              "tool_response_ready_ms": round((time.perf_counter() - request_started) * 1000)}
-    timing["total_ms"] = timing["tool_response_ready_ms"]
-    print(f"search_timings_ms {json.dumps(timing)}", file=sys.stderr, flush=True)
-    if TIMINGS:
-        response["timings_ms"] = timing
+    ontology_started = time.perf_counter()
+    try:
+        plan = resolve_ontology_plan(query)
+    except Exception as exc:
+        plan = {"resolution": {"status": "unavailable", "matched_concepts": [], "domains": []},
+                "queries": [query], "error": exc}
+    ontology_resolution_ms = round((time.perf_counter() - ontology_started) * 1000)
+    extras = more_queries if isinstance(more_queries, list) else []
+    variants = _clean_queries(query, [
+        q for q in plan.get("queries", []) if isinstance(q, str) and q.casefold() != query.casefold()
+    ] + extras)
+    plan = {**plan, "queries": variants}
+    response = search_one(
+        query, limit, full_documents=False,
+        _plan=plan,
+        _request_started=request_started, _include_documents=False,
+        _ontology_resolution_ms=ontology_resolution_ms,
+    )
     return response
 
 

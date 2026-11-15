@@ -63,7 +63,7 @@ def wire(monkeypatch, website, wiki=None):
 
 
 def search(query="how do I volunteer"):
-    return server.search_sujeeth_foundation.sync(query, full_documents=False)
+    return server.search_sujeeth_foundation.sync(query)
 
 
 def test_a_search_makes_one_request_to_the_search_app(monkeypatch):
@@ -169,14 +169,60 @@ def test_mcp_sends_every_model_generated_query_with_the_same_approved_filters(mo
             "error": None}
     monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: plan)
     wiki_calls = []
-    monkeypatch.setattr(server, "get_json", lambda url, key="", params=None: wiki_calls.append(dict(params or {})) or {"results": []})
+    post_json = server.post_json_with_retry
+    def record_wiki(url, payload, key="", attempts=None):
+        if url.startswith(server.WIKISEARCH_URL):
+            wiki_calls.append((url, dict(payload)))
+            return {"results": []}
+        return post_json(url, payload, key, attempts)
+    monkeypatch.setattr(server, "post_json_with_retry", record_wiki)
+    resolutions = []
+    monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: resolutions.append(query) or plan)
     result = search("how can I research a company?")
     sent = [body for url, body in calls if url.endswith("/api/search")]
-    assert {body["query"] for body in sent} == set(plan["queries"])
-    assert all(body["concepts"] == ["explore"] and body["domains"] == ["sujeeth.org"] for body in sent)
-    assert {item["q"] for item in wiki_calls} == set(plan["queries"])
-    assert all("concepts" in item and "domains" in item for item in wiki_calls)
+    assert len(sent) == 1 and sent[0]["queries"] == plan["queries"]
+    assert sent[0]["concepts"] == ["explore"] and sent[0]["domains"] == ["sujeeth.org"]
+    assert len(wiki_calls) == 1 and wiki_calls[0][1]["queries"] == plan["queries"]
+    assert wiki_calls[0][1]["concepts"] == ["explore"] and wiki_calls[0][1]["domains"] == ["sujeeth.org"]
+    assert resolutions == ["how can I research a company?"]
     assert result["ontology"]["matched_concepts"] == ["explore"]
+
+
+def test_three_query_variants_make_one_request_per_search_service(monkeypatch, capsys):
+    calls = wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]}, wiki=[])
+    plan = {"resolution": {**RESOLVED, "matched_concepts": ["explore"]},
+            "queries": ["how can I research a company?", "research roles and companies", "compare employers"],
+            "error": None}
+    resolutions = []
+    monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: resolutions.append(query) or plan)
+    out = server.search_sujeeth_foundation.sync("how can I research a company?")
+
+    web = [body for url, body in calls if url.startswith(server.WEBSEARCH_URL) and url.endswith("/api/search")]
+    wiki = [body for url, body in calls if url.startswith(server.WIKISEARCH_URL) and url.endswith("/api/search")]
+    assert resolutions == ["how can I research a company?"]
+    assert len(web) == len(wiki) == 1
+    assert web[0]["queries"] == wiki[0]["queries"] == plan["queries"]
+    assert web[0]["concepts"] == wiki[0]["concepts"] == ["explore"]
+    assert out["queries"] == plan["queries"]
+    timing = jsonlib.loads(next(line.partition(" ")[2] for line in capsys.readouterr().err.splitlines()
+                                if line.startswith("search_timings_ms ")))
+    assert timing["query_variants"] == 3
+
+
+def test_combined_search_never_fetches_documents(monkeypatch):
+    calls = wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]}, wiki=[])
+    monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: {
+        "resolution": {**RESOLVED, "matched_concepts": ["explore"]},
+        "queries": [query, "research company roles"], "error": None,
+    })
+    fetched = []
+    monkeypatch.setattr(server, "fetch_document", lambda *args, **kwargs: fetched.append(args) or {"text": "page"})
+    out = server.search_sujeeth_foundation.sync("how can I research a company?")
+    assert not fetched
+    assert out["full_documents"] is None
+    assert all("document" not in item for item in out["results"])
+    wiki_search = next(body for url, body in calls if url.startswith(server.WIKISEARCH_URL))
+    assert wiki_search["full_text"] == "false"
 
 
 def test_model_resolution_accepts_related_ontology_concepts_and_generates_queries():

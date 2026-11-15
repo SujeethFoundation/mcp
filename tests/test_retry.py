@@ -218,7 +218,7 @@ WEBSITE_HIT = (b'{"status": "completed", "resolution": {"status": "resolved", "m
 
 def test_the_combined_search_completes_when_the_first_try_hits_a_loading_instance(monkeypatch):
     fake = routed(monkeypatch, [reply(503, {"Retry-After": "1"}), reply(body=WEBSITE_HIT)])
-    result = server.search_sujeeth_foundation.sync("career circle", full_documents=False)
+    result = server.search_sujeeth_foundation.sync("career circle")
     assert result["status"] == "completed" and not result["service_errors"]
     assert [r["url"] for r in result["results"]] == ["https://www.sujeeth.org/circle"]
     assert fake.calls == 2

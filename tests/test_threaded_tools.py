@@ -21,6 +21,8 @@ def test_tool_parameters_survive_the_wrapper():
     assert list(by_name["get_documents"].parameters["properties"]) == ["urls", "max_chars"]
     assert "get_document" not in by_name  # one tool reads pages: get_documents
     assert "query" in by_name["search_sujeeth_foundation"].parameters["properties"]
+    assert not ({"full_documents", "max_documents", "document_max_chars"}
+                & set(by_name["search_sujeeth_foundation"].parameters["properties"]))
     assert by_name["search_sujeeth_foundation"].description  # the docstring the agent reads
 
 
