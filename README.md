@@ -91,6 +91,7 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 | `MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY` | `4` | Maximum simultaneous Luna calls per MCP instance; excess resolutions wait |
 | `MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS` | `3` | Total attempts for a Luna HTTP 429, subject to the model timeout |
 | `MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS` | `5` | Maximum wait before one Luna retry; MCP honors `retry-after-ms` and adds jitter |
+| `MCP_ONTOLOGY_MODEL_CANDIDATE_LIMIT` | `16` | Maximum locally matched concepts sent to Luna before one-hop relationship expansion; unknown wording uses the full ontology |
 | `MCP_ONTOLOGY_PLAN_CACHE_SECONDS` | `300` | How long each MCP instance reuses a validated ontology plan for a normalized query and ontology version; `0` disables it |
 | `MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES` | `500` | Maximum cached ontology plans per MCP instance before older entries are evicted |
 | `MCP_HOST` | `127.0.0.1` locally; `0.0.0.0` when running on Azure | Interface to listen on. It must not be `127.0.0.1` behind a custom domain, because requests for another host name are then rejected with HTTP 421 |

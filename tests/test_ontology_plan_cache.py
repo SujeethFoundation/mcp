@@ -146,3 +146,44 @@ def test_compact_catalog_keeps_relationship_specific_behavior_overrides():
     compact = server.compact_ontology_catalog(catalog_data)
     assert compact["predicate_search_behavior"]["supports"] == {"enabled": True, "effect": "expand"}
     assert compact["relationships"][0]["search_behavior"] == {"enabled": True, "effect": "none"}
+
+
+def test_model_context_sends_local_candidates_and_one_hop_relationships_only():
+    data = {
+        "ontology_version": "test",
+        "classes": [
+            {"id": "resume", "name": "Resume", "aliases": ["cv"]},
+            {"id": "interviewing", "name": "Interviewing"},
+            {"id": "networking", "name": "Networking"},
+        ],
+        "predicates": [{"id": "supports", "search_behavior": {"enabled": True, "effect": "expand"}}],
+        "relationships": [{"subject": "resume", "predicate": "supports", "object": "networking"}],
+        "domains": [{"domain": "sujeeth.org", "search_enabled": True, "associated_concepts": ["resume"]}],
+    }
+    context, allowed = server.ontology_model_context("help with my resume", data)
+
+    assert allowed == {"resume", "networking"}
+    assert {row["id"] for row in context["classes"]} == {"resume", "networking"}
+    assert context["relationships"] == [{"subject": "resume", "predicate": "supports", "object": "networking"}]
+    assert "search_domains" not in context
+
+
+def test_unknown_wording_falls_back_to_the_full_ontology_packet():
+    data = catalog()
+    data["classes"].append({"id": "networking", "name": "Networking"})
+    context, allowed = server.ontology_model_context("unrelated wording", data)
+
+    assert allowed is None
+    assert {row["id"] for row in context["classes"]} == {"explore", "networking"}
+
+
+def test_candidate_packet_cannot_validate_an_unsupplied_concept():
+    data = catalog()
+    data["classes"].append({"id": "networking", "name": "Networking"})
+    result = server.validate_ontology_plan(
+        {"matched_concepts": ["networking"], "related_concepts": [], "queries": [],
+         "needs_clarification": False, "suggested_question": None},
+        "resume help", data, allowed_ids={"explore"},
+    )
+
+    assert result["resolution"]["status"] == "no_match"

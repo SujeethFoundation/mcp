@@ -86,6 +86,7 @@ ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS = max(100, int(setting("MCP_ONTOLOGY_MODEL_MAX_
 ONTOLOGY_MODEL_MAX_CONCURRENCY = max(1, int(setting("MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY", "4") or 4))
 ONTOLOGY_MODEL_RETRY_ATTEMPTS = max(1, int(setting("MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS", "3") or 3))
 ONTOLOGY_MODEL_RETRY_MAX_WAIT = max(0.25, float(setting("MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS", "5") or 5))
+ONTOLOGY_MODEL_CANDIDATE_LIMIT = max(1, int(setting("MCP_ONTOLOGY_MODEL_CANDIDATE_LIMIT", "16") or 16))
 _ontology_model_slots = threading.BoundedSemaphore(ONTOLOGY_MODEL_MAX_CONCURRENCY)
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
@@ -758,7 +759,7 @@ _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, valid
 _ontology_plan_cache_lock = threading.Lock()
 _ontology_plan_inflight: dict[tuple[str, Any, str], Future] = {}
 MAX_RESOLVED_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))
-ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the complete supplied ontology. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge. Relationship edges are subject-predicate-object triples; `predicate_search_behavior` gives the default retrieval rule, with any edge-level `search_behavior` overriding it.
+ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the supplied ontology candidate packet. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge. Return only concept IDs present in the supplied packet. Relationship edges are subject-predicate-object triples; `predicate_search_behavior` gives the default retrieval rule, with any edge-level `search_behavior` overriding it.
 Return direct concept IDs for the user's topic. Add related IDs only when an ontology relationship supports retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
 Preserve the user's intent. Return at most {MAX_RESOLVED_QUERIES} short search queries covering the ask. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
 
@@ -792,11 +793,54 @@ def ontology_catalog() -> dict | None:
     return _ontology_catalog
 
 
-def compact_ontology_catalog(catalog):
-    """Keep the full searchable vocabulary and relevant edges while avoiding unrelated ontology metadata."""
+def ontology_candidate_ids(query, catalog):
+    """Return locally obvious concept IDs, or an empty list when Luna needs the full catalog."""
+    text = " " + " ".join(re.findall(r"[a-z0-9]+", str(query or "").casefold())) + " "
+    scored = []
+    for item in catalog.get("classes", []):
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        score = 0
+        for field, weight in (("id", 8), ("name", 8), ("query_phrases", 7),
+                              ("aliases", 6), ("synonyms", 6), ("alternative_terms", 6),
+                              ("alternate_names", 6)):
+            values = item.get(field, []) if field != "id" and field != "name" else [item.get(field)]
+            if not isinstance(values, list):
+                values = [values]
+            for value in values:
+                phrase = " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+                if phrase and len(phrase) >= 3 and f" {phrase} " in text:
+                    score = max(score, weight + min(4, len(phrase.split())))
+        if score:
+            scored.append((score, str(item["id"])))
+    return [concept_id for _, concept_id in sorted(scored, key=lambda row: (-row[0], row[1]))[:ONTOLOGY_MODEL_CANDIDATE_LIMIT]]
+
+
+def ontology_model_context(query, catalog):
+    """Build a small candidate packet; an unknown wording safely falls back to the full catalog."""
+    candidates = ontology_candidate_ids(query, catalog)
+    if not candidates:
+        return compact_ontology_catalog(catalog), None
+    selected = set(candidates)
+    for relationship in catalog.get("relationships", []):
+        if not isinstance(relationship, dict):
+            continue
+        subject, obj = relationship.get("subject"), relationship.get("object")
+        if subject in selected and obj:
+            selected.add(str(obj))
+        if obj in selected and subject:
+            selected.add(str(subject))
+    return compact_ontology_catalog(catalog, selected), selected
+
+
+def compact_ontology_catalog(catalog, concept_ids=None):
+    """Keep searchable vocabulary and only relationships relevant to an optional concept packet."""
+    selected = set(concept_ids) if concept_ids is not None else None
     classes = []
     for item in catalog.get("classes", []):
         if not isinstance(item, dict) or not item.get("id"):
+            continue
+        if selected is not None and item["id"] not in selected:
             continue
         keep = {key: item[key] for key in ("id", "name", "category", "definition", "aliases", "synonyms",
                                             "alternative_terms", "alternate_names", "query_phrases") if key in item}
@@ -823,6 +867,8 @@ def compact_ontology_catalog(catalog):
     for rel in catalog.get("relationships", []):
         if not isinstance(rel, dict):
             continue
+        if selected is not None and (rel.get("subject") not in selected or rel.get("object") not in selected):
+            continue
         pred = str(rel.get("predicate", "")).lower()
         p = predicate_map.get(pred, {})
         behavior = rel.get("search_behavior", p.get("search_behavior", {}))
@@ -836,11 +882,8 @@ def compact_ontology_catalog(catalog):
             if relationship_rule and relationship_rule != predicate_rule:
                 edge["search_behavior"] = relationship_rule
             edges.append(edge)
-    domains = [{"domain": row.get("domain"), "associated_concepts": row.get("associated_concepts") or []}
-               for row in catalog.get("domains", []) if isinstance(row, dict) and row.get("search_enabled") and row.get("domain")]
     return {"ontology_version": catalog.get("ontology_version"), "classes": classes,
-            "relationships": edges, "predicate_search_behavior": predicate_search_behavior,
-            "search_domains": domains}
+            "relationships": edges, "predicate_search_behavior": predicate_search_behavior}
 
 
 def _responses_output_text(payload):
@@ -934,17 +977,16 @@ def _ontology_plan_cache_put(key, plan):
                 _ontology_plan_cache.pop(old, None)
 
 
-def call_ontology_model(query, catalog):
+def call_ontology_model(query, model_context):
     """Call the configured Azure GPT-6 Luna deployment with the searchable ontology catalog."""
     if not ONTOLOGY_MODEL_ENDPOINT or not ONTOLOGY_MODEL_API_KEY:
         raise RuntimeError("Azure ontology model is not configured")
-    ontology = compact_ontology_catalog(catalog)
-    cache_key_source = f"{ONTOLOGY_MODEL_NAME}:{catalog.get('ontology_version', '')}:ontology-plan-v1"
+    cache_key_source = f"{ONTOLOGY_MODEL_NAME}:{model_context.get('ontology_version', '')}:ontology-plan-v2"
     prompt_cache_key = hashlib.sha256(cache_key_source.encode("utf-8")).hexdigest()
     model_started = time.perf_counter()
     deadline = time.monotonic() + ONTOLOGY_MODEL_TIMEOUT
     request = {"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
-               "input": json.dumps({"ontology": ontology, "question": query}, ensure_ascii=False,
+               "input": json.dumps({"ontology": model_context, "question": query}, ensure_ascii=False,
                                    separators=(",", ":")),
                "prompt_cache_key": prompt_cache_key,
                "reasoning": {"effort": ONTOLOGY_REASONING_EFFORT},
@@ -977,9 +1019,11 @@ def call_ontology_model(query, catalog):
     return json.loads(_responses_output_text(payload))
 
 
-def validate_ontology_plan(result, query, catalog):
+def validate_ontology_plan(result, query, catalog, allowed_ids=None):
     """Validate model-selected concepts, relationship expansions, domains, and query variants."""
     valid_ids = {str(row["id"]) for row in catalog["classes"] if isinstance(row, dict) and row.get("id")}
+    if allowed_ids is not None:
+        valid_ids &= set(allowed_ids)
     matched = list(dict.fromkeys(x for x in result.get("matched_concepts", []) if isinstance(x, str) and x in valid_ids))
     related = list(dict.fromkeys(x for x in result.get("related_concepts", []) if isinstance(x, str) and x in valid_ids))
     # A model may identify a concept as related only when an enabled ontology edge supports retrieval.
@@ -1060,7 +1104,8 @@ def resolve_ontology_plan(query, catalog=None):
     if not leader:
         return copy.deepcopy(shared.result())
     try:
-        plan = validate_ontology_plan(call_ontology_model(query, catalog), query, catalog)
+        model_context, allowed_ids = ontology_model_context(query, catalog)
+        plan = validate_ontology_plan(call_ontology_model(query, model_context), query, catalog, allowed_ids)
         _ontology_plan_cache_put(key, plan)
         shared.set_result(plan)
         return plan
