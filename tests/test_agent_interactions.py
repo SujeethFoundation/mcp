@@ -1,4 +1,4 @@
-"""What the agent reads: consistent search instructions and explicit page reads."""
+"""What the agent reads: one set of instructions, consistent limits, whole pages, one read per page."""
 import os
 import re
 
@@ -91,8 +91,9 @@ def test_tool_descriptions_are_the_agent_facing_text():
 # -- the response ---------------------------------------------------------------------------------------------------
 
 def test_candidates_are_named_so_they_are_not_read_as_results(monkeypatch):
+    monkeypatch.setattr(server, "WIKI_FULL_TEXT", False)
     wire(monkeypatch)
-    result = server.search_sujeeth_foundation.sync("report")
+    result = server.search_sujeeth_foundation.sync("report", full_documents=False)
     assert result["count"] == len(result["results"])
     assert set(result["retrieval"]) >= {"website_candidates", "wiki_candidates"}
     assert "wiki_search" not in result and "website_search" not in result
@@ -164,4 +165,3 @@ def test_diagnostics_reach_the_agent_only_when_timings_are_on(monkeypatch):
     monkeypatch.setattr(server, "TIMINGS", True)
     doc = server.get_documents.sync(url)["documents"][0]
     assert doc["cached"] is True and "ms" in doc
-
