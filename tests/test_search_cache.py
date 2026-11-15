@@ -14,6 +14,14 @@ def search(query="what is career circles"):
     return server.search_sujeeth_foundation.sync(query)
 
 
+def test_cache_key_includes_query_variants():
+    first = server._search_cache_key("research employer", 5, False, None, 12000,
+                                     ["research employer", "compare companies"])
+    second = server._search_cache_key("research employer", 5, False, None, 12000,
+                                      ["research employer", "compare roles"])
+    assert first != second
+
+
 def test_a_repeat_search_is_answered_from_memory(monkeypatch):
     calls = wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     monkeypatch.setattr(server, "SEARCH_CACHE_SECONDS", 300)
