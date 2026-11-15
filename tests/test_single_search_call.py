@@ -241,6 +241,12 @@ def test_ontology_resolution_calls_the_configured_azure_gpt6_luna_endpoint(monke
     assert '"id": "explore"' in request["json"]["input"]
 
 
+def test_ontology_model_endpoint_accepts_resource_base_and_full_responses_url():
+    assert server.ontology_model_responses_url("https://resource.example") == "https://resource.example/openai/v1/responses"
+    assert server.ontology_model_responses_url("https://resource.example/openai/v1/") == "https://resource.example/openai/v1/responses"
+    assert server.ontology_model_responses_url("https://resource.example/openai/v1/responses") == "https://resource.example/openai/v1/responses"
+
+
 def test_exact_refusal_scenario_stays_out_of_scope_without_a_recovery_retry(monkeypatch):
     calls = wire(monkeypatch, NO_MATCH)
     out = search("directions to a bar")

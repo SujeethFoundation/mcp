@@ -78,7 +78,7 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 |---|---|---|
 | `WEBSEARCH_FUNCTION_KEY`, `WIKISEARCH_FUNCTION_KEY`, `ONTOLOGY_FUNCTION_KEY` | none | Function (host) keys for each app. A missing key makes calls to that app fail with HTTP 401 |
 | `WEBSEARCH_URL`, `WIKISEARCH_URL`, `ONTOLOGY_URL` | the deployed apps | Base URLs |
-| `MCP_ONTOLOGY_MODEL_ENDPOINT` | empty (required) | Azure OpenAI / Foundry resource endpoint for the Responses API; MCP appends `/openai/v1/responses` |
+| `MCP_ONTOLOGY_MODEL_ENDPOINT` | empty (required) | Azure OpenAI / Foundry resource endpoint. Accepts a resource base URL, `/openai/v1` base, or full `/openai/v1/responses` URL; MCP normalizes it to the Responses endpoint |
 | `MCP_ONTOLOGY_MODEL_API_KEY` | empty (required) | Secret key for the Azure model endpoint. Store it as a Function App setting or in ignored local settings; never commit it |
 | `MCP_ONTOLOGY_MODEL_NAME` | `gpt-6-luna` | Deployed Azure model name used for ontology resolution and query generation |
 | `MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS` | `25` | Maximum wait for one ontology-resolution request |

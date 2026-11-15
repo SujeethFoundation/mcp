@@ -823,15 +823,22 @@ def _responses_output_text(payload):
     raise ValueError("Azure model response contained no text output")
 
 
+def ontology_model_responses_url(endpoint):
+    """Accept a resource URL, a `/openai/v1` base, or the complete Responses endpoint URL."""
+    endpoint = str(endpoint or "").strip().rstrip("/")
+    if endpoint.endswith("/openai/v1/responses"):
+        return endpoint
+    if endpoint.endswith("/openai/v1"):
+        return endpoint + "/responses"
+    return endpoint + "/openai/v1/responses"
+
+
 def call_ontology_model(query, catalog):
     """Call the configured Azure GPT-6 Luna deployment with the searchable ontology catalog."""
     if not ONTOLOGY_MODEL_ENDPOINT or not ONTOLOGY_MODEL_API_KEY:
         raise RuntimeError("Azure ontology model is not configured")
-    url = ONTOLOGY_MODEL_ENDPOINT
-    if not url.endswith("/openai/v1"):
-        url += "/openai/v1"
     response = requests.post(
-        f"{url}/responses",
+        ontology_model_responses_url(ONTOLOGY_MODEL_ENDPOINT),
         headers={"api-key": ONTOLOGY_MODEL_API_KEY, "Content-Type": "application/json"},
         json={"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
               "input": json.dumps({"question": query, "ontology": compact_ontology_catalog(catalog)}, ensure_ascii=False),
