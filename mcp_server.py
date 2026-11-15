@@ -856,6 +856,36 @@ def ontology_model_responses_url(endpoint):
         return endpoint + "/responses"
     return endpoint + "/openai/v1/responses"
 
+
+_MODEL_RATE_LIMIT_HEADERS = (
+    "retry-after-ms", "retry-after",
+    "x-ratelimit-limit-requests", "x-ratelimit-remaining-requests",
+    "x-ratelimit-limit-tokens", "x-ratelimit-remaining-tokens",
+    "apim-request-id", "x-request-id",
+)
+
+
+def log_ontology_model_http_error(response, started_at):
+    """Write safe model-throttling diagnostics without logging credentials or prompt content."""
+    try:
+        payload = response.json()
+        message = payload.get("error", {}).get("message") if isinstance(payload, dict) else None
+    except (ValueError, TypeError):
+        message = None
+    headers = {
+        name: response.headers.get(name)
+        for name in _MODEL_RATE_LIMIT_HEADERS
+        if response.headers.get(name) is not None
+    }
+    print(f"ontology_model_http_error {json.dumps({
+        'model': ONTOLOGY_MODEL_NAME,
+        'status': response.status_code,
+        'duration_ms': round((time.perf_counter() - started_at) * 1000),
+        'message': ' '.join(str(message).split())[:1000] if message else None,
+        'headers': headers,
+    })}", file=sys.stderr, flush=True)
+
+
 def clear_ontology_plan_cache():
     """Clear cached validated ontology plans, primarily for tests and local diagnostics."""
     with _ontology_plan_cache_lock:
@@ -910,7 +940,11 @@ def call_ontology_model(query, catalog):
                                    "schema": ONTOLOGY_PLAN_SCHEMA}}},
         timeout=ONTOLOGY_MODEL_TIMEOUT,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except requests.HTTPError:
+        log_ontology_model_http_error(response, model_started)
+        raise
     payload = response.json()
     usage = payload.get("usage") if isinstance(payload, dict) else {}
     usage = usage if isinstance(usage, dict) else {}
