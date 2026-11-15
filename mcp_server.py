@@ -742,6 +742,26 @@ OUT_OF_SCOPE_INSTRUCTIONS = (
     "answer the question from general knowledge, do not search again for it, and do not ask which area they mean."
 )
 
+# The ontology normally identifies career questions itself. These narrow patterns cover a known class of ordinary
+# student questions during a vocabulary rollout or a stale Search App cache. They are intentionally specific: a
+# generic "company" or "role" question must not bypass the ontology gate.
+CAREER_EXPLORATION_RECOVERY = re.compile(
+    r"\b(?:research(?:ing)?\s+(?:job\s+)?(?:roles?|companies|employers)|"
+    r"compare\s+(?:employers|companies)|"
+    r"(?:learn|understand|know)\s+what\s+(?:a\s+)?job\s+roles?\s+(?:is|are)\s+(?:really\s+)?like)\b",
+    re.IGNORECASE,
+)
+CAREER_EXPLORATION_CONCEPTS = ("explore", "career_development")
+
+
+def career_exploration_recovery_concepts(query: str, resolution: dict) -> list[str]:
+    """Return existing concepts for a narrowly recognized career-exploration no-match."""
+    if (resolution.get("matched_concepts") or []) or resolution.get("status") not in {
+        "no_match", "no_ontology_concept_match", "the ontology matched no concepts or no domains, so nothing is searched"
+    }:
+        return []
+    return list(CAREER_EXPLORATION_CONCEPTS) if CAREER_EXPLORATION_RECOVERY.search(query or "") else []
+
 NO_RESULTS_INSTRUCTIONS = (
     " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
     "Do not answer from general knowledge and do not ask a clarifying question."
@@ -1475,6 +1495,22 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
             "domains": website.get("domains") or [],
             "message": website.get("message"),
         }
+        recovery_concepts = career_exploration_recovery_concepts(query, resolution)
+        if recovery_concepts:
+            # A no-match is evidence of an ontology vocabulary/cache miss, not proof that this clearly career-focused
+            # question is out of scope. The retry is still constrained by ontology-approved domains.
+            website = post_json_with_retry(
+                f"{WEBSEARCH_URL}/api/search",
+                {"query": query, "concepts": recovery_concepts, "purpose": "search", "limit": CANDIDATE_POOL},
+                WEBSEARCH_KEY,
+            )
+            resolution = website.get("resolution") or {
+                "status": website.get("status"),
+                "ontology_version": website.get("ontology_version"),
+                "matched_concepts": website.get("concepts") or [],
+                "domains": website.get("domains") or [],
+                "message": website.get("message"),
+            }
     except Exception as exc:
         # The wiki answer is still worth returning, so a Search App failure no longer ends the request.
         website = {"results": []}

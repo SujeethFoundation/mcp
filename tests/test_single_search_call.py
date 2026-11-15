@@ -93,6 +93,41 @@ def test_a_question_with_no_concept_is_refused_not_clarified(monkeypatch):
     assert out["message"].startswith("That's outside what I can help with.") and "interview prep" in out["message"] and "mentor" in out["message"]
 
 
+def test_career_exploration_no_match_retries_existing_concepts_not_a_refusal(monkeypatch):
+    recovered = {"status": "completed", "resolution": {
+        **RESOLVED, "matched_concepts": ["explore", "career_development"],
+        "concept_matches": [{"concept_id": "explore", "confidence": 1.0, "source": "explicit"},
+                            {"concept_id": "career_development", "confidence": 1.0, "source": "explicit"}],
+    }, "results": [HIT]}
+    calls = []
+
+    def post(url, headers=None, json=None, timeout=None):
+        calls.append(json)
+        return reply(NO_MATCH if len(calls) % 2 else recovered)
+
+    monkeypatch.setattr(server.http, "post", post)
+    monkeypatch.setattr(server, "get_json", lambda *args, **kwargs: {"results": []})
+    for question in (
+        "how can I research roles and companies?",
+        "how do I research companies?",
+        "how do I compare employers?",
+        "how do I learn what a job role is really like?",
+    ):
+        before = len(calls)
+        out = search(question)
+        assert out["out_of_scope"] is False and out["status"] == "completed"
+        assert out["ontology"]["matched_concepts"] == ["explore", "career_development"]
+        assert len(calls) == before + 2
+        assert calls[-1]["concepts"] == ["explore", "career_development"]
+
+
+def test_exact_refusal_scenario_stays_out_of_scope_without_a_recovery_retry(monkeypatch):
+    calls = wire(monkeypatch, NO_MATCH)
+    out = search("directions to a bar")
+    assert out["out_of_scope"] is True and out["message"] == REFUSAL
+    assert len(calls) == 1
+
+
 def test_a_refusal_returns_no_wiki_results_even_when_the_wiki_found_keyword_hits(monkeypatch):
     wire(monkeypatch, NO_MATCH, wiki=[WIKI_HIT])
     out = search("directions to a bar")
