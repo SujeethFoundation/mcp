@@ -68,3 +68,16 @@ def test_disabling_plan_cache_calls_model_each_time(monkeypatch):
     resolve_plan("research a company", catalog())
     resolve_plan("research a company", catalog())
     assert calls == ["research a company", "research a company"]
+
+def test_compact_catalog_removes_only_duplicate_vocabulary_terms():
+    compact = server.compact_ontology_catalog({
+        "classes": [{"id": "explore", "aliases": ["research companies", "employers"],
+                     "synonyms": ["Employers", "job roles"],
+                     "query_phrases": ["research companies", "compare employers"]}],
+        "relationships": [],
+        "domains": [],
+    })
+    concept = compact["classes"][0]
+    vocabulary = [term for field in ("aliases", "synonyms", "query_phrases")
+                  for term in concept.get(field, [])]
+    assert vocabulary == ["research companies", "employers", "job roles", "compare employers"]
