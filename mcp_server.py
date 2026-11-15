@@ -1676,9 +1676,10 @@ def clear_search_cache():
         _search_cache.clear()
 
 
-def _search_cache_key(query, limit, full_documents, max_documents, document_max_chars):
+def _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries=None):
     # Case and spacing do not change what a search finds, so they must not split the cache.
-    return (" ".join(query.lower().split()), limit, bool(full_documents), max_documents, document_max_chars)
+    variants = tuple(" ".join(q.lower().split()) for q in (queries or []))
+    return (" ".join(query.lower().split()), variants, limit, bool(full_documents), max_documents, document_max_chars)
 
 
 def _search_cache_get(key):
