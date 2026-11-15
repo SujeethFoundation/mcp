@@ -1,6 +1,8 @@
 """The resolver reuses validated plans for a short time without confusing query text."""
 import json
 import os
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 os.environ.setdefault("MCP_TRUSTED_RANGE_URLS", "none")
 
@@ -69,6 +71,31 @@ def test_disabling_plan_cache_calls_model_each_time(monkeypatch):
     resolve_plan("research a company", catalog())
     resolve_plan("research a company", catalog())
     assert calls == ["research a company", "research a company"]
+
+
+def test_simultaneous_identical_questions_share_one_model_call(monkeypatch):
+    server.clear_ontology_plan_cache()
+    monkeypatch.setattr(server, "ONTOLOGY_PLAN_CACHE_SECONDS", 0)
+    started, release = threading.Event(), threading.Event()
+    calls = []
+
+    def resolve(question, _catalog):
+        calls.append(question)
+        started.set()
+        assert release.wait(2)
+        return {"matched_concepts": ["explore"], "related_concepts": [],
+                "queries": [question], "needs_clarification": False, "suggested_question": None}
+
+    monkeypatch.setattr(server, "call_ontology_model", resolve)
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        first = pool.submit(resolve_plan, "research a company", catalog())
+        assert started.wait(1)
+        waiting = [pool.submit(resolve_plan, "research a company", catalog()) for _ in range(3)]
+        release.set()
+        results = [first.result()] + [future.result() for future in waiting]
+
+    assert calls == ["research a company"]
+    assert all(result["resolution"]["matched_concepts"] == ["explore"] for result in results)
 
 def test_compact_catalog_removes_only_duplicate_vocabulary_terms():
     compact = server.compact_ontology_catalog({

@@ -87,6 +87,10 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 | `MCP_ONTOLOGY_MODEL_NAME` | `gpt-6-luna` | Deployed Azure model name used for ontology resolution and query generation |
 | `MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS` | `25` | Maximum wait for one ontology-resolution request |
 | `MCP_ONTOLOGY_REASONING_EFFORT` | `low` | Azure Responses API reasoning effort for ontology routing (`low`, `medium`, `high`, `xhigh`, or `max`); keep the value supported by the deployed model |
+| `MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS` | `400` | Output-token ceiling for the structured ontology plan |
+| `MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY` | `4` | Maximum simultaneous Luna calls per MCP instance; excess resolutions wait |
+| `MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS` | `3` | Total attempts for a Luna HTTP 429, subject to the model timeout |
+| `MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS` | `5` | Maximum wait before one Luna retry; MCP honors `retry-after-ms` and adds jitter |
 | `MCP_ONTOLOGY_PLAN_CACHE_SECONDS` | `300` | How long each MCP instance reuses a validated ontology plan for a normalized query and ontology version; `0` disables it |
 | `MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES` | `500` | Maximum cached ontology plans per MCP instance before older entries are evicted |
 | `MCP_HOST` | `127.0.0.1` locally; `0.0.0.0` when running on Azure | Interface to listen on. It must not be `127.0.0.1` behind a custom domain, because requests for another host name are then rejected with HTTP 421 |

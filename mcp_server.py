@@ -13,7 +13,7 @@ import sys
 import threading
 import time
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -82,6 +82,11 @@ ONTOLOGY_MODEL_TIMEOUT = max(5, int(setting("MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS"
 ONTOLOGY_REASONING_EFFORT = str(setting("MCP_ONTOLOGY_REASONING_EFFORT", "low") or "low").strip().lower()
 if ONTOLOGY_REASONING_EFFORT not in {"low", "medium", "high", "xhigh", "max"}:
     ONTOLOGY_REASONING_EFFORT = "low"
+ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS = max(100, int(setting("MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS", "400") or 400))
+ONTOLOGY_MODEL_MAX_CONCURRENCY = max(1, int(setting("MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY", "4") or 4))
+ONTOLOGY_MODEL_RETRY_ATTEMPTS = max(1, int(setting("MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS", "3") or 3))
+ONTOLOGY_MODEL_RETRY_MAX_WAIT = max(0.25, float(setting("MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS", "5") or 5))
+_ontology_model_slots = threading.BoundedSemaphore(ONTOLOGY_MODEL_MAX_CONCURRENCY)
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
 
@@ -751,6 +756,7 @@ ONTOLOGY_PLAN_CACHE_SECONDS = max(0, int(setting("MCP_ONTOLOGY_PLAN_CACHE_SECOND
 ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "500") or 500))
 _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
 _ontology_plan_cache_lock = threading.Lock()
+_ontology_plan_inflight: dict[tuple[str, Any, str], Future] = {}
 MAX_RESOLVED_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))
 ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the complete supplied ontology. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge. Relationship edges are subject-predicate-object triples; `predicate_search_behavior` gives the default retrieval rule, with any edge-level `search_behavior` overriding it.
 Return direct concept IDs for the user's topic. Add related IDs only when an ontology relationship supports retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
@@ -886,6 +892,15 @@ def log_ontology_model_http_error(response, started_at):
     })}", file=sys.stderr, flush=True)
 
 
+def _ontology_model_retry_after(response):
+    """Azure's millisecond hint wins; jitter keeps simultaneous callers from retrying together."""
+    try:
+        wait = float(response.headers.get("retry-after-ms")) / 1000
+    except (TypeError, ValueError):
+        wait = _retry_after_seconds(response)
+    return min(max(0.0, wait) + _jitter(), ONTOLOGY_MODEL_RETRY_MAX_WAIT)
+
+
 def clear_ontology_plan_cache():
     """Clear cached validated ontology plans, primarily for tests and local diagnostics."""
     with _ontology_plan_cache_lock:
@@ -927,24 +942,32 @@ def call_ontology_model(query, catalog):
     cache_key_source = f"{ONTOLOGY_MODEL_NAME}:{catalog.get('ontology_version', '')}:ontology-plan-v1"
     prompt_cache_key = hashlib.sha256(cache_key_source.encode("utf-8")).hexdigest()
     model_started = time.perf_counter()
-    response = http.post(
-        ontology_model_responses_url(ONTOLOGY_MODEL_ENDPOINT),
-        headers={"api-key": ONTOLOGY_MODEL_API_KEY, "Content-Type": "application/json"},
-        json={"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
-              "input": json.dumps({"ontology": ontology, "question": query}, ensure_ascii=False,
-                                  separators=(",", ":")),
-              "prompt_cache_key": prompt_cache_key,
-              "reasoning": {"effort": ONTOLOGY_REASONING_EFFORT},
-              "max_output_tokens": 1200, "store": False,
-              "text": {"format": {"type": "json_schema", "name": "ontology_search_plan", "strict": True,
-                                   "schema": ONTOLOGY_PLAN_SCHEMA}}},
-        timeout=ONTOLOGY_MODEL_TIMEOUT,
-    )
-    try:
-        response.raise_for_status()
-    except requests.HTTPError:
-        log_ontology_model_http_error(response, model_started)
-        raise
+    deadline = time.monotonic() + ONTOLOGY_MODEL_TIMEOUT
+    request = {"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
+               "input": json.dumps({"ontology": ontology, "question": query}, ensure_ascii=False,
+                                   separators=(",", ":")),
+               "prompt_cache_key": prompt_cache_key,
+               "reasoning": {"effort": ONTOLOGY_REASONING_EFFORT},
+               "max_output_tokens": ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS, "store": False,
+               "text": {"format": {"type": "json_schema", "name": "ontology_search_plan", "strict": True,
+                                   "schema": ONTOLOGY_PLAN_SCHEMA}}}
+    for attempt in range(1, ONTOLOGY_MODEL_RETRY_ATTEMPTS + 1):
+        with _ontology_model_slots:
+            response = http.post(
+                ontology_model_responses_url(ONTOLOGY_MODEL_ENDPOINT),
+                headers={"api-key": ONTOLOGY_MODEL_API_KEY, "Content-Type": "application/json"},
+                json=request, timeout=max(1.0, deadline - time.monotonic()),
+            )
+        try:
+            response.raise_for_status()
+            break
+        except requests.HTTPError:
+            log_ontology_model_http_error(response, model_started)
+            wait = _ontology_model_retry_after(response) if response.status_code == 429 else None
+            if wait is None or attempt == ONTOLOGY_MODEL_RETRY_ATTEMPTS or time.monotonic() + wait >= deadline:
+                raise
+            print(f"ontology_model_retry attempt={attempt} status=429 wait_s={wait:.2f}", file=sys.stderr, flush=True)
+            time.sleep(wait)
     payload = response.json()
     usage = payload.get("usage") if isinstance(payload, dict) else {}
     usage = usage if isinstance(usage, dict) else {}
@@ -1028,9 +1051,25 @@ def resolve_ontology_plan(query, catalog=None):
                   if " ".join(str(item).casefold().split()) != normalized]
         cached["queries"] = _clean_queries(query, extras)
         return cached
-    plan = validate_ontology_plan(call_ontology_model(query, catalog), query, catalog)
-    _ontology_plan_cache_put(key, plan)
-    return plan
+    with _ontology_plan_cache_lock:
+        shared = _ontology_plan_inflight.get(key)
+        leader = shared is None
+        if leader:
+            shared = Future()
+            _ontology_plan_inflight[key] = shared
+    if not leader:
+        return copy.deepcopy(shared.result())
+    try:
+        plan = validate_ontology_plan(call_ontology_model(query, catalog), query, catalog)
+        _ontology_plan_cache_put(key, plan)
+        shared.set_result(plan)
+        return plan
+    except BaseException as exc:
+        shared.set_exception(exc)
+        raise
+    finally:
+        with _ontology_plan_cache_lock:
+            _ontology_plan_inflight.pop(key, None)
 
 NO_RESULTS_INSTRUCTIONS = (
     " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
