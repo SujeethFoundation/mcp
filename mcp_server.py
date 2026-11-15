@@ -880,7 +880,8 @@ def call_ontology_model(query, catalog):
     ontology = compact_ontology_catalog(catalog)
     cache_key_source = f"{ONTOLOGY_MODEL_NAME}:{catalog.get('ontology_version', '')}:ontology-plan-v1"
     prompt_cache_key = hashlib.sha256(cache_key_source.encode("utf-8")).hexdigest()
-    response = requests.post(
+    model_started = time.perf_counter()
+    response = http.post(
         ontology_model_responses_url(ONTOLOGY_MODEL_ENDPOINT),
         headers={"api-key": ONTOLOGY_MODEL_API_KEY, "Content-Type": "application/json"},
         json={"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
@@ -893,7 +894,13 @@ def call_ontology_model(query, catalog):
         timeout=ONTOLOGY_MODEL_TIMEOUT,
     )
     response.raise_for_status()
-    return json.loads(_responses_output_text(response.json()))
+    payload = response.json()
+    usage = payload.get("usage") if isinstance(payload, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+    input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    print(f"ontology_model_timing_ms {json.dumps({'duration_ms': round((time.perf_counter() - model_started) * 1000), 'input_tokens': usage.get('input_tokens', usage.get('prompt_tokens')), 'output_tokens': usage.get('output_tokens', usage.get('completion_tokens')), 'cached_input_tokens': input_details.get('cached_tokens') if isinstance(input_details, dict) else None})}",
+          file=sys.stderr, flush=True)
+    return json.loads(_responses_output_text(payload))
 
 
 def validate_ontology_plan(result, query, catalog):
