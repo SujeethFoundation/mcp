@@ -800,6 +800,19 @@ def compact_ontology_catalog(catalog):
             continue
         keep = {key: item[key] for key in ("id", "name", "category", "definition", "aliases", "synonyms",
                                             "alternative_terms", "alternate_names", "query_phrases") if key in item}
+        seen_terms = set()
+        for key in ("aliases", "synonyms", "alternative_terms", "alternate_names", "query_phrases"):
+            terms = keep.get(key)
+            if not isinstance(terms, list):
+                continue
+            unique = []
+            for term in terms:
+                normalized = " ".join(term.casefold().split()) if isinstance(term, str) else None
+                if normalized is None or normalized not in seen_terms:
+                    unique.append(term)
+                    if normalized is not None:
+                        seen_terms.add(normalized)
+            keep[key] = unique
         classes.append(keep)
     predicates = catalog.get("predicates", [])
     if isinstance(predicates, dict):
@@ -885,7 +898,7 @@ def call_ontology_model(query, catalog):
         ontology_model_responses_url(ONTOLOGY_MODEL_ENDPOINT),
         headers={"api-key": ONTOLOGY_MODEL_API_KEY, "Content-Type": "application/json"},
         json={"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
-              "input": json.dumps({"ontology": ontology, "question": query}, ensure_ascii=False),
+              "input": json.dumps({"ontology": ontology, "question": query}, ensure_ascii=False,\n                                  separators=(",", ":")),
               "prompt_cache_key": prompt_cache_key,
               "reasoning": {"effort": ONTOLOGY_REASONING_EFFORT},
               "max_output_tokens": 1200, "store": False,
