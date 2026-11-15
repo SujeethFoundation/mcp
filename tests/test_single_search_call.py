@@ -40,6 +40,7 @@ def wire(monkeypatch, website, wiki=None):
 
     monkeypatch.setattr(server.http, "post", post)
     monkeypatch.setattr(server, "get_json", get_json)
+    monkeypatch.setattr(server, "WIKI_FULL_TEXT", False)
     monkeypatch.setattr(server, "_sleep", lambda seconds: None)      # a failing Search App is retried: do not wait for it
     monkeypatch.setattr(server, "ontology_catalog", lambda: {
         "ontology_version": "test",
@@ -68,24 +69,8 @@ def search(query="how do I volunteer"):
 def test_a_search_makes_one_request_to_the_search_app(monkeypatch):
     calls = wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
     search()
-    assert len([url for url, _ in calls if url.startswith(server.WEBSEARCH_URL) and url.endswith("/api/search")]) == 1
+    assert len(calls) == 1 and calls[0][0].endswith("/api/search")
     assert not any(url.endswith("/api/domain-resolution") for url, _ in calls)
-
-
-def test_search_timing_log_covers_ontology_services_and_response_ready(capsys, monkeypatch):
-    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
-    monkeypatch.setattr(server, "TIMINGS", False)
-    out = search("how do I volunteer")
-    records = [line.partition(" ")[2] for line in capsys.readouterr().err.splitlines()
-               if line.startswith("search_timings_ms ")]
-    assert len(records) == 1
-    timing = jsonlib.loads(records[0])
-    assert timing["cache_hit"] is False
-    assert timing["ontology_resolution_ms"] >= 0
-    assert timing["websearch_ms"] >= 0 and timing["wikisearch_ms"] >= 0
-    assert timing["result_processing_ms"] >= 0
-    assert timing["tool_response_ready_ms"] >= timing["ontology_resolution_ms"]
-    assert "timings_ms" not in out  # log is unconditional; response diagnostics remain opt-in
 
 
 def test_the_request_carries_only_concepts_selected_by_mcp(monkeypatch):
@@ -154,7 +139,7 @@ def test_career_exploration_is_resolved_before_the_first_search(monkeypatch):
     calls = []
 
     def post(url, headers=None, json=None, timeout=None):
-        calls.append((url, json))
+        calls.append(json)
         return reply(recovered)
 
     monkeypatch.setattr(server.http, "post", post)
@@ -166,14 +151,13 @@ def test_career_exploration_is_resolved_before_the_first_search(monkeypatch):
         "how do I compare employers?",
         "how do I learn what a job role is really like?",
     ):
-        before = len([body for url, body in calls if url.startswith(server.WEBSEARCH_URL)])
+        before = len(calls)
         out = search(question)
         assert out["out_of_scope"] is False and out["status"] in {"completed", "partial"}
         assert out["ontology"]["matched_concepts"] == ["explore"]
-        sent = [body for url, body in calls if url.startswith(server.WEBSEARCH_URL)]
-        assert len(sent) == before + 1
-        assert sent[-1]["concepts"] == ["explore"]
-        assert sent[-1]["domains"] == ["sujeeth.org"]
+        assert len(calls) == before + 1
+        assert calls[-1]["concepts"] == ["explore"]
+        assert calls[-1]["domains"] == ["sujeeth.org"]
 
 
 def test_mcp_sends_every_model_generated_query_with_the_same_approved_filters(monkeypatch):
@@ -303,13 +287,17 @@ def test_ontology_resolution_calls_the_configured_azure_gpt6_luna_endpoint(monke
     assert request["headers"]["api-key"] == "test-secret"
     assert request["json"]["model"] == "gpt-6-luna" and request["json"]["store"] is False
     model_input = jsonlib.loads(request["json"]["input"])
-    assert list(model_input) == ["ontology", "question"]
     assert model_input["ontology"]["classes"][0]["id"] == "explore"
+    assert list(model_input) == ["ontology", "question"]
     assert len(request["json"]["prompt_cache_key"]) == 64
     assert request["json"]["reasoning"] == {"effort": "low"}
     timing = capsys.readouterr().err
     assert '"input_tokens": 80' in timing and '"output_tokens": 20' in timing
     assert '"cached_input_tokens": 40' in timing
+    model_input = jsonlib.loads(request["json"]["input"])
+    assert list(model_input) == ["ontology", "question"]
+    assert len(request["json"]["prompt_cache_key"]) == 64
+    assert request["json"]["reasoning"] == {"effort": "low"}
 
 
 def test_ontology_model_endpoint_accepts_resource_base_and_full_responses_url():
@@ -429,3 +417,18 @@ def test_mcp_resolution_is_authoritative_over_search_app_resolution(monkeypatch)
     out = search("something")
     assert out["out_of_scope"] is False and out["needs_clarification"] is False
 
+
+def test_search_timing_log_covers_ontology_services_and_response_ready(capsys, monkeypatch):
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
+    monkeypatch.setattr(server, "TIMINGS", False)
+    out = search("how do I volunteer")
+    records = [line.partition(" ")[2] for line in capsys.readouterr().err.splitlines()
+               if line.startswith("search_timings_ms ")]
+    assert len(records) == 1
+    timing = jsonlib.loads(records[0])
+    assert timing["cache_hit"] is False
+    assert timing["ontology_resolution_ms"] >= 0
+    assert timing["websearch_ms"] >= 0 and timing["wikisearch_ms"] >= 0
+    assert timing["result_processing_ms"] >= 0
+    assert timing["tool_response_ready_ms"] >= timing["ontology_resolution_ms"]
+    assert "timings_ms" not in out
