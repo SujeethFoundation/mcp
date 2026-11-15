@@ -97,7 +97,7 @@ def test_simultaneous_identical_questions_share_one_model_call(monkeypatch):
     assert calls == ["research a company"]
     assert all(result["resolution"]["matched_concepts"] == ["explore"] for result in results)
 
-def test_compact_catalog_removes_only_duplicate_vocabulary_terms():
+def test_compact_catalog_omits_vocabulary_that_the_local_matcher_already_used():
     compact = server.compact_ontology_catalog({
         "classes": [{"id": "explore", "aliases": ["research companies", "employers"],
                      "synonyms": ["Employers", "job roles"],
@@ -106,9 +106,7 @@ def test_compact_catalog_removes_only_duplicate_vocabulary_terms():
         "domains": [],
     })
     concept = compact["classes"][0]
-    vocabulary = [term for field in ("aliases", "synonyms", "query_phrases")
-                  for term in concept.get(field, [])]
-    assert vocabulary == ["research companies", "employers", "job roles", "compare employers"]
+    assert set(concept) == {"id"}
 
 
 def test_compact_catalog_sends_predicate_behavior_once_without_changing_illustrates_direction():
@@ -163,6 +161,7 @@ def test_model_context_sends_local_candidates_and_one_hop_relationships_only():
     context, allowed = server.ontology_model_context("help with my resume", data)
 
     assert allowed == {"resume", "networking"}
+    assert context["packet_type"] == "candidates"
     assert {row["id"] for row in context["classes"]} == {"resume", "networking"}
     assert context["relationships"] == [{"subject": "resume", "predicate": "supports", "object": "networking"}]
     assert "search_domains" not in context
@@ -174,7 +173,19 @@ def test_unknown_wording_falls_back_to_the_full_ontology_packet():
     context, allowed = server.ontology_model_context("unrelated wording", data)
 
     assert allowed is None
+    assert context["packet_type"] == "full_fallback"
     assert {row["id"] for row in context["classes"]} == {"explore", "networking"}
+    assert context["relationships"] == []
+
+
+def test_single_word_overlap_selects_a_longer_concept_name():
+    data = catalog()
+    data["classes"] = [{"id": "resume_resource", "name": "Resume Resource"}]
+
+    context, allowed = server.ontology_model_context("help improve my resume", data)
+
+    assert allowed == {"resume_resource"}
+    assert context["packet_type"] == "candidates"
 
 
 def test_candidate_packet_cannot_validate_an_unsupplied_concept():
