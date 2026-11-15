@@ -332,6 +332,35 @@ def test_ontology_model_429_logs_safe_rate_limit_details(monkeypatch, capsys):
     assert "do not log this question" not in logged and "test-secret" not in logged
 
 
+def test_ontology_model_retries_a_429_with_the_azure_delay(monkeypatch, capsys):
+    limited = reply({"error": {"message": "Rate limit is exceeded"}}, status=429)
+    limited.headers["retry-after-ms"] = "100"
+    limited.url = "https://models.example/openai/v1/responses"
+    success = reply({"output_text": '{"matched_concepts":[],"related_concepts":[],"queries":[],"needs_clarification":false,"suggested_question":null}'})
+    responses = [limited, success]
+    calls, waits = [], []
+
+    def post(url, **kwargs):
+        response = responses.pop(0)
+        response.request = requests.Request("POST", url).prepare()
+        calls.append(kwargs)
+        return response
+
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_ENDPOINT", "https://models.example")
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_API_KEY", "test-secret")
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_RETRY_ATTEMPTS", 2)
+    monkeypatch.setattr(server, "ONTOLOGY_MODEL_RETRY_MAX_WAIT", 1)
+    monkeypatch.setattr(server, "_jitter", lambda: 0)
+    monkeypatch.setattr(server.time, "sleep", waits.append)
+    monkeypatch.setattr(server.http, "post", post)
+
+    server.call_ontology_model("research a company", {"classes": [], "relationships": []})
+
+    assert len(calls) == 2 and waits == [0.1]
+    assert calls[0]["json"]["max_output_tokens"] == server.ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS
+    assert "ontology_model_retry attempt=1 status=429 wait_s=0.10" in capsys.readouterr().err
+
+
 def test_ontology_model_endpoint_accepts_resource_base_and_full_responses_url():
     assert server.ontology_model_responses_url("https://resource.example") == "https://resource.example/openai/v1/responses"
     assert server.ontology_model_responses_url("https://resource.example/openai/v1/") == "https://resource.example/openai/v1/responses"
