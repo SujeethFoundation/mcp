@@ -219,26 +219,39 @@ def test_invalid_or_empty_model_matches_remain_a_no_match():
     assert plan["resolution"]["matched_concepts"] == [] and plan["queries"] == []
 
 
-def test_ontology_resolution_calls_the_configured_azure_gpt6_luna_endpoint(monkeypatch):
+def test_ontology_resolution_calls_the_configured_azure_gpt6_luna_endpoint(monkeypatch, capsys):
     requests_seen = []
     class Response:
         def raise_for_status(self):
             pass
         def json(self):
-            return {"output_text": '{"matched_concepts":[],"related_concepts":[],"queries":[]}'}
+            return {"output_text": '{"matched_concepts":[],"related_concepts":[],"queries":[]}',
+                    "usage": {"input_tokens": 80, "output_tokens": 20,
+                              "input_tokens_details": {"cached_tokens": 40}}}
     def post(url, **kwargs):
         requests_seen.append((url, kwargs))
         return Response()
     monkeypatch.setattr(server, "ONTOLOGY_MODEL_ENDPOINT", "https://models.example")
     monkeypatch.setattr(server, "ONTOLOGY_MODEL_API_KEY", "test-secret")
     monkeypatch.setattr(server, "ONTOLOGY_MODEL_NAME", "gpt-6-luna")
-    monkeypatch.setattr(server.requests, "post", post)
+    monkeypatch.setattr(server.http, "post", post)
     server.call_ontology_model("research a company", {"classes": [{"id": "explore"}], "relationships": []})
     url, request = requests_seen[0]
     assert url == "https://models.example/openai/v1/responses"
     assert request["headers"]["api-key"] == "test-secret"
     assert request["json"]["model"] == "gpt-6-luna" and request["json"]["store"] is False
-    assert '"id": "explore"' in request["json"]["input"]
+    model_input = jsonlib.loads(request["json"]["input"])
+    assert model_input["ontology"]["classes"][0]["id"] == "explore"
+    assert list(model_input) == ["ontology", "question"]
+    assert len(request["json"]["prompt_cache_key"]) == 64
+    assert request["json"]["reasoning"] == {"effort": "low"}
+    timing = capsys.readouterr().err
+    assert '"input_tokens": 80' in timing and '"output_tokens": 20' in timing
+    assert '"cached_input_tokens": 40' in timing
+    model_input = jsonlib.loads(request["json"]["input"])
+    assert list(model_input) == ["ontology", "question"]
+    assert len(request["json"]["prompt_cache_key"]) == 64
+    assert request["json"]["reasoning"] == {"effort": "low"}
 
 
 def test_ontology_model_endpoint_accepts_resource_base_and_full_responses_url():

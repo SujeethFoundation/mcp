@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import functools
+import hashlib
 import json
 import os
 import random
@@ -78,6 +79,9 @@ ONTOLOGY_MODEL_ENDPOINT = setting("MCP_ONTOLOGY_MODEL_ENDPOINT").rstrip("/")
 ONTOLOGY_MODEL_API_KEY = setting("MCP_ONTOLOGY_MODEL_API_KEY")
 ONTOLOGY_MODEL_NAME = setting("MCP_ONTOLOGY_MODEL_NAME", "gpt-6-luna")
 ONTOLOGY_MODEL_TIMEOUT = max(5, int(setting("MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS", "25") or 25))
+ONTOLOGY_REASONING_EFFORT = str(setting("MCP_ONTOLOGY_REASONING_EFFORT", "low") or "low").strip().lower()
+if ONTOLOGY_REASONING_EFFORT not in {"low", "medium", "high", "xhigh", "max"}:
+    ONTOLOGY_REASONING_EFFORT = "low"
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
 
@@ -749,10 +753,14 @@ OUT_OF_SCOPE_INSTRUCTIONS = (
 _ontology_catalog: dict | None = None
 _ontology_catalog_loaded_at: float | None = None
 ONTOLOGY_CATALOG_REFRESH_SECONDS = 300
+ONTOLOGY_PLAN_CACHE_SECONDS = max(0, int(setting("MCP_ONTOLOGY_PLAN_CACHE_SECONDS", "300") or 0))
+ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "500") or 500))
+_ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
+_ontology_plan_cache_lock = threading.Lock()
 MAX_RESOLVED_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))
-ONTOLOGY_RESOLUTION_PROMPT = """You route questions for the Sujeeth Foundation. Determine whether the user's actual topic is represented by any concepts in the supplied ontology, including its definitions, aliases, query phrases, and relevant relationships. The ontology catalog is the authority; do not use general knowledge to invent Foundation topics.
-Return direct matched concept IDs for what the user asks about, related concept IDs only when the ontology connects them in a way useful for retrieval, and up to the requested number of concise search queries that cover the original ask and likely relevant Foundation guidance. Set needs_clarification only when the wording leaves two materially different in-scope interpretations unresolved, and then provide one short suggested_question. Preserve the question's intent and do not broaden to unrelated advice. An empty direct matched_concepts list means out of scope.
-Relationship direction is semantic. For `illustrates`, only a matched object may retrieve its subject as an illustration; never reverse that edge. Use other relationships only as their declared search behavior allows. Return only IDs present in the catalog. Do not treat absence of a search result as evidence that a topic is out of scope."""
+ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the complete supplied ontology. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge.
+Return direct concept IDs for the user's topic. Add related IDs only when an ontology relationship supports retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
+Preserve the user's intent. Return at most {MAX_RESOLVED_QUERIES} short search queries covering the ask. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
 
 ONTOLOGY_PLAN_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -792,6 +800,19 @@ def compact_ontology_catalog(catalog):
             continue
         keep = {key: item[key] for key in ("id", "name", "category", "definition", "aliases", "synonyms",
                                             "alternative_terms", "alternate_names", "query_phrases") if key in item}
+        seen_terms = set()
+        for key in ("aliases", "synonyms", "alternative_terms", "alternate_names", "query_phrases"):
+            terms = keep.get(key)
+            if not isinstance(terms, list):
+                continue
+            unique = []
+            for term in terms:
+                normalized = " ".join(term.casefold().split()) if isinstance(term, str) else None
+                if normalized is None or normalized not in seen_terms:
+                    unique.append(term)
+                    if normalized is not None:
+                        seen_terms.add(normalized)
+            keep[key] = unique
         classes.append(keep)
     predicates = catalog.get("predicates", [])
     if isinstance(predicates, dict):
@@ -832,23 +853,68 @@ def ontology_model_responses_url(endpoint):
         return endpoint + "/responses"
     return endpoint + "/openai/v1/responses"
 
+def clear_ontology_plan_cache():
+    """Clear cached validated ontology plans, primarily for tests and local diagnostics."""
+    with _ontology_plan_cache_lock:
+        _ontology_plan_cache.clear()
+
+
+def _ontology_plan_cache_key(query, catalog):
+    return (" ".join((query or "").casefold().split()), catalog.get("ontology_version"), ONTOLOGY_MODEL_NAME)
+
+
+def _ontology_plan_cache_get(key):
+    if ONTOLOGY_PLAN_CACHE_SECONDS <= 0:
+        return None
+    now = time.monotonic()
+    with _ontology_plan_cache_lock:
+        entry = _ontology_plan_cache.get(key)
+        if entry and entry[0] > now:
+            return copy.deepcopy(entry[1])
+        if entry:
+            _ontology_plan_cache.pop(key, None)
+    return None
+
+
+def _ontology_plan_cache_put(key, plan):
+    if ONTOLOGY_PLAN_CACHE_SECONDS <= 0:
+        return
+    with _ontology_plan_cache_lock:
+        _ontology_plan_cache[key] = (time.monotonic() + ONTOLOGY_PLAN_CACHE_SECONDS, copy.deepcopy(plan))
+        if len(_ontology_plan_cache) > ONTOLOGY_PLAN_CACHE_MAX:
+            for old in list(_ontology_plan_cache)[:max(1, ONTOLOGY_PLAN_CACHE_MAX // 10)]:
+                _ontology_plan_cache.pop(old, None)
+
 
 def call_ontology_model(query, catalog):
     """Call the configured Azure GPT-6 Luna deployment with the searchable ontology catalog."""
     if not ONTOLOGY_MODEL_ENDPOINT or not ONTOLOGY_MODEL_API_KEY:
         raise RuntimeError("Azure ontology model is not configured")
-    response = requests.post(
+    ontology = compact_ontology_catalog(catalog)
+    cache_key_source = f"{ONTOLOGY_MODEL_NAME}:{catalog.get('ontology_version', '')}:ontology-plan-v1"
+    prompt_cache_key = hashlib.sha256(cache_key_source.encode("utf-8")).hexdigest()
+    model_started = time.perf_counter()
+    response = http.post(
         ontology_model_responses_url(ONTOLOGY_MODEL_ENDPOINT),
         headers={"api-key": ONTOLOGY_MODEL_API_KEY, "Content-Type": "application/json"},
         json={"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
-              "input": json.dumps({"question": query, "ontology": compact_ontology_catalog(catalog)}, ensure_ascii=False),
+              "input": json.dumps({"ontology": ontology, "question": query}, ensure_ascii=False,
+                                  separators=(",", ":")),
+              "prompt_cache_key": prompt_cache_key,
+              "reasoning": {"effort": ONTOLOGY_REASONING_EFFORT},
               "max_output_tokens": 1200, "store": False,
               "text": {"format": {"type": "json_schema", "name": "ontology_search_plan", "strict": True,
                                    "schema": ONTOLOGY_PLAN_SCHEMA}}},
         timeout=ONTOLOGY_MODEL_TIMEOUT,
     )
     response.raise_for_status()
-    return json.loads(_responses_output_text(response.json()))
+    payload = response.json()
+    usage = payload.get("usage") if isinstance(payload, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+    input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
+    print(f"ontology_model_timing_ms {json.dumps({'duration_ms': round((time.perf_counter() - model_started) * 1000), 'input_tokens': usage.get('input_tokens', usage.get('prompt_tokens')), 'output_tokens': usage.get('output_tokens', usage.get('completion_tokens')), 'cached_input_tokens': input_details.get('cached_tokens') if isinstance(input_details, dict) else None})}",
+          file=sys.stderr, flush=True)
+    return json.loads(_responses_output_text(payload))
 
 
 def validate_ontology_plan(result, query, catalog):
@@ -917,7 +983,17 @@ def resolve_ontology_plan(query, catalog=None):
     catalog = catalog if catalog is not None else ontology_catalog()
     if not isinstance(catalog, dict) or not isinstance(catalog.get("classes"), list):
         raise RuntimeError("Ontology catalog is unavailable")
-    return validate_ontology_plan(call_ontology_model(query, catalog), query, catalog)
+    key = _ontology_plan_cache_key(query, catalog)
+    cached = _ontology_plan_cache_get(key)
+    if cached is not None:
+        normalized = key[0]
+        extras = [item for item in cached.get("queries", [])
+                  if " ".join(str(item).casefold().split()) != normalized]
+        cached["queries"] = _clean_queries(query, extras)
+        return cached
+    plan = validate_ontology_plan(call_ontology_model(query, catalog), query, catalog)
+    _ontology_plan_cache_put(key, plan)
+    return plan
 
 NO_RESULTS_INSTRUCTIONS = (
     " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
