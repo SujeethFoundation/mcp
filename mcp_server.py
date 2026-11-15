@@ -1393,6 +1393,7 @@ def resolve_ontology(
     purpose: str = "search",
 ) -> dict[str, Any]:
     """Resolve a query to ontology concepts and approved domains."""
+    request_started = _request_started if _request_started is not None else time.perf_counter()
     query = (query or "").strip()
     if not query:
         return {"error": "Please provide a query."}
@@ -1635,7 +1636,7 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
-def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000, _plan=None):
+def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000, _plan=None, _request_started=None):
     """
     One query: Search Website Search and Wiki Search together using ontology resolution.
     Results flagged best_bet or spotlight are curated pages; present them first.
@@ -1658,28 +1659,43 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     cache_key = _search_cache_key(query, limit, full_documents, max_documents, document_max_chars)
     cached = _search_cache_get(cache_key)
     if cached is not None:
-        print("search_cache_hit", file=sys.stderr, flush=True)
+        timings = {"cache_hit": True, "ontology_resolution_ms": None, "websearch_ms": None, "wikisearch_ms": None,
+                   "tool_response_ready_ms": round((time.perf_counter() - request_started) * 1000)}
+        timings["total_ms"] = timings["tool_response_ready_ms"]
+        print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
+        if TIMINGS:
+            cached["timings_ms"] = timings
         return cached
+    timings = {"cache_hit": False}
+    ontology_started = time.perf_counter()
     if _plan is None:
         try:
             _plan = resolve_ontology_plan(query)
         except Exception as exc:
             _plan = {"resolution": {"status": "unavailable", "matched_concepts": [], "domains": []},
                      "queries": [query], "error": exc}
-        if _plan["resolution"].get("matched_concepts"):
+    timings["ontology_resolution_ms"] = round((time.perf_counter() - ontology_started) * 1000)
+    if _plan["resolution"].get("matched_concepts"):
             queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
             if len(queries) > 1:
                 with ThreadPoolExecutor(max_workers=len(queries)) as pool:
                     parts = list(pool.map(lambda text: search_one(text, limit, full_documents, max_documents,
                                                                   document_max_chars, _plan=_plan), queries))
                 response = combine_searches(queries, parts, limit)
+                timings["tool_response_ready_ms"] = round((time.perf_counter() - request_started) * 1000)
+                timings["total_ms"] = timings["tool_response_ready_ms"]
+                print(f"search_timings_ms {json.dumps({**timings, 'scope': 'combined_tool', 'query_variants': len(queries)})}", file=sys.stderr, flush=True)
+                if TIMINGS:
+                    response["timings_ms"] = timings
                 _search_cache_put(cache_key, response)
                 return response
     errors = []
 
     # Timing: each lap records the milliseconds since the previous one.
-    started = mark = time.perf_counter()
-    timings = {}
+    started = request_started
+    mark = time.perf_counter()
+    timings["cache_hit"] = False
+    timings["ontology_resolution_ms"] = timings.get("ontology_resolution_ms", 0)
 
     def lap(name):
         nonlocal mark
@@ -1704,13 +1720,17 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     if concepts:
         wiki_pool = ThreadPoolExecutor(max_workers=1)
         sibling_queries = [q for q in (_plan.get("queries") or []) if q.casefold() != query.casefold()]
-        wiki_future = wiki_pool.submit(run_wiki_search, query, full_documents, document_max_chars,
-                                       concepts, domains, sibling_queries)
+        def timed_wiki_search():
+            began = time.perf_counter()
+            value = run_wiki_search(query, full_documents, document_max_chars, concepts, domains, sibling_queries)
+            return value, round((time.perf_counter() - began) * 1000)
+        wiki_future = wiki_pool.submit(timed_wiki_search)
     else:
         wiki_pool = None
         wiki_future = None
 
     if concepts and domains:
+        web_started = time.perf_counter()
         try:
             website = post_json_with_retry(
                 f"{WEBSEARCH_URL}/api/search",
@@ -1723,24 +1743,29 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         except Exception as exc:
             website = {"results": [], "resolution": resolution}
             errors.append({"service": "websearch", **error_result(exc)})
+        timings["websearch_ms"] = round((time.perf_counter() - web_started) * 1000)
     else:
+        timings["websearch_ms"] = None
         website = {"results": [], "status": "no_ontology_concept_match" if not concepts else "no_approved_domains_for_concepts",
                    "resolution": resolution}
     if wiki_future:
+        wiki_wait_started = time.perf_counter()
         try:
-            wiki, wiki_error = wiki_future.result()
+            (wiki, wiki_error), timings["wikisearch_ms"] = wiki_future.result()
         finally:
             wiki_pool.shutdown(wait=False)
+        timings["wiki_wait_ms"] = round((time.perf_counter() - wiki_wait_started) * 1000)
     else:
         wiki, wiki_error = {"results": []}, None
+        timings["wikisearch_ms"] = None
+        timings["wiki_wait_ms"] = None
 
-    lap("websearch_ms")
+    # Backend durations are measured separately because both searches run concurrently.
     if not foundation_domain_allowed(resolution, domains):
         wiki, wiki_error = {"results": []}, None   # sujeeth.org is not an appropriate source for this question
     if wiki_error is not None:
         errors.append({"service": "wikisearch", **error_result(wiki_error)})
-    lap("wiki_wait_ms")
-
+    processing_started = time.perf_counter()
     wiki_items = drop_excluded_wiki([
         item for item in normalize_results(wiki, "wiki")
         if item.get("source") in {"wiki", None, ""}
@@ -1758,6 +1783,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     if spotlight_count:
         quality["agent_instructions"] += SPOTLIGHT_INSTRUCTIONS
 
+    timings["result_processing_ms"] = round((time.perf_counter() - processing_started) * 1000)
+    document_started = time.perf_counter()
     documents_summary = None
     if full_documents and results:
         documents_summary = attach_full_documents(
@@ -1773,11 +1800,9 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         reading = EXCERPT_INSTRUCTIONS
     if not out_of_scope:
         quality["agent_instructions"] += reading
-    lap("documents_ms")
+    timings["document_fetch_ms"] = round((time.perf_counter() - document_started) * 1000)
     strip_internal(results)
     slim_results(results)
-    timings["total_ms"] = round((time.perf_counter() - started) * 1000)
-    print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
 
     response = {
         "query": query,
@@ -1798,10 +1823,14 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         "full_documents": documents_summary,
         "results": results,
         "service_errors": errors,
-        **({"timings_ms": timings} if TIMINGS else {}),
         **quality,
     }
+    timings["tool_response_ready_ms"] = round((time.perf_counter() - request_started) * 1000)
+    timings["total_ms"] = timings["tool_response_ready_ms"]
+    if TIMINGS:
+        response["timings_ms"] = timings
     _search_cache_put(cache_key, response)
+    print(f"search_timings_ms {json.dumps(timings)}", file=sys.stderr, flush=True)
     return response
 
 
@@ -1946,11 +1975,13 @@ def search_sujeeth_foundation(
     one tool call, not one per part. Each search is resolved through the ontology by itself, exactly as
     a single search is. See search_one for the rest.
     """
+    request_started = time.perf_counter()
     queries = _clean_queries(query, more_queries)
     if not queries:
         return {"error": "Please provide a query."}
     if len(queries) == 1:
-        return search_one(queries[0], limit, full_documents, max_documents, document_max_chars)
+        return search_one(queries[0], limit, full_documents, max_documents, document_max_chars,
+                          _request_started=request_started)
 
     def run(text):
         try:
@@ -1961,7 +1992,14 @@ def search_sujeeth_foundation(
 
     with ThreadPoolExecutor(max_workers=len(queries)) as pool:
         parts = list(pool.map(run, queries))
-    return combine_searches(queries, parts, max(1, min(int(limit or RESULT_COUNT), 20)))
+    response = combine_searches(queries, parts, max(1, min(int(limit or RESULT_COUNT), 20)))
+    timing = {"scope": "combined_tool", "queries": len(queries),
+              "tool_response_ready_ms": round((time.perf_counter() - request_started) * 1000)}
+    timing["total_ms"] = timing["tool_response_ready_ms"]
+    print(f"search_timings_ms {json.dumps(timing)}", file=sys.stderr, flush=True)
+    if TIMINGS:
+        response["timings_ms"] = timing
+    return response
 
 
 def looks_like_wiki(url, chunk_id, source):
