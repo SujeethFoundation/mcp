@@ -239,6 +239,10 @@ def test_ontology_resolution_calls_the_configured_azure_gpt6_luna_endpoint(monke
     assert request["headers"]["api-key"] == "test-secret"
     assert request["json"]["model"] == "gpt-6-luna" and request["json"]["store"] is False
     assert '"id": "explore"' in request["json"]["input"]
+    model_input = jsonlib.loads(request["json"]["input"])
+    assert list(model_input) == ["ontology", "question"]
+    assert len(request["json"]["prompt_cache_key"]) == 64
+    assert request["json"]["reasoning"] == {"effort": "low"}
 
 
 def test_ontology_model_endpoint_accepts_resource_base_and_full_responses_url():
