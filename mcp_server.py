@@ -86,7 +86,9 @@ ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS = max(100, int(setting("MCP_ONTOLOGY_MODEL_MAX_
 ONTOLOGY_MODEL_MAX_CONCURRENCY = max(1, int(setting("MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY", "4") or 4))
 ONTOLOGY_MODEL_RETRY_ATTEMPTS = max(1, int(setting("MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS", "3") or 3))
 ONTOLOGY_MODEL_RETRY_MAX_WAIT = max(0.25, float(setting("MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS", "5") or 5))
-ONTOLOGY_MODEL_CANDIDATE_LIMIT = max(1, int(setting("MCP_ONTOLOGY_MODEL_CANDIDATE_LIMIT", "16") or 16))
+ONTOLOGY_MODEL_CANDIDATE_LIMIT = max(1, int(setting("MCP_ONTOLOGY_MODEL_CANDIDATE_LIMIT", "8") or 8))
+ONTOLOGY_MODEL_RELATIONSHIP_LIMIT = max(0, int(setting("MCP_ONTOLOGY_MODEL_RELATIONSHIP_LIMIT", "24") or 24))
+ONTOLOGY_MODEL_DEFINITION_MAX_CHARS = max(40, int(setting("MCP_ONTOLOGY_MODEL_DEFINITION_MAX_CHARS", "240") or 240))
 _ontology_model_slots = threading.BoundedSemaphore(ONTOLOGY_MODEL_MAX_CONCURRENCY)
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
@@ -796,6 +798,7 @@ def ontology_catalog() -> dict | None:
 def ontology_candidate_ids(query, catalog):
     """Return locally obvious concept IDs, or an empty list when Luna needs the full catalog."""
     text = " " + " ".join(re.findall(r"[a-z0-9]+", str(query or "").casefold())) + " "
+    query_tokens = {token for token in text.split() if len(token) >= 4}
     scored = []
     for item in catalog.get("classes", []):
         if not isinstance(item, dict) or not item.get("id"):
@@ -811,52 +814,57 @@ def ontology_candidate_ids(query, catalog):
                 phrase = " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
                 if phrase and len(phrase) >= 3 and f" {phrase} " in text:
                     score = max(score, weight + min(4, len(phrase.split())))
+                elif phrase:
+                    overlap = query_tokens.intersection(phrase.split())
+                    if overlap:
+                        score = max(score, weight // 2 + len(overlap))
         if score:
             scored.append((score, str(item["id"])))
     return [concept_id for _, concept_id in sorted(scored, key=lambda row: (-row[0], row[1]))[:ONTOLOGY_MODEL_CANDIDATE_LIMIT]]
 
 
 def ontology_model_context(query, catalog):
-    """Build a small candidate packet; an unknown wording safely falls back to the full catalog."""
+    """Build a bounded candidate packet; unknown wording gets a terse all-concept fallback."""
     candidates = ontology_candidate_ids(query, catalog)
     if not candidates:
-        return compact_ontology_catalog(catalog), None
-    selected = set(candidates)
+        context = compact_ontology_catalog(catalog, include_relationships=False)
+        context["packet_type"] = "full_fallback"
+        return context, None
+    direct = set(candidates)
+    selected = set(direct)
+    relationships = []
     for relationship in catalog.get("relationships", []):
         if not isinstance(relationship, dict):
             continue
         subject, obj = relationship.get("subject"), relationship.get("object")
-        if subject in selected and obj:
+        if subject in direct and obj:
             selected.add(str(obj))
-        if obj in selected and subject:
+            relationships.append(relationship)
+        elif obj in direct and subject:
             selected.add(str(subject))
-    return compact_ontology_catalog(catalog, selected), selected
+            relationships.append(relationship)
+        if len(relationships) >= ONTOLOGY_MODEL_RELATIONSHIP_LIMIT:
+            break
+    context = compact_ontology_catalog(catalog, selected, detailed_ids=direct, relationships=relationships)
+    context["packet_type"] = "candidates"
+    return context, selected
 
 
-def compact_ontology_catalog(catalog, concept_ids=None):
-    """Keep searchable vocabulary and only relationships relevant to an optional concept packet."""
+def compact_ontology_catalog(catalog, concept_ids=None, detailed_ids=None, relationships=None, include_relationships=True):
+    """Build a bounded model packet. Aliases are used locally and never sent back to Luna."""
     selected = set(concept_ids) if concept_ids is not None else None
+    detailed = set(detailed_ids) if detailed_ids is not None else None
     classes = []
     for item in catalog.get("classes", []):
         if not isinstance(item, dict) or not item.get("id"):
             continue
         if selected is not None and item["id"] not in selected:
             continue
-        keep = {key: item[key] for key in ("id", "name", "category", "definition", "aliases", "synonyms",
-                                            "alternative_terms", "alternate_names", "query_phrases") if key in item}
-        seen_terms = set()
-        for key in ("aliases", "synonyms", "alternative_terms", "alternate_names", "query_phrases"):
-            terms = keep.get(key)
-            if not isinstance(terms, list):
-                continue
-            unique = []
-            for term in terms:
-                normalized = " ".join(term.casefold().split()) if isinstance(term, str) else None
-                if normalized is None or normalized not in seen_terms:
-                    unique.append(term)
-                    if normalized is not None:
-                        seen_terms.add(normalized)
-            keep[key] = unique
+        keep = {key: item[key] for key in ("id", "name") if key in item}
+        if detailed is None or item["id"] in detailed:
+            definition = " ".join(str(item.get("definition") or "").split())
+            if definition:
+                keep["definition"] = definition[:ONTOLOGY_MODEL_DEFINITION_MAX_CHARS]
         classes.append(keep)
     predicates = catalog.get("predicates", [])
     if isinstance(predicates, dict):
@@ -864,7 +872,8 @@ def compact_ontology_catalog(catalog, concept_ids=None):
     predicate_map = {str(p.get("id", "")).lower(): p for p in predicates if isinstance(p, dict)}
     edges = []
     predicate_search_behavior = {}
-    for rel in catalog.get("relationships", []):
+    relationship_rows = relationships if relationships is not None else catalog.get("relationships", [])
+    for rel in relationship_rows if include_relationships else []:
         if not isinstance(rel, dict):
             continue
         if selected is not None and (rel.get("subject") not in selected or rel.get("object") not in selected):
@@ -1014,7 +1023,7 @@ def call_ontology_model(query, model_context):
     usage = payload.get("usage") if isinstance(payload, dict) else {}
     usage = usage if isinstance(usage, dict) else {}
     input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
-    print(f"ontology_model_timing_ms {json.dumps({'duration_ms': round((time.perf_counter() - model_started) * 1000), 'input_tokens': usage.get('input_tokens', usage.get('prompt_tokens')), 'output_tokens': usage.get('output_tokens', usage.get('completion_tokens')), 'cached_input_tokens': input_details.get('cached_tokens') if isinstance(input_details, dict) else None})}",
+    print(f"ontology_model_timing_ms {json.dumps({'duration_ms': round((time.perf_counter() - model_started) * 1000), 'input_tokens': usage.get('input_tokens', usage.get('prompt_tokens')), 'output_tokens': usage.get('output_tokens', usage.get('completion_tokens')), 'cached_input_tokens': input_details.get('cached_tokens') if isinstance(input_details, dict) else None, 'context_mode': model_context.get('packet_type', 'direct'), 'context_classes': len(model_context.get('classes') or []), 'context_relationships': len(model_context.get('relationships') or []), 'context_chars': len(json.dumps(model_context, ensure_ascii=False, separators=(',', ':')))})}",
           file=sys.stderr, flush=True)
     return json.loads(_responses_output_text(payload))
 
