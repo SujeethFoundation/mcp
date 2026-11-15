@@ -1,4 +1,5 @@
 """Repeat searches are answered from memory; failed or partial ones are not kept."""
+import json
 import os
 
 import requests
@@ -92,3 +93,17 @@ def test_reply_format_decides_what_the_tool_wrapper_returns(monkeypatch):
     out = asyncio.run(tool())
     assert out.content == [] and out.structuredContent == {"answer": 1}
     assert tool.sync() == {"answer": 1}  # the warm-up reads the plain result
+
+
+def test_cache_hit_still_emits_streaming_timings(capsys, monkeypatch):
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
+    monkeypatch.setattr(server, "SEARCH_CACHE_SECONDS", 300)
+    search()
+    search()
+    records = [line.partition(" ")[2] for line in capsys.readouterr().err.splitlines()
+               if line.startswith("search_timings_ms ")]
+    assert len(records) == 2
+    timing = json.loads(records[-1])
+    assert timing["cache_hit"] is True
+    assert timing["ontology_resolution_ms"] is None
+    assert "tool_response_ready_ms" in timing
