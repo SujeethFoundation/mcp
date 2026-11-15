@@ -758,7 +758,7 @@ ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRI
 _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
 _ontology_plan_cache_lock = threading.Lock()
 MAX_RESOLVED_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))
-ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the complete supplied ontology. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge.
+ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the complete supplied ontology. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge. Relationship edges are subject-predicate-object triples; `predicate_search_behavior` gives the default retrieval rule, with any edge-level `search_behavior` overriding it.
 Return direct concept IDs for the user's topic. Add related IDs only when an ontology relationship supports retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
 Preserve the user's intent. Return at most {MAX_RESOLVED_QUERIES} short search queries covering the ask. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
 
@@ -819,6 +819,7 @@ def compact_ontology_catalog(catalog):
         predicates = [{"id": key, **(value if isinstance(value, dict) else {})} for key, value in predicates.items()]
     predicate_map = {str(p.get("id", "")).lower(): p for p in predicates if isinstance(p, dict)}
     edges = []
+    predicate_search_behavior = {}
     for rel in catalog.get("relationships", []):
         if not isinstance(rel, dict):
             continue
@@ -826,12 +827,20 @@ def compact_ontology_catalog(catalog):
         p = predicate_map.get(pred, {})
         behavior = rel.get("search_behavior", p.get("search_behavior", {}))
         if behavior or p.get("expands_search"):
-            edges.append({"subject": rel.get("subject"), "predicate": rel.get("predicate"),
-                          "object": rel.get("object"), "search_behavior": behavior or {"effect": "expand"}})
+            predicate_rule = p.get("search_behavior") or ({"effect": "expand"} if p.get("expands_search") else None)
+            if predicate_rule is not None:
+                predicate_search_behavior[pred] = predicate_rule
+            edge = {"subject": rel.get("subject"), "predicate": rel.get("predicate"),
+                    "object": rel.get("object")}
+            relationship_rule = rel.get("search_behavior")
+            if relationship_rule and relationship_rule != predicate_rule:
+                edge["search_behavior"] = relationship_rule
+            edges.append(edge)
     domains = [{"domain": row.get("domain"), "associated_concepts": row.get("associated_concepts") or []}
                for row in catalog.get("domains", []) if isinstance(row, dict) and row.get("search_enabled") and row.get("domain")]
     return {"ontology_version": catalog.get("ontology_version"), "classes": classes,
-            "relationships": edges, "search_domains": domains}
+            "relationships": edges, "predicate_search_behavior": predicate_search_behavior,
+            "search_domains": domains}
 
 
 def _responses_output_text(payload):
