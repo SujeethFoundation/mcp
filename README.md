@@ -23,9 +23,12 @@ The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mc
 
 **MCP resolves before search.** `search_sujeeth_foundation` sends the question and compact ontology vocabulary and relationship graph to the configured Azure GPT-6 Luna deployment. The model identifies direct concepts, useful related concepts, and query variants. MCP accepts only concept IDs present in the ontology, allows related concepts only when an enabled ontology relationship supports retrieval, and derives searchable domains from those validated concepts. MCP sends the primary query, its variants, and shared approved filters in one request to Websearch and one to Wiki Search. A failed model call is a service failure, never an out-of-scope refusal. An actual no-concept match returns the exact refusal message without searching. If Websearch fails, Wiki Search results are still returned with `status: partial`. `retrieval.website_candidates` and `retrieval.wiki_candidates` count what each source found before the best results were chosen across sources; `count` is what the response returns.
 
+
 **Related searches.** The MCP model produces up to `SEARCH_MAX_QUERIES` (default 3) query variants for the same user question. MCP sends those variants together in one request to each search service. Same-topic variants can also be supplied with `more_queries`; separate topics should use separate tool calls so each gets its own ontology validation and filters.
 
+
 All search tools return excerpts. They do not fetch page text automatically. The Chat Agent calls `get_documents` for selected result URLs when the excerpts do not answer the question. The tool descriptions and server instructions that agents read are built from one set of constants in `mcp_server.py`.
+
 
 **Admin tools** (hidden unless `MCP_ADMIN_TOOLS=true`, which is meant for local testing): `check_services`, `resolve_ontology`, `get_ontology_context`. They expose backend health and the ontology's internal structure, so they are off in production.
 
@@ -206,4 +209,3 @@ Local tests that use admin tools need `MCP_ADMIN_TOOLS=true`. Search results dep
 | Deployed app returns 502 or never becomes healthy | `MCP_PORT` does not match `port` in `host.json`, or the Python version in the workflow does not match the app's runtime |
 | HTTP 429 | A rate limit was reached. Wait for the `Retry-After` interval or raise the limit |
 | `Unknown tool: check_services` | Admin tools are off. Set `MCP_ADMIN_TOOLS=true` for local testing only |
-
