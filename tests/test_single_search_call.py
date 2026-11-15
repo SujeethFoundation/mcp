@@ -107,6 +107,13 @@ def test_career_exploration_no_match_retries_existing_concepts_not_a_refusal(mon
 
     monkeypatch.setattr(server.http, "post", post)
     monkeypatch.setattr(server, "get_json", lambda *args, **kwargs: {"results": []})
+    catalog = {"classes": [
+        {"id": "explore", "name": "Explore", "query_phrases": ["research roles and companies", "research companies", "compare employers", "learn what a job role is really like"]},
+        {"id": "career_development", "name": "Career Development", "aliases": ["career planning"]},
+        {"id": "week_2", "name": "Week 2"},
+    ], "predicates": [{"id": "illustrates", "search_behavior": {"enabled": True, "matched_endpoint": "object", "effect": "expand"}}],
+        "relationships": [{"id": "explore_week_2", "subject": "explore", "predicate": "illustrates", "object": "week_2"}]}
+    monkeypatch.setattr(server, "ontology_catalog", lambda: catalog)
     for question in (
         "how can I research roles and companies?",
         "how do I research companies?",
@@ -118,7 +125,26 @@ def test_career_exploration_no_match_retries_existing_concepts_not_a_refusal(mon
         assert out["out_of_scope"] is False and out["status"] == "completed"
         assert out["ontology"]["matched_concepts"] == ["explore", "career_development"]
         assert len(calls) == before + 2
-        assert calls[-1]["concepts"] == ["explore", "career_development"]
+        assert calls[-1]["concepts"] == ["explore"]
+
+
+def test_ontology_recovery_detects_any_strong_concept_match_and_relationship(monkeypatch):
+    catalog = {"classes": [{"id": "donation", "name": "Donation", "aliases": ["monthly gift"]},
+                           {"id": "donor", "name": "Donor"}],
+               "predicates": [{"id": "supports", "search_behavior": {"enabled": True, "effect": "expand"}}],
+               "relationships": [{"subject": "donor", "predicate": "supports", "object": "donation"}]}
+    no_match = {"status": "no_match", "matched_concepts": []}
+    assert server.ontology_recovery_concepts("how do I make a monthly gift?", no_match, catalog) == ["donation", "donor"]
+    assert server.ontology_recovery_concepts("directions to a bar", no_match, catalog) == []
+
+
+def test_illustrates_recovery_never_inverts_subject_object_direction():
+    catalog = {"classes": [{"id": "career_story", "name": "Career Story"}, {"id": "career_development", "name": "Career Development"}],
+               "predicates": [{"id": "illustrates", "search_behavior": {"enabled": True, "effect": "expand"}}],
+               "relationships": [{"subject": "career_story", "predicate": "illustrates", "object": "career_development"}]}
+    no_match = {"status": "no_match", "matched_concepts": []}
+    assert server.ontology_recovery_concepts("tell me about career development", no_match, catalog) == ["career_development", "career_story"]
+    assert server.ontology_recovery_concepts("career story", no_match, catalog) == ["career_story"]
 
 
 def test_exact_refusal_scenario_stays_out_of_scope_without_a_recovery_retry(monkeypatch):

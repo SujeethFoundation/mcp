@@ -742,25 +742,84 @@ OUT_OF_SCOPE_INSTRUCTIONS = (
     "answer the question from general knowledge, do not search again for it, and do not ask which area they mean."
 )
 
-# The ontology normally identifies career questions itself. These narrow patterns cover a known class of ordinary
-# student questions during a vocabulary rollout or a stale Search App cache. They are intentionally specific: a
-# generic "company" or "role" question must not bypass the ontology gate.
-CAREER_EXPLORATION_RECOVERY = re.compile(
-    r"\b(?:research(?:ing)?\s+(?:job\s+)?(?:roles?|companies|employers)|"
-    r"compare\s+(?:employers|companies)|"
-    r"(?:learn|understand|know)\s+what\s+(?:a\s+)?job\s+roles?\s+(?:is|are)\s+(?:really\s+)?like)\b",
-    re.IGNORECASE,
-)
-CAREER_EXPLORATION_CONCEPTS = ("explore", "career_development")
+_ontology_catalog: dict | None = None
+_ontology_catalog_loaded_at: float | None = None
+ONTOLOGY_CATALOG_REFRESH_SECONDS = 300
+RECOVERY_STOPWORDS = set("a an the and or but if of to in on at by for from with into about is are was were be do does did can could should would will i me my we us our you your what which who when where why how tell show find learn understand know help please".split())
 
 
-def career_exploration_recovery_concepts(query: str, resolution: dict) -> list[str]:
-    """Return existing concepts for a narrowly recognized career-exploration no-match."""
+def ontology_catalog() -> dict | None:
+    """Load the public ontology catalog for a bounded no-match relevance check."""
+    global _ontology_catalog, _ontology_catalog_loaded_at
+    now = time.monotonic()
+    if _ontology_catalog is not None and _ontology_catalog_loaded_at is not None and now - _ontology_catalog_loaded_at < ONTOLOGY_CATALOG_REFRESH_SECONDS:
+        return _ontology_catalog
+    try:
+        response = requests.get(ONTOLOGY_URL, timeout=min(5, TIMEOUT))
+        response.raise_for_status()
+        data = response.json()
+        if isinstance(data, dict) and isinstance(data.get("classes"), list):
+            _ontology_catalog, _ontology_catalog_loaded_at = data, now
+    except Exception:
+        pass  # A failed catalog read cannot turn an unknown question into an in-scope one.
+    return _ontology_catalog
+
+
+def ontology_recovery_concepts(query: str, resolution: dict, catalog: dict | None = None) -> list[str]:
+    """Strongly match any declared ontology concept, then include linked concepts that can expand retrieval."""
     if (resolution.get("matched_concepts") or []) or resolution.get("status") not in {
         "no_match", "no_ontology_concept_match", "the ontology matched no concepts or no domains, so nothing is searched"
     }:
         return []
-    return list(CAREER_EXPLORATION_CONCEPTS) if CAREER_EXPLORATION_RECOVERY.search(query or "") else []
+    catalog = catalog if catalog is not None else ontology_catalog()
+    if not catalog:
+        return []
+    query_words = set(re.findall(r"[a-z0-9]+", (query or "").lower())) - RECOVERY_STOPWORDS
+    if not query_words:
+        return []
+    selected = set()
+    for item in catalog.get("classes", []):
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        phrases = [item.get("id", "").replace("_", " "), item.get("name", ""), item.get("definition", "")]
+        for key in ("aliases", "synonyms", "alternative_terms", "alternate_names", "query_phrases"):
+            val = item.get(key, [])
+            phrases.extend([val] if isinstance(val, str) else val if isinstance(val, list) else [])
+        for phrase in phrases:
+            phrase_words = set(re.findall(r"[a-z0-9]+", str(phrase).lower())) - RECOVERY_STOPWORDS
+            if not phrase_words:
+                continue
+            exact = " " + " ".join(re.findall(r"[a-z0-9]+", str(phrase).lower())) + " "
+            query_text = " " + " ".join(re.findall(r"[a-z0-9]+", (query or "").lower())) + " "
+            if exact in query_text or len(query_words & phrase_words) >= 2:
+                selected.add(str(item["id"]))
+                break
+    if not selected:
+        return []
+    predicates = catalog.get("predicates", [])
+    if isinstance(predicates, dict):
+        predicates = [{"id": k, **(v if isinstance(v, dict) else {})} for k, v in predicates.items()]
+    behaviors = {str(p.get("id", "")).lower(): p.get("search_behavior", {}) for p in predicates if isinstance(p, dict)}
+    for rel in catalog.get("relationships", []):
+        if not isinstance(rel, dict):
+            continue
+        predicate = str(rel.get("predicate", "")).lower()
+        spec = rel.get("search_behavior", behaviors.get(predicate, {}))
+        if not isinstance(spec, dict) or spec.get("enabled") is False:
+            continue
+        effect = str(spec.get("effect") or ("expand" if predicate == "illustrates" else "")).lower()
+        if effect not in LINKING_EFFECTS:
+            continue
+        subject, obj = rel.get("subject"), rel.get("object")
+        if predicate == "illustrates":
+            if obj in selected and subject:
+                selected.add(str(subject))
+        elif subject in selected and obj:
+            selected.add(str(obj))
+        elif obj in selected and subject:
+            selected.add(str(subject))
+    valid_ids = {str(c["id"]) for c in catalog["classes"] if isinstance(c, dict) and c.get("id")}
+    return sorted(selected & valid_ids)
 
 NO_RESULTS_INSTRUCTIONS = (
     " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
@@ -1495,7 +1554,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
             "domains": website.get("domains") or [],
             "message": website.get("message"),
         }
-        recovery_concepts = career_exploration_recovery_concepts(query, resolution)
+        recovery_concepts = ontology_recovery_concepts(query, resolution)
         if recovery_concepts:
             # A no-match is evidence of an ontology vocabulary/cache miss, not proof that this clearly career-focused
             # question is out of scope. The retry is still constrained by ontology-approved domains.
