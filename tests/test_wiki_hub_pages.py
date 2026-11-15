@@ -88,4 +88,3 @@ def test_an_overview_page_listed_twice_appears_once(monkeypatch):
     wire(monkeypatch, items)
     result = server.search_sujeeth_foundation.sync("weekly agendas")
     assert titles(result, "wiki").count("Week 1") == 1
-
