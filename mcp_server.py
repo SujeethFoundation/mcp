@@ -674,27 +674,58 @@ def resolution_summary(data):
     return summary
 
 
-# Concepts the ontology links with "illustrates" (for example Resume Resource and Week 3) are one answer, not two
-# competing readings. The pairs come from the public ontology file, loaded once. If it cannot be loaded the set
-# stays empty and the close-match question is asked as before.
+# Concepts the ontology links so that one is part of the other's answer (for example Resume Resource illustrates
+# Week 3, or networking supports referral) are one answer, not two competing readings. Each predicate in the public
+# ontology file says what it does to a search: "expand" and "boost" predicates link concepts that answer together;
+# "suppress" predicates (is_distinct_from, precedes) keep concepts apart, so a tie between them is still asked about.
+# The pairs are loaded from the ontology file and refreshed every LINKED_PAIRS_REFRESH_HOURS (default 24), so a running
+# instance follows an ontology change without a restart. If the file cannot be loaded the set stays as it was (empty on
+# the first try) and the close-match question is asked as before.
 ONTOLOGY_URL = setting(
     "MCP_ONTOLOGY_URL", "https://raw.githubusercontent.com/SujeethFoundation/ontology/main/ontology/ontology.json"
 )
+LINKED_PAIRS_REFRESH_SECONDS = max(60.0, float(setting("LINKED_PAIRS_REFRESH_HOURS", "24") or 24) * 3600)
+LINKING_EFFECTS = {"expand", "boost"}
 _linked_pairs: set | None = None
+_linked_pairs_loaded_at: float | None = None
+
+
+def pairs_from_ontology(data: dict) -> set:
+    """Concept pairs linked by a predicate whose search_behavior effect is expand or boost. A relationship can carry its
+    own search_behavior to override its predicate, or {"enabled": false} to opt out. A predicate with no search_behavior
+    (an older ontology file) counts only if it is "illustrates", which is what this check used before predicates had
+    effects."""
+    predicates = data.get("predicates") or []
+    if isinstance(predicates, dict):
+        predicates = [{"id": k, **(v if isinstance(v, dict) else {})} for k, v in predicates.items()]
+    behaviors = {str(p["id"]).lower(): p.get("search_behavior") for p in predicates if isinstance(p, dict) and p.get("id")}
+    pairs = set()
+    for rel in data.get("relationships", []):
+        name = str(rel.get("predicate", "")).lower()
+        spec = rel["search_behavior"] if "search_behavior" in rel else behaviors.get(name)
+        if isinstance(spec, dict):
+            linked = spec.get("enabled") is not False and str(spec.get("effect") or "").lower() in LINKING_EFFECTS
+            if spec.get("enabled") is not False and not spec.get("effect"):
+                linked = name == "illustrates"
+        else:
+            linked = name == "illustrates" and spec is None and "search_behavior" not in rel
+        if linked and rel.get("subject") and rel.get("object"):
+            pairs.add(frozenset((rel["subject"], rel["object"])))
+    return pairs
 
 
 def linked_concept_pairs():
-    global _linked_pairs
-    if _linked_pairs is None:
-        pairs = set()
+    global _linked_pairs, _linked_pairs_loaded_at
+    now = time.monotonic()
+    stale = _linked_pairs_loaded_at is not None and now - _linked_pairs_loaded_at > LINKED_PAIRS_REFRESH_SECONDS
+    if _linked_pairs is None or stale:
         try:
             data = requests.get(ONTOLOGY_URL, timeout=min(5, TIMEOUT)).json()
-            for rel in data.get("relationships", []):
-                if rel.get("predicate") == "illustrates":
-                    pairs.add(frozenset((rel.get("subject"), rel.get("object"))))
+            pairs = pairs_from_ontology(data)
         except Exception:
-            return set()  # do not cache a failure; try again on the next question
-        _linked_pairs = pairs
+            # Do not cache a failure: keep the last good set (empty on the first try) and try again next question.
+            return _linked_pairs or set()
+        _linked_pairs, _linked_pairs_loaded_at = pairs, now
     return _linked_pairs
 
 

@@ -191,7 +191,7 @@ Local tests that use admin tools need `MCP_ADMIN_TOOLS=true`. Search results dep
 | `Service returned HTTP 401` | A Function key is missing or wrong. Fix the app setting and restart |
 | `Service returned HTTP 502` from website search | The backend raised an error. Call its `/api/search` directly to see the message (a 429 inside means embedding quota) |
 | `out_of_scope` on a question about the Foundation | The ontology matched no concept. Add aliases for the topic in the ontology repo |
-| `needs_clarification` on a clear question | Two unlinked concepts scored within 0.10 of each other. Add an `illustrates` relationship between them, or sharper aliases, in the ontology repo |
+| `needs_clarification` on a clear question | Two unlinked concepts scored within 0.10 of each other. Concepts joined by a predicate whose `search_behavior` effect is `expand` or `boost` (`illustrates`, `supports`, `is_part_of`, `uses` and so on) count as one answer; `suppress` links (`is_distinct_from`) do not. Add a relationship between them, or sharper aliases, in the ontology repo. The links reload every `LINKED_PAIRS_REFRESH_HOURS` (default 24) |
 | `get_documents` reports an error for a url | The page is not indexed yet, or the `url` was not copied exactly from a result |
 | HTTP 401 on every request | The Functions host requires a function key. Set `defaultAuthorizationLevel` to `anonymous` in `host.json` |
 | HTTP 421 "Invalid Host header" | The server is bound to `127.0.0.1` behind a custom domain. Use `MCP_HOST=0.0.0.0` |
