@@ -42,7 +42,6 @@ def wire(monkeypatch, wiki_items, website_count=1):
 
     monkeypatch.setattr(server.http, "post", post)
     monkeypatch.setattr(server, "get_json", lambda url, key="", params=None: {"results": wiki_items})
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", True)
 
 
 def titles(result, source):
@@ -54,9 +53,9 @@ def test_the_overview_and_every_page_it_links_to_come_back_together(monkeypatch)
     result = server.search_sujeeth_foundation.sync("weekly agendas")
     assert titles(result, "wiki") == ["Weekly Content"] + [f"Week {n}" for n in range(1, 7)]
     assert titles(result, "website") == ["Alerts 0"]
-    # each week carries its own page, and the helper fields do not leave the server
+    # Page text is left for get_documents; helper fields do not leave the server.
     weeks = [r for r in result["results"] if r["title"].startswith("Week ")]
-    assert all(r["document"]["text"] == "Full text of " + r["title"].replace(" ", "-") + "." for r in weeks)
+    assert all("document" not in r for r in weeks)
     assert not any(k.startswith("_") or k in ("hub_pages", "hub_of") for r in result["results"] for k in r)
 
 
@@ -89,3 +88,4 @@ def test_an_overview_page_listed_twice_appears_once(monkeypatch):
     wire(monkeypatch, items)
     result = server.search_sujeeth_foundation.sync("weekly agendas")
     assert titles(result, "wiki").count("Week 1") == 1
+
