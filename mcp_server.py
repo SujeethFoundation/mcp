@@ -1652,6 +1652,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     matches, the question is not about the Foundation: the response has out_of_scope true, a message to
     relay, and no results.
     """
+    request_started = _request_started if _request_started is not None else time.perf_counter()
     query = (query or "").strip()
     if not query:
         return {"error": "Please provide a query."}
