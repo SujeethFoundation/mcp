@@ -41,7 +41,6 @@ def wire(monkeypatch, website, wiki=None):
 
     monkeypatch.setattr(server.http, "post", post)
     monkeypatch.setattr(server, "get_json", get_json)
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", False)
     monkeypatch.setattr(server, "_sleep", lambda seconds: None)      # a failing Search App is retried: do not wait for it
     monkeypatch.setattr(server, "ontology_catalog", lambda: {
         "ontology_version": "test",

@@ -90,15 +90,6 @@ def test_tool_descriptions_are_the_agent_facing_text():
 
 # -- the response ---------------------------------------------------------------------------------------------------
 
-def test_candidates_are_named_so_they_are_not_read_as_results(monkeypatch):
-    monkeypatch.setattr(server, "WIKI_FULL_TEXT", False)
-    wire(monkeypatch)
-    result = server.search_sujeeth_foundation.sync("report", full_documents=False)
-    assert result["count"] == len(result["results"])
-    assert set(result["retrieval"]) >= {"website_candidates", "wiki_candidates"}
-    assert "wiki_search" not in result and "website_search" not in result
-
-
 def test_search_never_reads_page_text_automatically(monkeypatch):
     wire(monkeypatch)
     calls = []

@@ -762,7 +762,7 @@ _ontology_plan_cache_lock = threading.Lock()
 _ontology_plan_inflight: dict[tuple[str, Any, str], Future] = {}
 MAX_RESOLVED_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))
 ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the supplied ontology candidate packet. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge. Return only concept IDs present in the supplied packet. Relationship edges are subject-predicate-object triples; `predicate_search_behavior` gives the default retrieval rule, with any edge-level `search_behavior` overriding it.
-Return direct concept IDs for the user's topic. Add related IDs only when an ontology relationship supports retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
+Return direct concept IDs for the user's topic. Also return the Mood Meter feeling IDs explicitly identified or clearly described in the question, and at most one canonical intent from the ontology's relationship intent tags when a feeling is present. Add related IDs only when an ontology relationship supports generic retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Do not use an edge marked `retrieval.general_search_expand=false` or `retrieval.search_expansion=feelings_api_only` for generic expansion; those are resolved only by the Feelings API. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
 Preserve the user's intent. Return at most {MAX_RESOLVED_QUERIES} short search queries covering the ask. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
 
 ONTOLOGY_PLAN_SCHEMA = {
@@ -770,11 +770,13 @@ ONTOLOGY_PLAN_SCHEMA = {
     "properties": {
         "matched_concepts": {"type": "array", "items": {"type": "string"}},
         "related_concepts": {"type": "array", "items": {"type": "string"}},
+        "feelings": {"type": "array", "items": {"type": "string"}},
+        "intent": {"type": ["string", "null"]},
         "queries": {"type": "array", "items": {"type": "string"}},
         "needs_clarification": {"type": "boolean"},
         "suggested_question": {"type": ["string", "null"]},
     },
-    "required": ["matched_concepts", "related_concepts", "queries", "needs_clarification", "suggested_question"],
+    "required": ["matched_concepts", "related_concepts", "feelings", "intent", "queries", "needs_clarification", "suggested_question"],
 }
 
 
@@ -823,6 +825,15 @@ def ontology_candidate_ids(query, catalog):
     return [concept_id for _, concept_id in sorted(scored, key=lambda row: (-row[0], row[1]))[:ONTOLOGY_MODEL_CANDIDATE_LIMIT]]
 
 
+def is_feelings_api_only_edge(relationship):
+    """Whether an edge is reserved for the deterministic Feelings API, never generic traversal."""
+    retrieval = relationship.get("retrieval", {}) if isinstance(relationship, dict) else {}
+    return isinstance(retrieval, dict) and (
+        retrieval.get("general_search_expand") is False
+        or retrieval.get("search_expansion") == "feelings_api_only"
+    )
+
+
 def ontology_model_context(query, catalog):
     """Build a bounded candidate packet; unknown wording gets a terse all-concept fallback."""
     candidates = ontology_candidate_ids(query, catalog)
@@ -835,6 +846,8 @@ def ontology_model_context(query, catalog):
     relationships = []
     for relationship in catalog.get("relationships", []):
         if not isinstance(relationship, dict):
+            continue
+        if is_feelings_api_only_edge(relationship):
             continue
         subject, obj = relationship.get("subject"), relationship.get("object")
         if subject in direct and obj:
@@ -875,6 +888,8 @@ def compact_ontology_catalog(catalog, concept_ids=None, detailed_ids=None, relat
     relationship_rows = relationships if relationships is not None else catalog.get("relationships", [])
     for rel in relationship_rows if include_relationships else []:
         if not isinstance(rel, dict):
+            continue
+        if is_feelings_api_only_edge(rel):
             continue
         if selected is not None and (rel.get("subject") not in selected or rel.get("object") not in selected):
             continue
@@ -1035,6 +1050,13 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None):
         valid_ids &= set(allowed_ids)
     matched = list(dict.fromkeys(x for x in result.get("matched_concepts", []) if isinstance(x, str) and x in valid_ids))
     related = list(dict.fromkeys(x for x in result.get("related_concepts", []) if isinstance(x, str) and x in valid_ids))
+    feeling_ids = {str(row["id"]) for row in catalog["classes"]
+                   if isinstance(row, dict) and row.get("id") and isinstance(row.get("mood_meter"), dict)}
+    feelings = list(dict.fromkeys(x for x in result.get("feelings", []) if isinstance(x, str) and x in feeling_ids))
+    intent_tags = {str(tag) for rel in catalog.get("relationships", []) if isinstance(rel, dict)
+                   for tag in ((rel.get("retrieval") or {}).get("intent_tags") or []) if isinstance(tag, str)}
+    requested_intent = result.get("intent")
+    intent = requested_intent if isinstance(requested_intent, str) and requested_intent in intent_tags else None
     # A model may identify a concept as related only when an enabled ontology edge supports retrieval.
     predicates = catalog.get("predicates", [])
     if isinstance(predicates, dict):
@@ -1043,6 +1065,8 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None):
     allowed_related = set()
     for rel in catalog.get("relationships", []):
         if not isinstance(rel, dict):
+            continue
+        if is_feelings_api_only_edge(rel):
             continue
         predicate = str(rel.get("predicate", "")).lower()
         spec = rel.get("search_behavior", behavior_map.get(predicate, {}))
@@ -1086,9 +1110,62 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None):
                            "matched_concepts": concepts, "domains": domains,
                            "needs_clarification": needs_clarification,
                            "suggested_question": suggested if needs_clarification else None,
+                           "feelings": feelings,
+                           "intent": intent,
                            "concept_matches": ([{"concept_id": x, "source": "azure_model"} for x in matched] +
                                                [{"concept_id": x, "source": "ontology_relationship"} for x in related])},
             "queries": queries, "error": None}
+
+
+def add_feelings_frameworks(plan, catalog):
+    """Resolve recognized feelings through the ontology API and append its ranked framework concepts.
+
+    The API owns ranking and interprets feelings-only edges. If it is unavailable, retain direct concepts and expose
+    a degraded route rather than silently re-expanding those restricted edges.
+    """
+    resolution = plan.get("resolution", {})
+    feelings = resolution.get("feelings") or []
+    if not feelings:
+        return plan
+    enriched = copy.deepcopy(plan)
+    resolution = enriched["resolution"]
+    try:
+        response = post_json(
+            f"{ONTOLOGY_URL}/api/ontology/feelings/resolve",
+            {"feelings": feelings, "intent": resolution.get("intent"), "max_results": 3},
+            ONTOLOGY_KEY,
+        )
+        ranked = response.get("frameworks", []) if isinstance(response, dict) else []
+        valid_ids = {str(row["id"]) for row in catalog.get("classes", [])
+                     if isinstance(row, dict) and row.get("id")}
+        framework_ids = []
+        framework_details = []
+        for framework in ranked:
+            if not isinstance(framework, dict):
+                continue
+            framework_id = framework.get("framework_id")
+            if not isinstance(framework_id, str) or framework_id not in valid_ids or framework_id in framework_ids:
+                continue
+            framework_ids.append(framework_id)
+            framework_details.append({key: framework[key] for key in
+                                      ("framework_id", "framework_name", "matched_feelings", "intent_match",
+                                       "ranking_score", "guardrail") if key in framework})
+        concepts = list(dict.fromkeys((resolution.get("matched_concepts") or []) + framework_ids))
+        resolution["matched_concepts"] = concepts
+        resolution["domains"] = list(dict.fromkeys(
+            row["domain"] for row in catalog.get("domains", [])
+            if isinstance(row, dict) and row.get("search_enabled") and row.get("domain")
+            and set(concepts).intersection(row.get("associated_concepts") or [])
+        ))
+        resolution["concept_matches"] = (resolution.get("concept_matches") or []) + [
+            {"concept_id": framework_id, "source": "feelings_api"} for framework_id in framework_ids
+        ]
+        resolution["feelings_route"] = {"status": "resolved", "intent": resolution.get("intent"),
+                                         "frameworks": framework_details}
+    except Exception:
+        resolution["feelings_route"] = {"status": "unavailable", "degraded": True,
+                                         "message": "Feelings guidance is temporarily unavailable; restricted emotion mappings were not expanded."}
+    return enriched
 
 
 def resolve_ontology_plan(query, catalog=None):
@@ -1115,6 +1192,7 @@ def resolve_ontology_plan(query, catalog=None):
     try:
         model_context, allowed_ids = ontology_model_context(query, catalog)
         plan = validate_ontology_plan(call_ontology_model(query, model_context), query, catalog, allowed_ids)
+        plan = add_feelings_frameworks(plan, catalog)
         _ontology_plan_cache_put(key, plan)
         shared.set_result(plan)
         return plan
