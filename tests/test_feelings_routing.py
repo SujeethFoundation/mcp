@@ -34,9 +34,10 @@ def catalog():
     }
 
 
-def model_result(matched, feelings=None, intent=None, related=None):
+def model_result(matched, feelings=None, intent=None, related=None, topic_queries=None, feeling_query=None):
     return {"matched_concepts": matched, "related_concepts": related or [], "feelings": feelings or [],
-            "intent": intent, "queries": ["help"], "needs_clarification": False,
+            "intent": intent, "topic_queries": topic_queries or ["help", "practical help", "examples"],
+            "feeling_query": feeling_query, "needs_clarification": False,
             "suggested_question": None}
 
 
@@ -85,6 +86,37 @@ def test_mixed_question_merges_ranked_framework_with_career_concepts(monkeypatch
 
     assert plan["resolution"]["matched_concepts"] == ["interviewing", "nervous", "emotional_regulation"]
     assert plan["resolution"]["domains"] == ["feelings.example", "career.example"]
+
+
+def test_mixed_plan_keeps_three_topic_queries_and_a_contextual_feeling_query(monkeypatch):
+    monkeypatch.setattr(server, "post_json", lambda *args, **kwargs: {"frameworks": []})
+    plan = server.add_feelings_frameworks(
+        server.validate_ontology_plan(
+            model_result(
+                ["interviewing", "nervous"], ["nervous"], "regulation",
+                topic_queries=["interview preparation", "interview practice", "interview examples"],
+                feeling_query="managing nervousness before an interview",
+            ),
+            "I am nervous about my interview", catalog(),
+        ),
+        catalog(),
+    )
+
+    query_plan = plan["resolution"]["query_plan"]
+    assert query_plan["topic_queries"] == ["I am nervous about my interview", "interview preparation", "interview practice"]
+    assert query_plan["feeling_query"] == "managing nervousness before an interview"
+    assert query_plan["career_context_concepts"] == ["interviewing"]
+    assert plan["queries"] == query_plan["topic_queries"] + [query_plan["feeling_query"]]
+
+
+def test_feeling_query_is_omitted_without_a_career_context():
+    plan = server.validate_ontology_plan(
+        model_result(["nervous"], ["nervous"], "regulation", feeling_query="managing nervousness"),
+        "I am nervous", catalog(),
+    )
+
+    assert plan["resolution"]["query_plan"]["feeling_query"] is None
+    assert len(plan["resolution"]["query_plan"]["topic_queries"]) == 3
 
 
 def test_feelings_only_edges_cannot_be_used_by_generic_related_expansion():
