@@ -109,6 +109,41 @@ def test_mixed_plan_keeps_three_topic_queries_and_a_contextual_feeling_query(mon
     assert plan["queries"] == query_plan["topic_queries"] + [query_plan["feeling_query"]]
 
 
+def test_previous_turn_context_is_a_candidate_not_an_automatic_feeling_query(monkeypatch):
+    server.clear_ontology_plan_cache()
+    seen = []
+
+    def context(query, data, retrieval_context):
+        seen.append(retrieval_context)
+        return data, None
+
+    monkeypatch.setattr(server, "ontology_model_context", context)
+    monkeypatch.setattr(server, "call_ontology_model", lambda query, data, retrieval_context: model_result(
+        ["interviewing", "nervous"], ["nervous"], "regulation",
+        topic_queries=["interview preparation", "interview practice", "interview examples"],
+        feeling_query="managing nervousness before an interview",
+    ))
+    monkeypatch.setattr(server, "post_json", lambda *args, **kwargs: {"frameworks": []})
+
+    plan = resolve_plan("best practices for interviews", catalog(), {
+        "feeling": "nervous", "career_context": "interviewing", "source": "previous_turn",
+    })
+
+    assert seen == [{"feeling": "nervous", "career_context": "interviewing", "source": "previous_turn"}]
+    assert plan["resolution"]["query_plan"]["feeling_source"] == "conversation_context"
+
+
+def test_invalid_context_is_not_sent_to_the_ontology_model(monkeypatch):
+    server.clear_ontology_plan_cache()
+    seen = []
+    monkeypatch.setattr(server, "ontology_model_context", lambda query, data: seen.append((query, data)) or (data, None))
+    monkeypatch.setattr(server, "call_ontology_model", lambda query, data: model_result(["interviewing"]))
+
+    resolve_plan("interview help", catalog(), {"feeling": "invented", "career_context": "interviewing"})
+
+    assert len(seen) == 1
+
+
 def test_feeling_query_is_omitted_without_a_career_context():
     plan = server.validate_ontology_plan(
         model_result(["nervous"], ["nervous"], "regulation", feeling_query="managing nervousness"),

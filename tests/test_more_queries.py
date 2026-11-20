@@ -86,6 +86,22 @@ def test_search_diagnostics_identify_topic_and_feeling_queries(monkeypatch):
     assert result["retrieval"]["query_plan"] == query_plan
 
 
+def test_search_forwards_compact_retrieval_context(monkeypatch):
+    hit = {"title": "Networking", "url": "https://sujeeth.org/networking", "snippet": "Advice",
+           "source": "website", "domain": "sujeeth.org", "chunk_id": "networking-0"}
+    wire(monkeypatch, {"status": "completed", "resolution": resolved("networking"), "results": [hit]})
+    seen = []
+    monkeypatch.setattr(server, "resolve_ontology_plan", lambda query, retrieval_context=None:
+                        seen.append(retrieval_context) or {"resolution": resolved("networking"),
+                                                           "queries": [query], "error": None})
+
+    server.search_sujeeth_foundation.sync("networking best practices", retrieval_context={
+        "feeling": "nervous", "career_context": "networking", "source": "previous_turn",
+    })
+
+    assert seen == [{"feeling": "nervous", "career_context": "networking", "source": "previous_turn"}]
+
+
 def test_query_variants_are_capped_after_deduplication(monkeypatch):
     hit = {"title": "X", "url": "https://sujeeth.org/x", "snippet": "X",
            "source": "website", "domain": "sujeeth.org", "chunk_id": "x-0"}

@@ -779,7 +779,7 @@ TOPIC_QUERY_COUNT = 3
 MAX_RESOLVED_QUERIES = max(TOPIC_QUERY_COUNT + 1, min(int(setting("SEARCH_MAX_QUERIES", "4") or 4), 5))
 ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the supplied ontology candidate packet. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge. Return only concept IDs present in the supplied packet. Relationship edges are subject-predicate-object triples; `predicate_search_behavior` gives the default retrieval rule, with any edge-level `search_behavior` overriding it.
 Return direct concept IDs for the user's topic. Also return the Mood Meter feeling IDs explicitly identified or clearly described in the question, and at most one canonical intent from the ontology's relationship intent tags when a feeling is present. Add related IDs only when an ontology relationship supports generic retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Do not use an edge marked `retrieval.general_search_expand=false` or `retrieval.search_expansion=feelings_api_only` for generic expansion; those are resolved only by the Feelings API. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
-Preserve the user's intent. Return exactly {TOPIC_QUERY_COUNT} distinct, short `topic_queries` for the active career question: one direct answer path, one related concept or approach, and one practical guidance or example path. Do not make superficial rewrites of the same query. When a feeling is explicitly identified or clearly remains relevant in the question, return one `feeling_query` that addresses that feeling in the active career context. For example, use "managing nervousness when networking", never anxiety in general. Do not invent a feeling, and return null for `feeling_query` when no feeling is relevant or no active career context is present. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
+Preserve the user's intent. A `conversation_context` field may name one feeling from the immediately preceding conversation turn and the current career context. Treat it only as a candidate: use it only when the current question continues that career context, and otherwise ignore it. Return exactly {TOPIC_QUERY_COUNT} distinct, short `topic_queries` for the active career question: one direct answer path, one related concept or approach, and one practical guidance or example path. Do not make superficial rewrites of the same query. When a feeling is explicitly identified or clearly remains relevant through `conversation_context`, return one `feeling_query` that addresses that feeling in the active career context. For example, use "managing nervousness when networking", never anxiety in general. Do not invent a feeling, and return null for `feeling_query` when no feeling is relevant or no active career context is present. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
 
 ONTOLOGY_PLAN_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -842,6 +842,25 @@ def ontology_candidate_ids(query, catalog):
     return [concept_id for _, concept_id in sorted(scored, key=lambda row: (-row[0], row[1]))[:ONTOLOGY_MODEL_CANDIDATE_LIMIT]]
 
 
+def clean_retrieval_context(value, catalog):
+    """Keep one bounded, ontology-backed feeling candidate from the calling conversation."""
+    if not isinstance(value, dict):
+        return None
+    feeling = value.get("feeling")
+    career_context = value.get("career_context")
+    if not isinstance(feeling, str) or not isinstance(career_context, str):
+        return None
+    feeling = " ".join(feeling.split())[:80]
+    career_context = " ".join(career_context.split())[:160]
+    mood_ids = {str(row.get("id")) for row in catalog.get("classes", [])
+                if isinstance(row, dict) and isinstance(row.get("mood_meter"), dict) and row.get("id")}
+    if feeling not in mood_ids or not career_context:
+        return None
+    source = value.get("source")
+    return {"feeling": feeling, "career_context": career_context,
+            "source": source if source in {"previous_turn", "summary"} else "conversation"}
+
+
 def is_feelings_api_only_edge(relationship):
     """Whether an edge is reserved for the deterministic Feelings API, never generic traversal."""
     retrieval = relationship.get("retrieval", {}) if isinstance(relationship, dict) else {}
@@ -851,9 +870,11 @@ def is_feelings_api_only_edge(relationship):
     )
 
 
-def ontology_model_context(query, catalog):
+def ontology_model_context(query, catalog, retrieval_context=None):
     """Build a bounded candidate packet; unknown wording gets a terse all-concept fallback."""
     candidates = ontology_candidate_ids(query, catalog)
+    if retrieval_context and retrieval_context["feeling"] not in candidates:
+        candidates = [retrieval_context["feeling"], *candidates][:ONTOLOGY_MODEL_CANDIDATE_LIMIT]
     if not candidates:
         context = compact_ontology_catalog(catalog, include_relationships=False)
         context["packet_type"] = "full_fallback"
@@ -991,8 +1012,9 @@ def clear_ontology_plan_cache():
         _ontology_plan_cache.clear()
 
 
-def _ontology_plan_cache_key(query, catalog):
-    return (" ".join((query or "").casefold().split()), catalog.get("ontology_version"), ONTOLOGY_MODEL_NAME)
+def _ontology_plan_cache_key(query, catalog, retrieval_context=None):
+    context_key = tuple(sorted((str(key), str(value)) for key, value in (retrieval_context or {}).items()))
+    return (" ".join((query or "").casefold().split()), catalog.get("ontology_version"), ONTOLOGY_MODEL_NAME, context_key)
 
 
 def _ontology_plan_cache_get(key):
@@ -1018,7 +1040,7 @@ def _ontology_plan_cache_put(key, plan):
                 _ontology_plan_cache.pop(old, None)
 
 
-def call_ontology_model(query, model_context):
+def call_ontology_model(query, model_context, retrieval_context=None):
     """Call the configured Azure GPT-6 Luna deployment with the searchable ontology catalog."""
     if not ONTOLOGY_MODEL_ENDPOINT or not ONTOLOGY_MODEL_API_KEY:
         raise RuntimeError("Azure ontology model is not configured")
@@ -1026,8 +1048,11 @@ def call_ontology_model(query, model_context):
     prompt_cache_key = hashlib.sha256(cache_key_source.encode("utf-8")).hexdigest()
     model_started = time.perf_counter()
     deadline = time.monotonic() + ONTOLOGY_MODEL_TIMEOUT
+    payload = {"ontology": model_context, "question": query}
+    if retrieval_context:
+        payload["conversation_context"] = retrieval_context
     request = {"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
-               "input": json.dumps({"ontology": model_context, "question": query}, ensure_ascii=False,
+               "input": json.dumps(payload, ensure_ascii=False,
                                    separators=(",", ":")),
                "prompt_cache_key": prompt_cache_key,
                "reasoning": {"effort": ONTOLOGY_REASONING_EFFORT},
@@ -1060,7 +1085,7 @@ def call_ontology_model(query, model_context):
     return json.loads(_responses_output_text(payload))
 
 
-def validate_ontology_plan(result, query, catalog, allowed_ids=None):
+def validate_ontology_plan(result, query, catalog, allowed_ids=None, retrieval_context=None):
     """Validate model-selected concepts, relationship expansions, domains, and query variants."""
     valid_ids = {str(row["id"]) for row in catalog["classes"] if isinstance(row, dict) and row.get("id")}
     if allowed_ids is not None:
@@ -1142,7 +1167,10 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None):
                            "intent": intent,
                            "query_plan": {"topic_queries": topic_queries,
                                           "feeling_query": feeling_query,
-                                          "career_context_concepts": career_context_concepts},
+                                          "career_context_concepts": career_context_concepts,
+                                          "feeling_source": ("conversation_context" if feeling_query and retrieval_context
+                                                             and retrieval_context["feeling"] in feelings
+                                                             else "current_query" if feeling_query else None)},
                            "concept_matches": ([{"concept_id": x, "source": "azure_model"} for x in matched] +
                                                [{"concept_id": x, "source": "ontology_relationship"} for x in related])},
             "queries": queries, "error": None}
@@ -1199,12 +1227,13 @@ def add_feelings_frameworks(plan, catalog):
     return enriched
 
 
-def resolve_ontology_plan(query, catalog=None):
+def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
     """Ask Azure GPT-6 Luna to resolve the query against ontology concepts and suggest retrieval queries."""
     catalog = catalog if catalog is not None else ontology_catalog()
     if not isinstance(catalog, dict) or not isinstance(catalog.get("classes"), list):
         raise RuntimeError("Ontology catalog is unavailable")
-    key = _ontology_plan_cache_key(query, catalog)
+    retrieval_context = clean_retrieval_context(retrieval_context, catalog)
+    key = _ontology_plan_cache_key(query, catalog, retrieval_context)
     cached = _ontology_plan_cache_get(key)
     if cached is not None:
         normalized = key[0]
@@ -1221,8 +1250,13 @@ def resolve_ontology_plan(query, catalog=None):
     if not leader:
         return copy.deepcopy(shared.result())
     try:
-        model_context, allowed_ids = ontology_model_context(query, catalog)
-        plan = validate_ontology_plan(call_ontology_model(query, model_context), query, catalog, allowed_ids)
+        if retrieval_context:
+            model_context, allowed_ids = ontology_model_context(query, catalog, retrieval_context)
+            model_result = call_ontology_model(query, model_context, retrieval_context)
+        else:
+            model_context, allowed_ids = ontology_model_context(query, catalog)
+            model_result = call_ontology_model(query, model_context)
+        plan = validate_ontology_plan(model_result, query, catalog, allowed_ids, retrieval_context)
         plan = add_feelings_frameworks(plan, catalog)
         _ontology_plan_cache_put(key, plan)
         shared.set_result(plan)
@@ -1438,7 +1472,9 @@ SEARCH_DESCRIPTION = (
     "suggested_question to ask. If the response has out_of_scope true, the question is not about the Foundation: "
     "relay its message and do not answer from other sources. "
     + (f"You may pass same-topic wording variants in more_queries (up to {MAX_QUERIES} queries in one search request). " if MAX_QUERIES > 1 else "")
-    + "For separate topics, call this tool separately. Do not request page text here; use get_documents only when the excerpts are insufficient."
+    + "For separate topics, call this tool separately. A chat client may pass one compact retrieval_context with an "
+    "active feeling and career context; MCP decides whether it remains relevant. Do not request page text here; use "
+    "get_documents only when the excerpts are insufficient."
 )
 
 WEBSITE_SEARCH_DESCRIPTION = (
@@ -1916,10 +1952,11 @@ def clear_search_cache():
         _search_cache.clear()
 
 
-def _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries=None):
+def _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries=None, retrieval_context=None):
     # Case and spacing do not change what a search finds, so they must not split the cache.
     variants = tuple(" ".join(q.lower().split()) for q in (queries or []))
-    return (" ".join(query.lower().split()), variants, limit, bool(full_documents), max_documents, document_max_chars)
+    context_key = tuple(sorted((str(key), str(value)) for key, value in (retrieval_context or {}).items()))
+    return (" ".join(query.lower().split()), variants, context_key, limit, bool(full_documents), max_documents, document_max_chars)
 
 
 def _search_cache_get(key):
@@ -1943,7 +1980,8 @@ def _search_cache_put(key, response):
 
 
 def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000,
-               _plan=None, _request_started=None, _include_documents=True, _ontology_resolution_ms=None):
+               _plan=None, _request_started=None, _include_documents=True, _ontology_resolution_ms=None,
+               _retrieval_context=None):
     """
     One query: Search Website Search and Wiki Search together using ontology resolution.
     Results flagged best_bet or spotlight are curated pages; present them first.
@@ -1978,7 +2016,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     )
     queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
     full_documents = bool(full_documents and _include_documents)
-    cache_key = _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries)
+    cache_key = _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries,
+                                  _retrieval_context)
     cached = _search_cache_get(cache_key)
     if cached is not None:
         timings = {"cache_hit": True, "ontology_resolution_ms": (
@@ -2145,11 +2184,14 @@ def search_sujeeth_foundation(
     query: str,
     limit: int | None = None,
     more_queries: list[str] | None = None,
+    retrieval_context: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Resolve once, then send the query and same-topic variants in one request to each search service.
 
-    Page text is not fetched by this tool. The chat agent can call get_documents for selected results when
-    their excerpts are not enough. Separate topics should use separate tool calls.
+    Page text is not fetched by this tool. `retrieval_context` is optional, compact chat state with
+    `feeling`, `career_context`, and `source`; MCP validates it and decides whether it belongs in retrieval.
+    The chat agent can call get_documents for selected results when their excerpts are not enough.
+    Separate topics should use separate tool calls.
     """
     request_started = time.perf_counter()
     query = (query or "").strip()
@@ -2157,7 +2199,8 @@ def search_sujeeth_foundation(
         return {"error": "Please provide a query."}
     ontology_started = time.perf_counter()
     try:
-        plan = resolve_ontology_plan(query)
+        plan = (resolve_ontology_plan(query, retrieval_context=retrieval_context)
+                if retrieval_context is not None else resolve_ontology_plan(query))
     except Exception as exc:
         plan = {"resolution": {"status": "unavailable", "matched_concepts": [], "domains": []},
                 "queries": [query], "error": exc}
@@ -2172,6 +2215,7 @@ def search_sujeeth_foundation(
         _plan=plan,
         _request_started=request_started, _include_documents=False,
         _ontology_resolution_ms=ontology_resolution_ms,
+        _retrieval_context=retrieval_context,
     )
     return response
 
