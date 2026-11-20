@@ -68,6 +68,24 @@ def test_same_topic_variants_make_one_request_to_each_search_service(monkeypatch
     assert result["count"] == 1 and "for_query" not in result["results"][0]
 
 
+def test_search_diagnostics_identify_topic_and_feeling_queries(monkeypatch):
+    hit = {"title": "Interview", "url": "https://sujeeth.org/interview", "snippet": "Advice",
+           "source": "website", "domain": "sujeeth.org", "chunk_id": "interview-0"}
+    sent = wire(monkeypatch, {"status": "completed", "resolution": resolved("interviewing", "nervous"), "results": [hit]})
+    query_plan = {"topic_queries": ["I am nervous about my interview", "interview preparation", "interview practice"],
+                  "feeling_query": "managing nervousness before an interview",
+                  "career_context_concepts": ["interviewing"]}
+    monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: {
+        "resolution": {**resolved("interviewing", "nervous"), "query_plan": query_plan},
+        "queries": query_plan["topic_queries"] + [query_plan["feeling_query"]], "error": None})
+
+    result = server.search_sujeeth_foundation.sync("I am nervous about my interview")
+
+    website = [body for url, body in sent if url.startswith(server.WEBSEARCH_URL)]
+    assert website[0]["queries"] == ["I am nervous about my interview", "interview preparation", "interview practice", "managing nervousness before an interview"]
+    assert result["retrieval"]["query_plan"] == query_plan
+
+
 def test_query_variants_are_capped_after_deduplication(monkeypatch):
     hit = {"title": "X", "url": "https://sujeeth.org/x", "snippet": "X",
            "source": "website", "domain": "sujeeth.org", "chunk_id": "x-0"}
@@ -94,4 +112,5 @@ def test_agent_guidance_keeps_separate_topics_as_separate_tool_calls():
     assert "For separate topics" in server.SEARCH_DESCRIPTION
     assert "one search request" in server.SEARCH_DESCRIPTION
     assert "separate parts" not in server.SERVER_INSTRUCTIONS
+
 

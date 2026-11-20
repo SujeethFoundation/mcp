@@ -111,7 +111,8 @@ RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)   
 RESULT_COUNT = int(setting("SEARCH_RESULT_COUNT", "10") or 10)
 CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "20") or 20)   # the Search App returns at most SEARCH_MAX_LIMIT (20)
 MAX_PER_DOMAIN = int(setting("MAX_RESULTS_PER_DOMAIN", "2") or 2)
-MAX_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))   # searches one tool call may combine (query + more_queries)
+# A universal search uses three topic queries and may add one feeling query.
+MAX_QUERIES = max(4, min(int(setting("SEARCH_MAX_QUERIES", "4") or 4), 5))   # searches one tool call may combine (query + more_queries)
 WIKI_POOL = MAX_PER_DOMAIN + 2  # the wiki counts as one source, so it needs only a few candidates
 # When the best wiki result is an overview that links to the pages that answer the question ("weekly agendas" -> Weekly Content,
 # which links Week 1 to Week 6), the wiki app returns those pages with it (hub_pages / hub_of). They are kept together, outside the
@@ -681,6 +682,7 @@ def resolution_summary(data):
     }
     if VERBOSE_ONTOLOGY:
         summary["concept_matches"] = data.get("concept_matches", [])
+        summary["query_plan"] = data.get("query_plan", {})
     return summary
 
 
@@ -739,6 +741,17 @@ def linked_concept_pairs():
     return _linked_pairs
 
 
+# Response principles are sent both when the MCP connects and with tool results, so the chat agent has the same
+# behavioral contract before and after retrieval.
+RESPONSE_GUARDRAILS = {
+    "capability_honesty": "Claim an action, search, verification, or access only when the available tools and their results support it.",
+    "grounding": "Separate retrieved Foundation material, general coaching, and unknowns; do not invent specifics.",
+    "conversation_context": "Treat short follow-ups as replies to the active conversation; if needed context is absent, say what is needed.",
+    "constructive_scope": "When a request exceeds available capability, state the boundary plainly and offer the nearest supported next step without promising external action.",
+    "uncertainty_and_agency": "Avoid diagnosis, pressure, or certainty beyond the evidence; clarify only when it would materially change the help given.",
+}
+RESPONSE_GUARDRAILS_TEXT = "Response principles: " + " ".join(RESPONSE_GUARDRAILS.values())
+
 # What the customer is told when nothing in the ontology matches the question.
 OUT_OF_SCOPE_MESSAGE = (
     "That's outside what I can help with. I'm here to help you get ready for your first job: career guidance, "
@@ -747,7 +760,7 @@ OUT_OF_SCOPE_MESSAGE = (
 )
 
 OUT_OF_SCOPE_INSTRUCTIONS = (
-    "This question is not about the Foundation: no ontology concept matched it, so nothing was searched. "
+    RESPONSE_GUARDRAILS_TEXT + " This question is not about the Foundation: no ontology concept matched it, so nothing was searched. "
     f'Reply with this message, in these words: "{OUT_OF_SCOPE_MESSAGE}" Add nothing to it. Do not '
     "answer the question from general knowledge, do not search again for it, and do not ask which area they mean."
 )
@@ -760,10 +773,13 @@ ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRI
 _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
 _ontology_plan_cache_lock = threading.Lock()
 _ontology_plan_inflight: dict[tuple[str, Any, str], Future] = {}
-MAX_RESOLVED_QUERIES = max(1, min(int(setting("SEARCH_MAX_QUERIES", "3") or 3), 5))
+TOPIC_QUERY_COUNT = 3
+# Universal search needs three career-topic paths plus room for one optional feeling path.
+# Keep the setting bounded, but never silently reduce the retrieval contract below four slots.
+MAX_RESOLVED_QUERIES = max(TOPIC_QUERY_COUNT + 1, min(int(setting("SEARCH_MAX_QUERIES", "4") or 4), 5))
 ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the supplied ontology candidate packet. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge. Return only concept IDs present in the supplied packet. Relationship edges are subject-predicate-object triples; `predicate_search_behavior` gives the default retrieval rule, with any edge-level `search_behavior` overriding it.
 Return direct concept IDs for the user's topic. Also return the Mood Meter feeling IDs explicitly identified or clearly described in the question, and at most one canonical intent from the ontology's relationship intent tags when a feeling is present. Add related IDs only when an ontology relationship supports generic retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Do not use an edge marked `retrieval.general_search_expand=false` or `retrieval.search_expansion=feelings_api_only` for generic expansion; those are resolved only by the Feelings API. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
-Preserve the user's intent. Return at most {MAX_RESOLVED_QUERIES} short search queries covering the ask. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
+Preserve the user's intent. Return exactly {TOPIC_QUERY_COUNT} distinct, short `topic_queries` for the active career question: one direct answer path, one related concept or approach, and one practical guidance or example path. Do not make superficial rewrites of the same query. When a feeling is explicitly identified or clearly remains relevant in the question, return one `feeling_query` that addresses that feeling in the active career context. For example, use "managing nervousness when networking", never anxiety in general. Do not invent a feeling, and return null for `feeling_query` when no feeling is relevant or no active career context is present. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
 
 ONTOLOGY_PLAN_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -772,11 +788,12 @@ ONTOLOGY_PLAN_SCHEMA = {
         "related_concepts": {"type": "array", "items": {"type": "string"}},
         "feelings": {"type": "array", "items": {"type": "string"}},
         "intent": {"type": ["string", "null"]},
-        "queries": {"type": "array", "items": {"type": "string"}},
+        "topic_queries": {"type": "array", "items": {"type": "string"}},
+        "feeling_query": {"type": ["string", "null"]},
         "needs_clarification": {"type": "boolean"},
         "suggested_question": {"type": ["string", "null"]},
     },
-    "required": ["matched_concepts", "related_concepts", "feelings", "intent", "queries", "needs_clarification", "suggested_question"],
+    "required": ["matched_concepts", "related_concepts", "feelings", "intent", "topic_queries", "feeling_query", "needs_clarification", "suggested_question"],
 }
 
 
@@ -1090,18 +1107,29 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None):
         if isinstance(row, dict) and row.get("search_enabled") and row.get("domain")
         and set(concepts).intersection(row.get("associated_concepts") or [])
     ))
-    queries = []
-    for candidate in result.get("queries", []):
+    topic_queries = []
+    for candidate in result.get("topic_queries", []):
         if not isinstance(candidate, str):
             continue
         candidate = " ".join(candidate.split())
-        if candidate and len(candidate) <= 300 and candidate.casefold() not in {q.casefold() for q in queries}:
-            queries.append(candidate)
-        if len(queries) >= MAX_RESOLVED_QUERIES:
+        if candidate and len(candidate) <= 300 and candidate.casefold() not in {q.casefold() for q in topic_queries}:
+            topic_queries.append(candidate)
+        if len(topic_queries) >= TOPIC_QUERY_COUNT:
             break
-    if matched and query.strip() and query.casefold() not in {q.casefold() for q in queries}:
-        queries.insert(0, query.strip())
-        queries = queries[:MAX_RESOLVED_QUERIES]
+    if matched and query.strip() and query.casefold() not in {q.casefold() for q in topic_queries}:
+        topic_queries.insert(0, query.strip())
+        topic_queries = topic_queries[:TOPIC_QUERY_COUNT]
+    # A feeling route is useful only when it remains anchored to a non-feeling career topic.
+    career_context_concepts = [concept for concept in matched if concept not in feelings]
+    feeling_query = result.get("feeling_query")
+    if not (feelings and career_context_concepts and isinstance(feeling_query, str)):
+        feeling_query = None
+    else:
+        feeling_query = " ".join(feeling_query.split())
+        if (not feeling_query or len(feeling_query) > 300 or
+                feeling_query.casefold() in {q.casefold() for q in topic_queries}):
+            feeling_query = None
+    queries = topic_queries + ([feeling_query] if feeling_query else [])
     suggested = result.get("suggested_question")
     suggested = " ".join(suggested.split()) if isinstance(suggested, str) else None
     needs_clarification = bool(result.get("needs_clarification") and matched and suggested and len(suggested) <= 300)
@@ -1112,6 +1140,9 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None):
                            "suggested_question": suggested if needs_clarification else None,
                            "feelings": feelings,
                            "intent": intent,
+                           "query_plan": {"topic_queries": topic_queries,
+                                          "feeling_query": feeling_query,
+                                          "career_context_concepts": career_context_concepts},
                            "concept_matches": ([{"concept_id": x, "source": "azure_model"} for x in matched] +
                                                [{"concept_id": x, "source": "ontology_relationship"} for x in related])},
             "queries": queries, "error": None}
@@ -1282,7 +1313,7 @@ def assess_quality(resolution, results, errors):
             "agent_instructions": OUT_OF_SCOPE_INSTRUCTIONS,
         }
 
-    instructions = (
+    instructions = RESPONSE_GUARDRAILS_TEXT + " " + (
         "If needs_clarification is true, ask the suggested question before "
         "making a definitive claim. Use ontology context to explain "
         "available concepts. Never guess a domain or search outside "
@@ -1310,6 +1341,7 @@ def assess_quality(resolution, results, errors):
         "reasons": reasons,
         "suggested_question": question,
         "agent_instructions": instructions,
+        "response_guardrails": RESPONSE_GUARDRAILS,
     }
 
 
@@ -1387,13 +1419,15 @@ SPOTLIGHT_INSTRUCTIONS = (
 
 
 CITE_AND_STATS = "Cite the url. " + STATS_RULE
+CAPABILITY_BOUNDARY_INSTRUCTIONS = RESPONSE_GUARDRAILS_TEXT
 
 # What the agent reads when it lists the tools. They are written for the agent: what each tool is
 # for, when to use it, and what to do with what comes back. Implementation detail stays in code comments.
 SEARCH_DESCRIPTION = (
     "Search the Sujeeth Foundation website and GitHub wiki together. Use this first for the visitor's "
     "question. MCP uses Azure GPT-6 Luna to resolve the wording against the full ontology, follow "
-    "enabled concept relationships, and generate related search queries. It validates the selected "
+    "enabled concept relationships, and generate three distinct career-topic queries plus one optional "
+    "feeling-aware query tied to that career context. It validates the selected "
     "concept IDs and approved website domains, then sends the primary query and its related variants together "
     "in one request to each search service. "
     "Do not classify a question as out of scope yourself; rely on this tool's out_of_scope result. "
@@ -1436,10 +1470,11 @@ SERVER_INSTRUCTIONS = (
     "Knowledge about the Sujeeth Foundation: its Career Circles student mentorship program, mentoring, "
     "volunteering, donating and partnering. Start with search_sujeeth_foundation; it searches the "
     "website and the wiki together"
-    + (", and can send same-topic query variants together in one search request. " if MAX_QUERIES > 1 else ". ")
+    + (", and sends three career-topic queries plus an optional career-contextual feeling query together in one search request. " if MAX_QUERIES > 1 else ". ")
     + "Results are excerpts. "
     + f"If the excerpts do not answer the question, call get_documents once with the urls you need "
     f"(at most {MAX_BATCH_DOCUMENTS}). Cite the url for every claim. " + STATS_RULE
+    + " " + CAPABILITY_BOUNDARY_INSTRUCTIONS
     + " If a search comes back out_of_scope, reply with its message as written and nothing from "
     "general knowledge. Ask a clarifying question only when the response has needs_clarification true."
 )
@@ -1972,6 +2007,9 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         resolution = {"status": "unavailable"}
         concepts, domains = [], []
         errors.append({"service": "ontology", **error_result(exc)})
+    query_plan = resolution.get("query_plan") or {}
+    timings["topic_query_count"] = len(query_plan.get("topic_queries") or queries)
+    timings["feeling_query_included"] = bool(query_plan.get("feeling_query"))
 
     if concepts:
         wiki_pool = ThreadPoolExecutor(max_workers=1)
@@ -2068,6 +2106,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
             "website_candidates": len(website.get("results", []) or []),
             "wiki_candidates": len(wiki_items),
             "search_mode": website.get("search_mode"),
+            "query_plan": resolution.get("query_plan", {"topic_queries": queries, "feeling_query": None}),
             **({"domains": website.get("domains", domains)} if VERBOSE_ONTOLOGY else {}),
         },
         "count": len(results),
@@ -2076,6 +2115,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         "full_documents": documents_summary,
         "results": results,
         "service_errors": errors,
+        "response_guardrails": RESPONSE_GUARDRAILS,
         **quality,
     }
     timings["tool_response_ready_ms"] = round((time.perf_counter() - request_started) * 1000)
@@ -2270,7 +2310,8 @@ def get_documents(urls: list[str], max_chars: int = DOCUMENT_DEFAULT_CHARS) -> d
     response = {
         "count": len(documents),
         "documents": documents,
-        "agent_instructions": GET_DOCUMENTS_INSTRUCTIONS,
+        "agent_instructions": RESPONSE_GUARDRAILS_TEXT + " " + GET_DOCUMENTS_INSTRUCTIONS,
+        "response_guardrails": RESPONSE_GUARDRAILS,
     }
     if skipped:
         response["not_read"] = skipped
