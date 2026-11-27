@@ -1255,6 +1255,11 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None, retrieval_c
             "queries": queries, "error": None}
 
 
+def search_concepts(resolution):
+    """The concepts that filter and rank a search: matched_concepts less any feelings framework the question did not call for."""
+    return resolution.get("search_concepts") or resolution.get("matched_concepts") or []
+
+
 def add_feelings_frameworks(plan, catalog):
     """Resolve recognized feelings through the ontology API and append its ranked framework concepts.
 
@@ -1288,12 +1293,19 @@ def add_feelings_frameworks(plan, catalog):
             framework_details.append({key: framework[key] for key in
                                       ("framework_id", "framework_name", "matched_feelings", "intent_match",
                                        "ranking_score", "guardrail") if key in framework})
-        concepts = list(dict.fromkeys((resolution.get("matched_concepts") or []) + framework_ids))
+        direct = list(resolution.get("matched_concepts") or [])
+        concepts = list(dict.fromkeys(direct + framework_ids))
         resolution["matched_concepts"] = concepts
+        # A framework the API did not tie to the question's intent is guidance for the agent (its guardrail says when
+        # to foreground it), not a topic of the question, so it neither filters nor ranks the search. A question with
+        # nothing else to search on keeps all of them.
+        intent_ids = [row["framework_id"] for row in framework_details if row.get("intent_match")]
+        search = list(dict.fromkeys(direct + intent_ids)) or concepts
+        resolution["search_concepts"] = search
         resolution["domains"] = list(dict.fromkeys(
             row["domain"] for row in catalog.get("domains", [])
             if isinstance(row, dict) and row.get("search_enabled") and row.get("domain")
-            and set(concepts).intersection(row.get("associated_concepts") or [])
+            and set(search).intersection(row.get("associated_concepts") or [])
         ))
         resolution["concept_matches"] = (resolution.get("concept_matches") or []) + [
             {"concept_id": framework_id, "source": "feelings_api"} for framework_id in framework_ids
@@ -2074,7 +2086,7 @@ def search_website(
     try:
         plan = resolve_ontology_plan(query)
         resolution = plan["resolution"]
-        concepts, domains = resolution.get("matched_concepts") or [], resolution.get("domains") or []
+        concepts, domains = search_concepts(resolution), resolution.get("domains") or []
         if not concepts:
             return {"status": "out_of_scope", "out_of_scope": True, "message": OUT_OF_SCOPE_MESSAGE,
                     "ontology": resolution_summary(resolution), "count": 0, "results": [],
@@ -2152,7 +2164,7 @@ def search_wiki(
     try:
         plan = resolve_ontology_plan(query)
         resolution = plan["resolution"]
-        concepts, domains = resolution.get("matched_concepts") or [], resolution.get("domains") or []
+        concepts, domains = search_concepts(resolution), resolution.get("domains") or []
         if not concepts:
             return {"status": "out_of_scope", "out_of_scope": True, "message": OUT_OF_SCOPE_MESSAGE,
                     "ontology": resolution_summary(resolution), "count": 0, "results": [],
@@ -2294,7 +2306,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     # derives approved domains. An unavailable model is a service failure, never an out-of-scope verdict.
     try:
         resolution = _plan["resolution"]
-        concepts = resolution.get("matched_concepts") or []
+        concepts = search_concepts(resolution)
         domains = resolution.get("domains") or []
         if resolution.get("status") == "unavailable":
             raise _plan.get("error") or RuntimeError("Ontology resolution is unavailable")
