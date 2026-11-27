@@ -53,6 +53,15 @@ def test_a_matched_concept_brings_its_tools_best_first():
     assert found[1]["why"] == "Teal helps students."          # no reason on the edge: the definition
 
 
+def test_an_mcp_address_and_where_it_is_available_come_through(monkeypatch):
+    catalog = {**CATALOG, "classes": [tool("youspot", "YouSpot", mcp_url="https://example.org/mcp",
+                                           available_in=["Claude connector directory", "ChatGPT", 7])]}
+    found = server.suggest_tools(catalog, ["networking"], "asked")
+    assert found[0]["mcp_url"] == "https://example.org/mcp"
+    assert found[0]["available_in"] == ["Claude connector directory", "ChatGPT"]
+    assert "mcp_url" not in server.suggest_tools(CATALOG, ["networking"], "asked")[0]
+
+
 def test_only_tools_for_matched_concepts_are_offered():
     assert names(server.suggest_tools(CATALOG, ["resume_resource"], "fits")) == ["teal"]
     assert server.suggest_tools(CATALOG, ["unrelated"], "asked") == []

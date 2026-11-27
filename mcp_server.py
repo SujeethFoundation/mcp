@@ -1129,7 +1129,8 @@ def call_ontology_model(query, model_context, retrieval_context=None):
 def suggest_tools(catalog, concepts, tool_intent):
     """Tools the ontology says support the matched concepts, best first, when the question asks for a tool or one fits.
 
-    A tool is a class with category "tool" (name, definition and a `tool` object with url, kind, connect and fit_when).
+    A tool is a class with category "tool" (name, definition and a `tool` object with url, kind, connect, fit_when and,
+    for a tool that has one, mcp_url and available_in).
     A relationship `tool --supports--> skill` (optional `weight` 0 to 1 and `reason`) says what it helps with. Nothing is
     added to the search: this only decides which tools the agent may offer, and the agent is told to offer one only
     when it fits the question."""
@@ -1163,7 +1164,9 @@ def suggest_tools(catalog, concepts, tool_intent):
         suggestions.append({key: value for key, value in {
             "id": tool_id, "name": row.get("name") or tool_id, "url": detail["url"], "kind": detail.get("kind"),
             "why": entry["reason"] or " ".join(str(row.get("definition") or "").split()) or None,
-            "connect": detail.get("connect"), "fit_when": detail.get("fit_when"), "supports": entry["supports"],
+            "connect": detail.get("connect"), "mcp_url": detail.get("mcp_url"),
+            "available_in": [str(x) for x in detail.get("available_in") or [] if isinstance(x, str)] or None,
+            "fit_when": detail.get("fit_when"), "supports": entry["supports"],
         }.items() if value})
     return suggestions
 
