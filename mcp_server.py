@@ -90,6 +90,7 @@ ONTOLOGY_MODEL_CANDIDATE_LIMIT = max(1, int(setting("MCP_ONTOLOGY_MODEL_CANDIDAT
 ONTOLOGY_MODEL_RELATIONSHIP_LIMIT = max(0, int(setting("MCP_ONTOLOGY_MODEL_RELATIONSHIP_LIMIT", "24") or 24))
 ONTOLOGY_MODEL_DEFINITION_MAX_CHARS = max(40, int(setting("MCP_ONTOLOGY_MODEL_DEFINITION_MAX_CHARS", "240") or 240))
 _ontology_model_slots = threading.BoundedSemaphore(ONTOLOGY_MODEL_MAX_CONCURRENCY)
+_ontology_model_waiting = [0]          # resolutions on this instance waiting for one of the slots above, for the timing line
 
 TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
 
@@ -1084,13 +1085,25 @@ def call_ontology_model(query, model_context, retrieval_context=None):
                "max_output_tokens": ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS, "store": False,
                "text": {"format": {"type": "json_schema", "name": "ontology_search_plan", "strict": True,
                                    "schema": ONTOLOGY_PLAN_SCHEMA}}}
+    queue_wait = 0.0                   # seconds spent waiting for a slot, all attempts; the HTTP time is the rest
+    waiting_behind = 0
     for attempt in range(1, ONTOLOGY_MODEL_RETRY_ATTEMPTS + 1):
-        with _ontology_model_slots:
+        queued = time.perf_counter()
+        _ontology_model_waiting[0] += 1
+        try:
+            _ontology_model_slots.acquire()
+        finally:
+            _ontology_model_waiting[0] -= 1
+        waiting_behind = max(waiting_behind, _ontology_model_waiting[0])
+        queue_wait += time.perf_counter() - queued
+        try:
             response = http.post(
                 ontology_model_responses_url(ONTOLOGY_MODEL_ENDPOINT),
                 headers={"api-key": ONTOLOGY_MODEL_API_KEY, "Content-Type": "application/json"},
                 json=request, timeout=max(1.0, deadline - time.monotonic()),
             )
+        finally:
+            _ontology_model_slots.release()
         try:
             response.raise_for_status()
             break
@@ -1105,7 +1118,8 @@ def call_ontology_model(query, model_context, retrieval_context=None):
     usage = payload.get("usage") if isinstance(payload, dict) else {}
     usage = usage if isinstance(usage, dict) else {}
     input_details = usage.get("input_tokens_details") or usage.get("prompt_tokens_details") or {}
-    print(f"ontology_model_timing_ms {json.dumps({'duration_ms': round((time.perf_counter() - model_started) * 1000), 'input_tokens': usage.get('input_tokens', usage.get('prompt_tokens')), 'output_tokens': usage.get('output_tokens', usage.get('completion_tokens')), 'cached_input_tokens': input_details.get('cached_tokens') if isinstance(input_details, dict) else None, 'context_mode': model_context.get('packet_type', 'direct'), 'context_classes': len(model_context.get('classes') or []), 'context_relationships': len(model_context.get('relationships') or []), 'context_chars': len(json.dumps(model_context, ensure_ascii=False, separators=(',', ':')))})}",
+    output_details = usage.get("output_tokens_details") or usage.get("completion_tokens_details") or {}
+    print(f"ontology_model_timing_ms {json.dumps({'duration_ms': round((time.perf_counter() - model_started) * 1000), 'queue_wait_ms': round(queue_wait * 1000), 'waiting_behind': waiting_behind, 'attempts': attempt, 'status': payload.get('status') if isinstance(payload, dict) else None, 'reasoning_tokens': output_details.get('reasoning_tokens') if isinstance(output_details, dict) else None, 'input_tokens': usage.get('input_tokens', usage.get('prompt_tokens')), 'output_tokens': usage.get('output_tokens', usage.get('completion_tokens')), 'cached_input_tokens': input_details.get('cached_tokens') if isinstance(input_details, dict) else None, 'context_mode': model_context.get('packet_type', 'direct'), 'context_classes': len(model_context.get('classes') or []), 'context_relationships': len(model_context.get('relationships') or []), 'context_chars': len(json.dumps(model_context, ensure_ascii=False, separators=(',', ':')))})}",
           file=sys.stderr, flush=True)
     return json.loads(_responses_output_text(payload))
 
