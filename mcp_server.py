@@ -1204,10 +1204,11 @@ def suggest_tools(catalog, concepts, tool_intent):
         suggestions.append({key: value for key, value in {
             "id": tool_id, "name": row.get("name") or tool_id, "url": detail["url"], "kind": detail.get("kind"),
             "why": entry["reason"] or " ".join(str(row.get("definition") or "").split()) or None,
+            "provider": detail.get("provider"), "foundation_owned": bool(detail.get("foundation_owned")),
             "connect": detail.get("connect"), "mcp_url": detail.get("mcp_url"),
             "available_in": [str(x) for x in detail.get("available_in") or [] if isinstance(x, str)] or None,
             "fit_when": detail.get("fit_when"), "supports": entry["supports"],
-        }.items() if value})
+        }.items() if value or key == "foundation_owned"})
     return suggestions
 
 
@@ -1593,6 +1594,13 @@ NO_RESULTS_INSTRUCTIONS = (
 
 
 # How the agent places a tool among the Foundation's own guidance. Tools support the guidance; they do not replace it.
+TOOLS_OWNERSHIP_INSTRUCTIONS = (
+    "A tool with foundation_owned false is made by another company, named in `provider`: say so (\"YouSpot, from HubSpot\"), "
+    "call it a third-party tool the Foundation does not own or run, and never write \"the Foundation's\" tool. Mention the "
+    "Foundation only for what it actually offers: its own materials that talk about the tool, if a result shows that. Do "
+    "not imply the Foundation endorses, partners with, or is paid by the provider. Only a tool with foundation_owned true "
+    "is the Foundation's own."
+)
 TOOLS_ASKED_INSTRUCTIONS = (
     "The visitor asked for a tool, so open by answering that directly with the tool, then give the Foundation's guidance "
     "from the results as how to get the most from it (for example, \"Pair it with the Foundation's Week 3 advice to...\"). "
@@ -1698,8 +1706,9 @@ def assess_quality(resolution, results, errors):
             "those that fit what the visitor asked, never all of them. Write each in one or two plain sentences: its name "
             "as a link, what it does for this task (use `why`), and how to start (use `connect` as written). Add nothing "
             "about what the tool contains or does beyond `why`, and no filler such as \"explore its tools\". "
+            + TOOLS_OWNERSHIP_INSTRUCTIONS + " "
             + (TOOLS_ASKED_INSTRUCTIONS if resolution.get("tool_intent") == "asked" else TOOLS_FITS_INSTRUCTIONS)
-            + " Never present a tool as required, as the whole answer, or as something you used or can run for them."
+            + " Treat a tool as an option, never as required or as the whole answer, and do not say that it is optional or that you did not use it. Do not say you used a tool or can run it, and do not describe these rules to the visitor."
         )
     if service_degraded:
         instructions += (
