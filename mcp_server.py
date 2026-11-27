@@ -103,6 +103,7 @@ TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
 # once with HTTP 503 and a Retry-After header (LOCAL_INDEX_FAIL_FAST on that app), so the request can be tried again
 # in a moment instead of waiting on a busy instance. Connection errors are retried too. Every attempt together stays
 # within MCP_REQUEST_TIMEOUT, so a caller never waits longer than it did without retries.
+WEBSEARCH_SEARCH_TIMEOUT = max(1, int(setting("MCP_WEBSEARCH_SEARCH_TIMEOUT", "12") or 12))   # all tries of one website search together; the wiki results do not wait longer than this for it
 RETRY_ATTEMPTS = max(1, int(setting("MCP_RETRY_ATTEMPTS", "4") or 4))                 # tries in all, the first included; 1 = no retry
 RETRY_DEFAULT_WAIT = float(setting("MCP_RETRY_DEFAULT_WAIT_SECONDS", "3") or 3)       # wait when the 503 has no Retry-After
 RETRY_MAX_WAIT = float(setting("MCP_RETRY_MAX_WAIT_SECONDS", "8") or 8)               # longest single wait, whatever Retry-After says
@@ -480,20 +481,21 @@ def _why(exc):
     return type(exc).__name__
 
 
-def post_json_with_retry(url, payload, key="", attempts=None):
+def post_json_with_retry(url, payload, key="", attempts=None, timeout=None):
     """post_json, tried again when the search app is still loading or briefly unreachable.
 
-    All tries together take at most MCP_REQUEST_TIMEOUT seconds: each try is given only the time that is left, and a
+    All tries together take at most MCP_REQUEST_TIMEOUT seconds (or `timeout`, when it is shorter): each try is given only the time that is left, and a
     retry is made only if at least MCP_RETRY_MIN_ATTEMPT_SECONDS would remain after the wait. The last failure is
     raised as before, so callers handle it exactly as they did without retries. Every try is counted in the downstream
     numbers, and each retry also in "retries"."""
     attempts = RETRY_ATTEMPTS if attempts is None else max(1, int(attempts))
-    deadline = _clock() + TIMEOUT
+    budget = TIMEOUT if timeout is None else max(1.0, min(float(TIMEOUT), float(timeout)))
+    deadline = _clock() + budget
     attempt = 0
     while True:
         attempt += 1
         try:
-            return post_json(url, payload, key, timeout=max(1.0, min(float(TIMEOUT), deadline - _clock())))
+            return post_json(url, payload, key, timeout=max(1.0, min(budget, deadline - _clock())))
         except Exception as exc:
             wait = _retry_wait(exc) if attempt < attempts else None
             if wait is None:
@@ -2161,7 +2163,7 @@ def search_website(
             f"{WEBSEARCH_URL}/api/search",
             {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
              "ontology_version": resolution.get("ontology_version"), "purpose": "search",
-             "limit": max(1, min(int(limit), 5))}, WEBSEARCH_KEY)
+             "limit": max(1, min(int(limit), 5))}, WEBSEARCH_KEY, timeout=WEBSEARCH_SEARCH_TIMEOUT)
         items, seen = [], set()
         for item in payload.get("results", []) or []:
             identity = page_identity(item)
@@ -2401,7 +2403,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                 f"{WEBSEARCH_URL}/api/search",
                 {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
                  "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
-                WEBSEARCH_KEY,
+                WEBSEARCH_KEY, timeout=WEBSEARCH_SEARCH_TIMEOUT,
             )
             # MCP's authorization decision remains authoritative; Websearch only reports/filter-searches results.
             website["resolution"] = resolution

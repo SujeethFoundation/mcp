@@ -142,6 +142,7 @@ The slim catalog does not carry the search domains. When the catalog has no `dom
 | `MCP_TRUSTED_KEY_HEADER` | `x-mcp-client-key` | Name of the header that carries that secret |
 | `MCP_TRUSTED_USER_AGENTS` | empty (off) | Optional regular expression. A matching User-Agent counts as trusted. It can be faked, so it only picks the bucket |
 | `MCP_REQUEST_TIMEOUT` | `30` | Seconds to wait for a backend |
+| `MCP_WEBSEARCH_SEARCH_TIMEOUT` | `12` | Seconds all tries of one website search may take together. A search app that is still loading its index (503) or slow no longer holds the whole answer for `MCP_REQUEST_TIMEOUT`: the wiki results are returned with `status: partial` and the agent is told the website search failed. Wiki, ontology and document calls keep `MCP_REQUEST_TIMEOUT` |
 | `MCP_RETRY_ATTEMPTS` | `4` | Tries in all (the first included) for a call to the website search app that is refused with HTTP 503 (an instance still loading its index, when `LOCAL_INDEX_FAIL_FAST` is on there) or cannot be reached. `1` turns retries off. All tries together stay within `MCP_REQUEST_TIMEOUT` |
 | `MCP_RETRY_DEFAULT_WAIT_SECONDS` | `3` | Wait before a retry when the 503 has no `Retry-After` header, and after a connection error |
 | `MCP_RETRY_MAX_WAIT_SECONDS` | `8` | Longest single wait, whatever `Retry-After` says |
