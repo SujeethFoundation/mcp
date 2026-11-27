@@ -809,7 +809,7 @@ TOPIC_QUERY_COUNT = 3
 MAX_RESOLVED_QUERIES = max(TOPIC_QUERY_COUNT + 1, min(int(setting("SEARCH_MAX_QUERIES", "4") or 4), 5))
 ONTOLOGY_RESOLUTION_PROMPT = f"""Route the user's question for the Sujeeth Foundation using the supplied ontology candidate packet. Match against concept names, definitions, aliases, query phrases, and relevant relationships; do not infer Foundation topics from general knowledge. Return only concept IDs present in the supplied packet. Relationship edges are subject-predicate-object triples; `predicate_search_behavior` gives the default retrieval rule, with any edge-level `search_behavior` overriding it.
 Return direct concept IDs for the user's topic. Also return the Mood Meter feeling IDs explicitly identified or clearly described in the question, and at most one canonical intent from the ontology's relationship intent tags when a feeling is present. Add related IDs only when an ontology relationship supports generic retrieval. For `illustrates`, a matched object may retrieve its subject as an example; never reverse that direction. Do not use an edge marked `retrieval.general_search_expand=false` or `retrieval.search_expansion=feelings_api_only` for generic expansion; those are resolved only by the Feelings API. Follow other relationships only as their declared search behavior allows. Return only IDs in the ontology.
-Preserve the user's intent. A `conversation_context` field may name one feeling from the immediately preceding conversation turn and the current career context. Treat it only as a candidate: use it only when the current question continues that career context, and otherwise ignore it. Return exactly {TOPIC_QUERY_COUNT} distinct, short `topic_queries` for the active career question: one direct answer path, one related concept or approach, and one practical guidance or example path. Do not make superficial rewrites of the same query. When a feeling is explicitly identified or clearly remains relevant through `conversation_context`, return one `feeling_query` that addresses that feeling in the active career context. For example, use "managing nervousness when networking", never anxiety in general. Do not invent a feeling, and return null for `feeling_query` when no feeling is relevant or no active career context is present. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
+Preserve the user's intent. A `conversation_context` field names the feeling and the career context that are active in the conversation so far, taken from the last turn or from a summary of it; both count as active. Use it when the current question continues that career context, including a short follow-up that does not repeat the topic ("is there an easy way to research a person?" after networking is a networking question), and include that career context's concept in matched_concepts when you do. Ignore it when the question is about something else. Return exactly {TOPIC_QUERY_COUNT} distinct, short `topic_queries` for the active career question: one direct answer path, one related concept or approach, and one practical guidance or example path. Do not make superficial rewrites of the same query. When a feeling is explicitly identified or clearly remains relevant through `conversation_context`, return one `feeling_query` that addresses that feeling in the active career context. For example, use "managing nervousness when networking", never anxiety in general. Do not invent a feeling, and return null for `feeling_query` when no feeling is relevant or no active career context is present. Ask one clarification only when two materially different in-scope interpretations remain. An empty direct matched_concepts list means out of scope. A lack of search results does not mean out of scope."""
 
 ONTOLOGY_PLAN_SCHEMA = {
     "type": "object", "additionalProperties": False,
@@ -899,8 +899,13 @@ def is_feelings_api_only_edge(relationship):
 def ontology_model_context(query, catalog, retrieval_context=None):
     """Build a bounded candidate packet; unknown wording gets a terse all-concept fallback."""
     candidates = ontology_candidate_ids(query, catalog)
-    if retrieval_context and retrieval_context["feeling"] not in candidates:
-        candidates = [retrieval_context["feeling"], *candidates][:ONTOLOGY_MODEL_CANDIDATE_LIMIT]
+    if retrieval_context:
+        # The active career context goes into the packet too, so the model can pick it as a matched concept.
+        class_ids = {str(row.get("id")) for row in catalog.get("classes", []) if isinstance(row, dict) and row.get("id")}
+        carried = [cid for cid in (retrieval_context["feeling"], retrieval_context["career_context"])
+                   if cid in class_ids and cid not in candidates]
+        if carried:
+            candidates = [*carried, *candidates][:ONTOLOGY_MODEL_CANDIDATE_LIMIT]
     if not candidates:
         context = compact_ontology_catalog(catalog, include_relationships=False)
         context["packet_type"] = "full_fallback"
@@ -1076,7 +1081,8 @@ def call_ontology_model(query, model_context, retrieval_context=None):
     deadline = time.monotonic() + ONTOLOGY_MODEL_TIMEOUT
     payload = {"ontology": model_context, "question": query}
     if retrieval_context:
-        payload["conversation_context"] = retrieval_context
+        # Where the caller got the context from (last turn, summary) says nothing about whether it is still active.
+        payload["conversation_context"] = {key: value for key, value in retrieval_context.items() if key != "source"}
     request = {"model": ONTOLOGY_MODEL_NAME, "instructions": ONTOLOGY_RESOLUTION_PROMPT,
                "input": json.dumps(payload, ensure_ascii=False,
                                    separators=(",", ":")),
