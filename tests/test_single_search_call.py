@@ -236,7 +236,7 @@ def test_model_resolution_accepts_related_ontology_concepts_and_generates_querie
                             "associated_concepts": ["career_development", "career_story"]}]}
     plan = server.validate_ontology_plan({"matched_concepts": ["career_development", "not_in_ontology"],
                                           "related_concepts": ["career_story", "not_in_ontology"],
-                                          "queries": ["research companies", "compare employers"]},
+                                          "topic_queries": ["research companies", "compare employers", "salary data"]},
                                          "how can I research a company?", catalog)
     assert plan["resolution"]["matched_concepts"] == ["career_development", "career_story"]
     assert plan["resolution"]["domains"] == ["sujeeth.org"]
