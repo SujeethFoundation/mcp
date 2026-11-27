@@ -112,6 +112,7 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 | `MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS` | `5` | Maximum wait before one Luna retry; MCP honors `retry-after-ms` and adds jitter |
 | `MCP_ONTOLOGY_MODEL_CANDIDATE_LIMIT` | `8` | Maximum locally matched concepts sent to Luna before one-hop relationship expansion |
 | `MCP_ONTOLOGY_MODEL_RELATIONSHIP_LIMIT` | `24` | Maximum one-hop relationships in a Luna candidate packet |
+| `MCP_SUGGESTED_TOOLS_MAX` | `2` | Most tools offered with one answer (`suggested_tools`); `0` turns tool suggestions off |
 | `MCP_ONTOLOGY_MODEL_DEFINITION_MAX_CHARS` | `240` | Maximum definition characters sent for a directly matched concept |
 | `MCP_ONTOLOGY_PLAN_CACHE_SECONDS` | `300` | How long each MCP instance reuses a validated ontology plan for a normalized query and ontology version; `0` disables it |
 | `MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES` | `500` | Maximum cached ontology plans per MCP instance before older entries are evicted |
@@ -235,3 +236,11 @@ Local tests that use admin tools need `MCP_ADMIN_TOOLS=true`. Search results dep
 | Deployed app returns 502 or never becomes healthy | `MCP_PORT` does not match `port` in `host.json`, or the Python version in the workflow does not match the app's runtime |
 | HTTP 429 | A rate limit was reached. Wait for the `Retry-After` interval or raise the limit |
 | `Unknown tool: check_services` | Admin tools are off. Set `MCP_ADMIN_TOOLS=true` for local testing only |
+
+## Suggested tools
+
+Students can connect some tools themselves (for example YouSpot for researching people before a networking message, or the Foundation's own MCP server). The ontology describes them and MCP offers them when they fit; they never change what is searched.
+
+- **In the ontology.** A tool is a class with `category: "tool"`, a `name`, a `definition`, and a `tool` object: `url` (required), `kind` (`app` or `mcp`), `connect` (what the student does to start, in the words the agent should use), and `fit_when`. A relationship `tool` `supports` `skill` says what it helps with, with an optional `weight` (0 to 1, default 0.5) and `reason` (one line on why it helps).
+- **In the plan.** The model returns `tool_intent`: `asked` (the person asked for a tool), `fits` (a practical how-to where a tool is a natural next step) or `none` (including feeling-only questions).
+- **In the response.** Unless `tool_intent` is `none`, `suggested_tools` lists up to `MCP_SUGGESTED_TOOLS_MAX` tools that support a matched concept, best weight first. `agent_instructions` tells the agent to offer one only when it fits, as an option, and never as required or as something it ran. For `fits`, the agent answers first and mentions at most one at the end.
