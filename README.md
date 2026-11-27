@@ -8,7 +8,25 @@ A Model Context Protocol (MCP) server that lets AI assistants search and read Su
 | Wiki Search | `wikisearch` | Keyword search excerpts for the GitHub wiki; `get_documents` reads selected pages |
 | Ontology | `ontology` | Concepts, relationships, and which domains are approved |
 
-The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mcp` locally and `https://mcp.sujeeth.org/mcp` in production.
+## Platform architecture
+
+The Sujeeth Foundation helps college students network into their first job through Career Circles, a six-week mentorship program. Students, mentors and partners use two front ends, the static site at sujeeth.org and a Power Pages portal, both on one Dataverse environment. Azure Function apps add chat, knowledge search, payments, short links and texting. The Dataverse side (Base Camp, circles, book requests, surveys, credentials, the Career Ascent course) ships as Dataverse solutions and has no repo.
+
+| Repo (README) | Role |
+|---|---|
+| [`sujeethfoundation.github.io`](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/README.md) | Website at sujeeth.org, wiki, Discussions, course player and Power Pages CSS |
+| [`chat`](https://github.com/SujeethFoundation/chat/blob/main/README.md) | Chat API behind the site's assistant widget |
+| [`mcp`](https://github.com/SujeethFoundation/mcp/blob/main/README.md) | MCP server (the "Sujeeth Foundation Graph") that AI assistants use to search Foundation knowledge |
+| [`ontology`](https://github.com/SujeethFoundation/ontology/blob/main/README.md) | Concept graph and governance: concepts, approved domains, Feelings API |
+| [`websearch`](https://github.com/SujeethFoundation/websearch/blob/main/README.md) | Crawler and hybrid search over ontology-approved websites |
+| [`wikisearch`](https://github.com/SujeethFoundation/wikisearch/blob/main/README.md) | Keyword search over the GitHub wiki |
+| [`payments`](https://github.com/SujeethFoundation/payments/blob/main/README.md) | PayPal checkout and webhook for online courses |
+| [`shortner`](https://github.com/SujeethFoundation/shortner/blob/main/README.md) | Link shortener for go.sujeeth.org |
+| [`acs-sms-bot`](https://github.com/SujeethFoundation/acs-sms-bot/blob/main/readme.md) | Texting through Azure Communication Services |
+
+Architecture docs, in the website repo's `architecture/` folder: [platform architecture](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/platform-architecture.md) (repos, Azure apps, how they connect), [data model and portal](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/platform-data-model-and-portal.md) (Dataverse tables, solutions, Power Pages) and [business architecture](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/business-architecture.md) (vision, assumptions, tests). This block is the same in every repo's README; the canonical copy is in the platform architecture doc.
+
+**This repo:** called by the Foundation's chat agent (the `chat` repo) and by hosted AI assistants such as Claude and ChatGPT. It calls `ontology`, `websearch` and `wikisearch`. The MCP endpoint is `/mcp` on whatever host serves it: `http://127.0.0.1:8000/mcp` locally and `https://mcp.sujeeth.org/mcp` in production.
 
 ## Tools
 
@@ -183,7 +201,7 @@ Local testing of the Functions setup needs Azure Functions Core Tools (`func sta
 - **Foundry does not publish a stable address for its tool calls**, so identify the Foundry project with a key. Set `MCP_TRUSTED_KEY` on this app, then in the Foundry project add the MCP tool with key-based authentication and the same value under the header name in `MCP_TRUSTED_KEY_HEADER`. Foundry keeps the secret in the project connection, so the agent never sees it. OpenAI says its own ranges are best effort and that addresses outside the manifest have appeared before, so watch for `rate_limited bucket=public` lines from OpenAI addresses and add them to `MCP_TRUSTED_RANGES`.
 - **Tools run on worker threads.** FastMCP calls a plain `def` tool directly on the event loop, so before this change one instance answered one tool call at a time and `/healthz` stalled behind every search. In a load test of 10 searches a second, requests waited 25 seconds while the server's own timer showed under 1 second per search, and Application Insights showed the app scaling to 5 instances that together completed about 6 a second. Every tool is now wrapped with `in_thread`, and a test fails if one is added without it. Code that calls a tool function directly from a plain thread, as the warm-up does, must use `tool.sync(...)`; calling the wrapper returns a coroutine that never runs. This is also why the Flex Consumption per-instance HTTP concurrency setting (default 4 at 512 MB) only helps now: it lets the platform send an instance several requests at once, which the server can finally work on together.
 - **Throttling is logged.** Each throttled address writes one line per minute: `rate_limited bucket=public|trusted|global ip=... limit_per_minute=...`. These lines contain client addresses. Search the log for them first when a tool call fails with no other explanation.
-- **Each search can spend money.** Every search calls the websearch app, which uses Azure AI Search and the embedding deployment. Keep a budget alert on those resources.
+- **Each search can spend money.** Every search calls the websearch app, which embeds the question (see its README). Keep a budget alert on the embedding resource and on the Function Apps.
 - **Scaling.** Flex Consumption adds instances as requests arrive, up to the maximum you set. Stateless mode is what makes that safe. The always-ready instances keep the first request from waiting on a cold start.
 - **Preview status.** Hosting your own SDK-based MCP server on Azure Functions is in public preview. Check the Azure documentation before relying on it for something with a service-level agreement.
 - **Browser-based clients.** The server does not add CORS headers. Clients that connect server to server (hosted AI assistants and developer tools) are unaffected.
