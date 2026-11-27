@@ -86,6 +86,7 @@ ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS = max(100, int(setting("MCP_ONTOLOGY_MODEL_MAX_
 ONTOLOGY_MODEL_MAX_CONCURRENCY = max(1, int(setting("MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY", "4") or 4))
 ONTOLOGY_MODEL_RETRY_ATTEMPTS = max(1, int(setting("MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS", "3") or 3))
 ONTOLOGY_MODEL_RETRY_MAX_WAIT = max(0.25, float(setting("MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS", "5") or 5))
+SUGGESTED_TOOLS_MAX = max(0, int(setting("MCP_SUGGESTED_TOOLS_MAX", "2") or 0))   # tools offered with one answer; 0 turns tool suggestions off
 ONTOLOGY_MODEL_CANDIDATE_LIMIT = max(1, int(setting("MCP_ONTOLOGY_MODEL_CANDIDATE_LIMIT", "8") or 8))
 ONTOLOGY_MODEL_RELATIONSHIP_LIMIT = max(0, int(setting("MCP_ONTOLOGY_MODEL_RELATIONSHIP_LIMIT", "24") or 24))
 ONTOLOGY_MODEL_DEFINITION_MAX_CHARS = max(40, int(setting("MCP_ONTOLOGY_MODEL_DEFINITION_MAX_CHARS", "240") or 240))
@@ -826,8 +827,9 @@ ONTOLOGY_PLAN_SCHEMA = {
         "feeling_query": {"type": ["string", "null"]},
         "needs_clarification": {"type": "boolean"},
         "suggested_question": {"type": ["string", "null"]},
+        "tool_intent": {"type": "string", "enum": ["asked", "fits", "none"]},
     },
-    "required": ["matched_concepts", "related_concepts", "feelings", "intent", "topic_queries", "feeling_query", "needs_clarification", "suggested_question"],
+    "required": ["matched_concepts", "related_concepts", "feelings", "intent", "topic_queries", "feeling_query", "needs_clarification", "suggested_question", "tool_intent"],
 }
 
 
@@ -1164,6 +1166,51 @@ def call_ontology_model(query, model_context, retrieval_context=None):
     return json.loads(_responses_output_text(payload))
 
 
+def suggest_tools(catalog, concepts, tool_intent):
+    """Tools the ontology says support the matched concepts, best first, when the question asks for a tool or one fits.
+
+    A tool is a class with category "tool" (name, definition and a `tool` object with url, kind, connect, fit_when and,
+    for a tool that has one, mcp_url and available_in).
+    A relationship `tool --supports--> skill` (optional `weight` 0 to 1 and `reason`) says what it helps with. Nothing is
+    added to the search: this only decides which tools the agent may offer, and the agent is told to offer one only
+    when it fits the question."""
+    if tool_intent not in ("asked", "fits") or not SUGGESTED_TOOLS_MAX or not concepts:
+        return []
+    tools = {str(row["id"]): row for row in catalog.get("classes", [])
+             if isinstance(row, dict) and row.get("id") and row.get("category") == "tool"
+             and isinstance(row.get("tool"), dict) and row["tool"].get("url")}
+    if not tools:
+        return []
+    matched = set(concepts)
+    found = {}
+    for rel in catalog.get("relationships", []):
+        if not isinstance(rel, dict) or str(rel.get("predicate", "")).lower() != "supports":
+            continue
+        tool_id, concept = str(rel.get("subject")), rel.get("object")
+        if tool_id not in tools or concept not in matched:
+            continue
+        try:
+            weight = min(1.0, max(0.0, float(rel.get("weight", 0.5))))
+        except (TypeError, ValueError):
+            weight = 0.5
+        entry = found.setdefault(tool_id, {"score": 0.0, "supports": [], "reason": None})
+        entry["supports"].append(str(concept))
+        if weight >= entry["score"]:
+            entry["score"], entry["reason"] = weight, rel.get("reason")
+    ranked = sorted(found.items(), key=lambda row: (-row[1]["score"], -len(row[1]["supports"]), row[0]))
+    suggestions = []
+    for tool_id, entry in ranked[:SUGGESTED_TOOLS_MAX]:
+        row, detail = tools[tool_id], tools[tool_id]["tool"]
+        suggestions.append({key: value for key, value in {
+            "id": tool_id, "name": row.get("name") or tool_id, "url": detail["url"], "kind": detail.get("kind"),
+            "why": entry["reason"] or " ".join(str(row.get("definition") or "").split()) or None,
+            "connect": detail.get("connect"), "mcp_url": detail.get("mcp_url"),
+            "available_in": [str(x) for x in detail.get("available_in") or [] if isinstance(x, str)] or None,
+            "fit_when": detail.get("fit_when"), "supports": entry["supports"],
+        }.items() if value})
+    return suggestions
+
+
 def validate_ontology_plan(result, query, catalog, allowed_ids=None, retrieval_context=None):
     """Validate model-selected concepts, relationship expansions, domains, and query variants."""
     valid_ids = {str(row["id"]) for row in catalog["classes"] if isinstance(row, dict) and row.get("id")}
@@ -1234,6 +1281,7 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None, retrieval_c
                 feeling_query.casefold() in {q.casefold() for q in topic_queries}):
             feeling_query = None
     queries = topic_queries + ([feeling_query] if feeling_query else [])
+    tool_intent = result.get("tool_intent") if result.get("tool_intent") in ("asked", "fits") else "none"
     suggested = result.get("suggested_question")
     suggested = " ".join(suggested.split()) if isinstance(suggested, str) else None
     needs_clarification = bool(result.get("needs_clarification") and matched and suggested and len(suggested) <= 300)
@@ -1244,6 +1292,8 @@ def validate_ontology_plan(result, query, catalog, allowed_ids=None, retrieval_c
                            "suggested_question": suggested if needs_clarification else None,
                            "feelings": feelings,
                            "intent": intent,
+                           "tool_intent": tool_intent,
+                           "suggested_tools": suggest_tools(catalog, concepts, tool_intent),
                            "query_plan": {"topic_queries": topic_queries,
                                           "feeling_query": feeling_query,
                                           "career_context_concepts": career_context_concepts,
@@ -1629,6 +1679,16 @@ def assess_quality(resolution, results, errors):
         "(for example Resume Resource and Week 3), do not ask which one the user meant. Lead with the "
         "guidance, then use the week's agenda as the worked example."
     )
+    tools = resolution.get("suggested_tools") or []
+    if tools:
+        instructions += (
+            " suggested_tools are optional tools the student connects or opens themselves. Mention one only when it fits "
+            "what the visitor asked, as an option with its link and why it helps"
+            + (" (they asked for tools, so lead with the one that fits best)" if resolution.get("tool_intent") == "asked"
+               else " (they did not ask for tools, so answer first and mention at most one at the end)")
+            + ". Never present a tool as required, as the whole answer, or as something you used or can run for them. "
+            "Use the connect text as written."
+        )
     if service_degraded:
         instructions += (
             " One or more search services failed, so results may be incomplete. "
@@ -1644,6 +1704,7 @@ def assess_quality(resolution, results, errors):
         "suggested_question": question,
         "agent_instructions": instructions,
         "response_guardrails": RESPONSE_GUARDRAILS,
+        **({"suggested_tools": tools} if tools else {}),
     }
 
 
