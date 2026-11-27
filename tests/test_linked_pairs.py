@@ -10,6 +10,9 @@ class Reply:
     def json(self):
         return self.data
 
+    def raise_for_status(self):
+        pass
+
 
 ONTOLOGY = {
     "predicates": [
@@ -67,10 +70,10 @@ def test_an_older_ontology_without_effects_still_links_illustrates_only():
 def test_the_pairs_are_reloaded_after_the_refresh_interval(monkeypatch):
     reset(monkeypatch)
     calls = []
-    versions = [{"relationships": [{"subject": "x", "predicate": "illustrates", "object": "y"}]},
-                {"relationships": [{"subject": "m", "predicate": "illustrates", "object": "n"}]}]
+    versions = [{"classes": [], "relationships": [{"subject": "x", "predicate": "illustrates", "object": "y"}]},
+                {"classes": [], "relationships": [{"subject": "m", "predicate": "illustrates", "object": "n"}]}]
 
-    def fake_get(url, timeout=None):
+    def fake_get(url, headers=None, timeout=None):
         calls.append(url)
         return Reply(versions[len(calls) - 1])
 
@@ -87,7 +90,7 @@ def test_a_failed_refresh_keeps_the_last_good_pairs_and_retries(monkeypatch):
     monkeypatch.setattr(server, "_linked_pairs", good)
     monkeypatch.setattr(server, "_linked_pairs_loaded_at", time.monotonic() - server.LINKED_PAIRS_REFRESH_SECONDS - 1)
 
-    def boom(url, timeout=None):
+    def boom(url, headers=None, timeout=None):
         raise RuntimeError("down")
 
     monkeypatch.setattr(server.requests, "get", boom)
@@ -97,6 +100,6 @@ def test_a_failed_refresh_keeps_the_last_good_pairs_and_retries(monkeypatch):
 
 def test_a_first_load_failure_is_not_cached(monkeypatch):
     reset(monkeypatch)
-    monkeypatch.setattr(server.requests, "get", lambda url, timeout=None: (_ for _ in ()).throw(RuntimeError("down")))
+    monkeypatch.setattr(server.requests, "get", lambda url, headers=None, timeout=None: (_ for _ in ()).throw(RuntimeError("down")))
     assert server.linked_concept_pairs() == set()
     assert server._linked_pairs is None

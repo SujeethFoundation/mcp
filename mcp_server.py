@@ -700,6 +700,32 @@ def resolution_summary(data):
 MCP_ONTOLOGY_JSON_URL = setting(
     "MCP_ONTOLOGY_URL", "https://raw.githubusercontent.com/SujeethFoundation/ontology/main/ontology/ontology.json"
 )
+# The slim catalog from the ontology app is the first choice: about a quarter of the file, with the edge defaults
+# already applied, the same view chat and websearch read. The raw file is the fallback, and the only source when
+# MCP_ONTOLOGY_URL is set on purpose.
+ONTOLOGY_CATALOG_URL = f"{ONTOLOGY_URL}/api/ontology/catalog"
+ONTOLOGY_CATALOG_ENABLED = not setting("MCP_ONTOLOGY_URL") and setting("MCP_ONTOLOGY_CATALOG", "true").lower() not in ("0", "false", "no")
+
+
+def fetch_ontology_json(timeout):
+    """The ontology as a dict: the slim catalog from the ontology app, else the raw file. Raises when neither answers
+    with an ontology (a dict with a list of classes), so a bad answer never replaces a good catalog."""
+    sources = []
+    if ONTOLOGY_CATALOG_ENABLED:
+        sources.append((ONTOLOGY_CATALOG_URL, {"x-functions-key": ONTOLOGY_KEY} if ONTOLOGY_KEY else {}))
+    sources.append((MCP_ONTOLOGY_JSON_URL, {}))
+    error = None
+    for url, headers in sources:
+        try:
+            response = requests.get(url, headers=headers, timeout=timeout)
+            response.raise_for_status()
+            data = response.json()
+            if isinstance(data, dict) and isinstance(data.get("classes"), list):
+                return data
+            error = ValueError("not an ontology")
+        except Exception as exc:
+            error = exc
+    raise error or RuntimeError("no ontology source")
 LINKED_PAIRS_REFRESH_SECONDS = max(60.0, float(setting("LINKED_PAIRS_REFRESH_HOURS", "24") or 24) * 3600)
 LINKING_EFFECTS = {"expand", "boost"}
 _linked_pairs: set | None = None
@@ -736,8 +762,7 @@ def linked_concept_pairs():
     stale = _linked_pairs_loaded_at is not None and now - _linked_pairs_loaded_at > LINKED_PAIRS_REFRESH_SECONDS
     if _linked_pairs is None or stale:
         try:
-            data = requests.get(MCP_ONTOLOGY_JSON_URL, timeout=min(5, TIMEOUT)).json()
-            pairs = pairs_from_ontology(data)
+            pairs = pairs_from_ontology(fetch_ontology_json(min(5, TIMEOUT)))
         except Exception:
             # Do not cache a failure: keep the last good set (empty on the first try) and try again next question.
             return _linked_pairs or set()
@@ -808,11 +833,7 @@ def ontology_catalog() -> dict | None:
     if _ontology_catalog is not None and _ontology_catalog_loaded_at is not None and now - _ontology_catalog_loaded_at < ONTOLOGY_CATALOG_REFRESH_SECONDS:
         return _ontology_catalog
     try:
-        response = requests.get(MCP_ONTOLOGY_JSON_URL, timeout=min(5, TIMEOUT))
-        response.raise_for_status()
-        data = response.json()
-        if isinstance(data, dict) and isinstance(data.get("classes"), list):
-            _ontology_catalog, _ontology_catalog_loaded_at = data, now
+        _ontology_catalog, _ontology_catalog_loaded_at = fetch_ontology_json(min(5, TIMEOUT)), now
     except Exception:
         pass  # A failed catalog read cannot turn an unknown question into an in-scope one.
     return _ontology_catalog
