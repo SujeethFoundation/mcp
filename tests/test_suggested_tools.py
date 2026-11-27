@@ -10,7 +10,8 @@ import mcp_server as server  # noqa: E402
 
 def tool(tool_id, name, url="https://example.org/" , **extra):
     return {"id": tool_id, "category": "tool", "name": name, "definition": f"{name} helps students.",
-            "tool": {"url": url + tool_id, "kind": "app", "connect": f"Open {name}.", "fit_when": f"when using {name}", **extra}}
+            "tool": {"url": url + tool_id, "kind": "app", "connect": f"Open {name}.", "fit_when": f"when using {name}",
+                     "provider": "Maker Co", "foundation_owned": tool_id == "foundation_mcp", **extra}}
 
 
 def helps_with(tool_id, concept, weight=None, reason=None):
@@ -123,12 +124,35 @@ def quality(intent):
 def test_the_response_lists_the_tools_and_tells_the_agent_how_to_offer_them():
     asked = quality("asked")
     assert names(asked["suggested_tools"]) == ["youspot", "teal"]
-    assert "suggested_tools are optional" in asked["agent_instructions"] and "they asked for tools" in asked["agent_instructions"]
-    assert "Never present a tool as required" in asked["agent_instructions"]
+    assert "suggested_tools are optional" in asked["agent_instructions"] and "The visitor asked for a tool" in asked["agent_instructions"]
+    assert "answer from the Foundation's guidance first" not in asked["agent_instructions"]
+    assert "Do not say you used a tool or can run it" in asked["agent_instructions"]
     fits = quality("fits")
-    assert "answer first and mention at most one at the end" in fits["agent_instructions"]
+    assert "answer from the Foundation's guidance first, then close with the tool" in fits["agent_instructions"]
+    assert "The visitor asked for a tool" not in fits["agent_instructions"]
+    for text in (asked["agent_instructions"], fits["agent_instructions"]):
+        assert "use `why`" in text and "use `connect` as written" in text and "no filler" in text
 
 
 def test_no_tools_means_no_field_and_no_instruction():
     none = quality("none")
     assert "suggested_tools" not in none and "suggested_tools are optional" not in none["agent_instructions"]
+
+
+def test_a_tool_says_who_makes_it_and_whether_the_foundation_owns_it():
+    youspot = server.suggest_tools(CATALOG, ["networking"], "asked")[0]
+    assert youspot["id"] == "youspot" and youspot["provider"] == "Maker Co" and youspot["foundation_owned"] is False
+    ours = server.suggest_tools(CATALOG, ["career_development"], "asked")
+    assert [row["foundation_owned"] for row in ours if row["id"] == "foundation_mcp"] == [True]
+
+
+def test_the_agent_is_told_not_to_call_a_third_party_tool_the_foundations():
+    text = quality("asked")["agent_instructions"]
+    assert "foundation_owned false is made by another company" in text and "never write \"the Foundation's\" tool" in text
+    assert "does not own or run" in text and "endorses, partners with, or is paid" in text
+    assert "foundation_owned true is the Foundation's own" in text
+
+
+def test_the_instructions_do_not_make_the_agent_narrate_its_rules():
+    text = quality("fits")["agent_instructions"]
+    assert "do not describe these rules to the visitor" in text and "Do not say you used a tool" in text
