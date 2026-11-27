@@ -99,7 +99,8 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 |---|---|---|
 | `WEBSEARCH_FUNCTION_KEY`, `WIKISEARCH_FUNCTION_KEY`, `ONTOLOGY_FUNCTION_KEY` | none | Function (host) keys for each app. A missing key makes calls to that app fail with HTTP 401 |
 | `WEBSEARCH_URL`, `WIKISEARCH_URL`, `ONTOLOGY_URL` | the deployed apps | Base URLs |
-| `MCP_ONTOLOGY_URL` | ontology JSON on the `main` branch of `SujeethFoundation/ontology` | Raw ontology file URL used by MCP's resolver and relationship checks; independent from the Ontology Function URL used by diagnostics/admin tools |
+| `MCP_ONTOLOGY_URL` | not set | A raw ontology file URL. When set, it is the only source of the ontology for MCP's resolver and relationship checks. When not set, MCP reads the slim catalog from `ONTOLOGY_URL` (`/api/ontology/catalog`, sent with `ONTOLOGY_FUNCTION_KEY`) and falls back to the file on the `main` branch of `SujeethFoundation/ontology` if the app does not answer |
+| `MCP_ONTOLOGY_CATALOG` | `true` | Set to `false` to skip the slim catalog and read the GitHub file |
 | `MCP_ONTOLOGY_MODEL_ENDPOINT` | empty (required) | Azure OpenAI / Foundry resource endpoint. Accepts a resource base URL, `/openai/v1` base, or full `/openai/v1/responses` URL; MCP normalizes it to the Responses endpoint |
 | `MCP_ONTOLOGY_MODEL_API_KEY` | empty (required) | Secret key for the Azure model endpoint. Store it as a Function App setting or in ignored local settings; never commit it |
 | `MCP_ONTOLOGY_MODEL_NAME` | `gpt-6-luna` | Deployed Azure model name used for ontology resolution and query generation |
