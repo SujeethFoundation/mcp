@@ -138,11 +138,43 @@ def test_all_tries_together_stay_within_the_request_timeout(monkeypatch):
 
 def test_each_try_is_given_only_the_time_that_is_left(monkeypatch):
     monkeypatch.setattr(server, "TIMEOUT", 30)
+    monkeypatch.setattr(server, "ATTEMPT_TIMEOUT", 30.0)
     fake = Fake(monkeypatch, [reply(503, {"Retry-After": "8"})])
     with pytest.raises(requests.HTTPError):
         call(attempts=10)
     assert fake.timeouts == [30, 22, 14, 6]
     assert all(t <= server.TIMEOUT for t in fake.timeouts)
+
+
+def test_one_try_is_given_at_most_the_attempt_timeout(monkeypatch):
+    monkeypatch.setattr(server, "TIMEOUT", 30)
+    monkeypatch.setattr(server, "ATTEMPT_TIMEOUT", 10.0)
+    fake = Fake(monkeypatch, [reply()])
+    call()
+    assert fake.timeouts == [10.0]
+
+
+def test_a_try_that_times_out_is_retried_at_once_and_can_succeed(monkeypatch):
+    monkeypatch.setattr(server, "TIMEOUT", 30)
+    monkeypatch.setattr(server, "ATTEMPT_TIMEOUT", 10.0)
+    fake = Fake(monkeypatch, [requests.Timeout("slow"), reply()])
+    assert call() == {"results": []}
+    assert fake.calls == 2 and fake.sleeps == [0.0]
+
+
+def test_timeouts_stop_when_less_than_the_minimum_attempt_is_left(monkeypatch):
+    monkeypatch.setattr(server, "TIMEOUT", 30)
+    monkeypatch.setattr(server, "ATTEMPT_TIMEOUT", 10.0)
+
+    class Slow(Fake):
+        def post(self, url, headers=None, json=None, timeout=None):
+            self.now += timeout          # the try used all its time
+            return super().post(url, headers, json, timeout)
+
+    fake = Slow(monkeypatch, [requests.Timeout("slow")])
+    with pytest.raises(requests.Timeout):
+        call(attempts=10)
+    assert fake.timeouts == [10.0, 10.0, 10.0]
 
 
 def test_a_slow_first_failure_leaves_no_room_for_a_retry(monkeypatch):
