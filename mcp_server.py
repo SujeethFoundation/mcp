@@ -89,6 +89,10 @@ ONTOLOGY_MODEL_RETRY_MAX_WAIT = max(0.25, float(setting("MCP_ONTOLOGY_MODEL_RETR
 ONTOLOGY_MODEL_CANDIDATE_LIMIT = max(1, int(setting("MCP_ONTOLOGY_MODEL_CANDIDATE_LIMIT", "8") or 8))
 ONTOLOGY_MODEL_RELATIONSHIP_LIMIT = max(0, int(setting("MCP_ONTOLOGY_MODEL_RELATIONSHIP_LIMIT", "24") or 24))
 ONTOLOGY_MODEL_DEFINITION_MAX_CHARS = max(40, int(setting("MCP_ONTOLOGY_MODEL_DEFINITION_MAX_CHARS", "240") or 240))
+# Local resolution: a question the ontology can read with confidence skips the model call (see local_ontology_plan).
+LOCAL_RESOLVE = str(setting("MCP_LOCAL_RESOLVE", "true")).strip().lower() in {"1", "true", "yes", "on"}
+LOCAL_RESOLVE_MAX_WORDS = max(3, int(setting("MCP_LOCAL_RESOLVE_MAX_WORDS", "25") or 25))
+LOCAL_RESOLVE_MAX_RELATED = max(0, int(setting("MCP_LOCAL_RESOLVE_MAX_RELATED", "2") or 0))
 _ontology_model_slots = threading.BoundedSemaphore(ONTOLOGY_MODEL_MAX_CONCURRENCY)
 _ontology_model_waiting = [0]          # resolutions on this instance waiting for one of the slots above, for the timing line
 
@@ -1266,6 +1270,176 @@ def add_feelings_frameworks(plan, catalog):
     return enriched
 
 
+_resolution_counts = {"ontology": 0, "model": 0, "skipped": {}}   # for /status: how often the gate lets the model call go
+_resolution_counts_lock = threading.Lock()
+_STOP_WORDS = frozenset("""about after again also been before being could does from have into just like make more most much
+need only other over should some such than that their them then there these they this those very want what when where
+which while will with would your""".split())
+
+
+def count_resolution(kind, reason=None):
+    """Record how a question was resolved: 'ontology' (local), 'model', or a skip reason when the gate sent it on."""
+    with _resolution_counts_lock:
+        if kind == "skipped":
+            _resolution_counts["skipped"][reason] = _resolution_counts["skipped"].get(reason, 0) + 1
+        else:
+            _resolution_counts[kind] += 1
+
+
+def resolution_counts():
+    with _resolution_counts_lock:
+        return {"ontology": _resolution_counts["ontology"], "model": _resolution_counts["model"],
+                "skipped": dict(_resolution_counts["skipped"])}
+
+
+def _norm(value):
+    return " ".join(re.findall(r"[a-z0-9]+", str(value or "").casefold()))
+
+
+def _find(text, phrase):
+    """The form of phrase found whole in normalized text (with a plural s added or dropped on its last word), or None."""
+    forms = [phrase, phrase + "s"] + ([phrase[:-1]] if phrase.endswith("s") and len(phrase) > 3 else [])
+    return next((form for form in forms if f" {form} " in text), None)
+
+
+_local_index_cache = None   # (the catalog dict it was built from, the index): rebuilt when a refresh swaps the catalog
+
+
+def local_index(catalog):
+    """What local matching reads from the catalog, worked out once per catalog: each concept's phrases, and which
+    concepts use each word in their names and aliases."""
+    global _local_index_cache
+    if _local_index_cache is not None and _local_index_cache[0] is catalog:
+        return _local_index_cache[1]
+    concepts, owners = [], {}
+    for item in catalog.get("classes", []):
+        if not isinstance(item, dict) or not item.get("id"):
+            continue
+        cid = str(item["id"])
+        names = [_norm(cid.replace("_", " ")), _norm(item.get("name"))]
+        others = [_norm(v) for field in ("aliases", "synonyms", "alternative_terms", "alternate_names", "query_phrases")
+                  for v in (item.get(field) or [])]
+        # A one-word alias counts only when it is five letters or more and not a common word, so "job" and "week"
+        # never stand for a concept alone.
+        phrases = [p for p in names + [v for v in others if len(v.split()) > 1 or (len(v) >= 5 and v not in _STOP_WORDS)]
+                   if len(p) >= 3]
+        concepts.append((cid, phrases))
+        for phrase in names + [_norm(v) for field in ("aliases", "synonyms", "alternative_terms", "alternate_names")
+                               for v in (item.get(field) or [])]:
+            for word in phrase.split():
+                if len(word) >= 5 and word not in _STOP_WORDS:
+                    owners.setdefault(word, set()).add(cid)
+    index = {"concepts": concepts, "owners": owners}
+    _local_index_cache = (catalog, index)
+    return index
+
+
+def local_concept_hits(query, catalog):
+    """{concept id: the longest phrase of it found whole in the question, as it was written}. Every way the ontology
+    names a concept counts: its id, name, aliases and query phrases. A fuzzy overlap of words never does."""
+    text = f" {_norm(query)} "
+    hits = {}
+    for cid, phrases in local_index(catalog)["concepts"]:
+        found = [form for form in (_find(text, phrase) for phrase in phrases) if form]
+        if found:
+            hits[cid] = max(found, key=len)
+    # A phrase made of some of the words of another concept's longer phrase is part of that one ("informational
+    # interview" is not about Interviewing), so drop it. Equal phrases are not nested: two concepts naming the same
+    # words are exactly the case the model decides.
+    def inside(short, long):
+        a, b = short.split(), long.split()
+        return len(a) < len(b) and any(b[i:i + len(a)] == a for i in range(len(b) - len(a) + 1))
+    return {cid: phrase for cid, phrase in hits.items()
+            if not any(other != cid and inside(phrase, longer) for other, longer in hits.items())}
+
+
+def local_topic_queries(query, matched_phrase, concept):
+    """Up to two variants of the question in the ontology's own words for the concept: its query phrases and
+    multi-word aliases that are not already in the question. Those that share words with what the question asks
+    beyond the concept's name come first (a "prepare" question gets the phrase about preparing), then query phrases
+    before aliases, then the more descriptive phrase. Definitions are not used: they say what a concept is, not how
+    people ask about it, and several drift toward neighboring topics."""
+    asked = _norm(query)
+    intent = {w for w in asked.split() if len(w) >= 4 and w not in _STOP_WORDS and w not in matched_phrase.split()}
+    pool = [(v, 1) for v in concept.get("query_phrases") or []] + [(v, 0) for v in concept.get("aliases") or []]
+    ranked = []
+    for value, from_query_phrases in pool:
+        phrase = _norm(value)
+        if len(phrase.split()) < 2 or phrase == asked or _find(f" {asked} ", phrase) or _find(f" {phrase} ", matched_phrase):
+            continue
+        ranked.append((-len(intent.intersection(phrase.split())), -from_query_phrases, -len(phrase), str(value).strip()))
+    return [row[-1] for row in sorted(ranked)[:2]]
+
+
+def _skip(reason):
+    count_resolution("skipped", reason)
+    return None
+
+
+def local_ontology_plan(query, catalog, retrieval_context=None):
+    """A search plan built from the ontology alone, or None when the model should decide.
+
+    The model call exists to choose concepts, name related ones, flag a feeling, ask about an ambiguity and write
+    variants. When the question names exactly one concept in the ontology's own words and nothing makes it uncertain,
+    none of that needs a model, so the plan comes from the ontology: the concept, the concepts its enabled
+    relationships link, and variants made from its query phrases and definition. The model still decides everything
+    else: a question that matches nothing (the out-of-scope call), several concepts, a feeling, a word the ontology
+    lists as ambiguous, or a long or multi-sentence question.
+    """
+    if not LOCAL_RESOLVE:
+        return None
+    words = _norm(query).split()
+    if not words or len(words) > LOCAL_RESOLVE_MAX_WORDS:
+        return _skip("long_question")
+    if re.search(r"[.?!]\s+\S", str(query or "").strip()):
+        return _skip("several_sentences")
+    hits = local_concept_hits(query, catalog)
+    if not hits:
+        return _skip("no_confident_match")
+    if len(hits) > 1:
+        return _skip("several_concepts")
+    (cid, matched_phrase), = hits.items()
+    concept = next((c for c in catalog.get("classes", []) if isinstance(c, dict) and str(c.get("id")) == cid), {})
+    if isinstance(concept.get("mood_meter"), dict):
+        return _skip("feeling")
+    if retrieval_context and retrieval_context.get("career_context") == cid:
+        return _skip("feeling_context")
+    # A word the ontology lists as having several meanings stops the shortcut, unless it is the matched phrase's own
+    # wording ("Career Circle" names the program; only a "circle" left over in the question would be ambiguous).
+    remainder = f" {_norm(query)} ".replace(f" {matched_phrase} ", " ", 1)
+    for item in catalog.get("ambiguous_terms") or []:
+        for term in str(item.get("term") if isinstance(item, dict) else "").split("/"):
+            term = _norm(term)
+            if term and (term == matched_phrase or _find(remainder, term)):
+                return _skip("ambiguous_term")
+    # A word left over that names another concept ("resume" in "help with my resume and interview prep", where only
+    # interviewing matched whole) is a second topic the question did not spell the ontology's way. The model decides.
+    owners = local_index(catalog)["owners"]
+    if any(owners.get(word, set()) - {cid} for word in remainder.split() if len(word) >= 5 and word not in _STOP_WORDS):
+        return _skip("other_topic_word")
+    neighbors = []
+    for rel in catalog.get("relationships", []):
+        if not isinstance(rel, dict) or is_feelings_api_only_edge(rel):
+            continue
+        other = rel.get("object") if rel.get("subject") == cid else rel.get("subject") if rel.get("object") == cid else None
+        if other and other != cid and other not in neighbors:
+            neighbors.append(str(other))
+    result = {"matched_concepts": [cid], "related_concepts": neighbors, "feelings": [], "intent": None,
+              "topic_queries": local_topic_queries(query, matched_phrase, concept), "feeling_query": None,
+              "needs_clarification": False, "suggested_question": None}
+    plan = validate_ontology_plan(result, query, catalog)
+    linked = plan["resolution"]["matched_concepts"][1:]   # the neighbors an enabled relationship allows
+    if len(linked) != min(len(linked), LOCAL_RESOLVE_MAX_RELATED):
+        result["related_concepts"] = linked[:LOCAL_RESOLVE_MAX_RELATED]
+        plan = validate_ontology_plan(result, query, catalog)
+    plan["resolution"]["resolved_by"] = "ontology"
+    plan["resolution"]["concept_matches"] = [
+        {**match, "source": "ontology_local" if match.get("source") == "azure_model" else match.get("source")}
+        for match in plan["resolution"].get("concept_matches", [])]
+    count_resolution("ontology")
+    return plan
+
+
 def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
     """Ask Azure GPT-6 Luna to resolve the query against ontology concepts and suggest retrieval queries."""
     catalog = catalog if catalog is not None else ontology_catalog()
@@ -1280,6 +1454,9 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
                   if " ".join(str(item).casefold().split()) != normalized]
         cached["queries"] = _clean_queries(query, extras)
         return cached
+    local = local_ontology_plan(query, catalog, retrieval_context)
+    if local is not None:
+        return local
     with _ontology_plan_cache_lock:
         shared = _ontology_plan_inflight.get(key)
         leader = shared is None
@@ -1296,6 +1473,8 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
             model_context, allowed_ids = ontology_model_context(query, catalog)
             model_result = call_ontology_model(query, model_context)
         plan = validate_ontology_plan(model_result, query, catalog, allowed_ids, retrieval_context)
+        plan["resolution"]["resolved_by"] = "model"
+        count_resolution("model")
         plan = add_feelings_frameworks(plan, catalog)
         # A degraded route is a transient failure of the Feelings API: do not pin it for the cache window.
         if not (plan.get("resolution", {}).get("feelings_route") or {}).get("degraded"):
@@ -1741,6 +1920,7 @@ async def status(request):
         "process": process_info(),
         "tool_pool": {"threads": TOOL_THREADS, "in_flight": in_flight, "queued": max(0, in_flight - TOOL_THREADS), "peak_in_flight": peak},
         "downstream": downstream_stats(),
+        "ontology_resolution": resolution_counts(),
     }, headers={"Cache-Control": "no-store"})
 
 
@@ -2088,6 +2268,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         concepts, domains = [], []
         errors.append({"service": "ontology", **error_result(exc)})
     query_plan = resolution.get("query_plan") or {}
+    timings["ontology_resolved_by"] = resolution.get("resolved_by") or "model"
     timings["topic_query_count"] = len(query_plan.get("topic_queries") or queries)
     timings["feeling_query_included"] = bool(query_plan.get("feeling_query"))
 
