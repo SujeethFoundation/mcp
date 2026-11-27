@@ -220,3 +220,7 @@ Local tests that use admin tools need `MCP_ADMIN_TOOLS=true`. Search results dep
 | Deployed app returns 502 or never becomes healthy | `MCP_PORT` does not match `port` in `host.json`, or the Python version in the workflow does not match the app's runtime |
 | HTTP 429 | A rate limit was reached. Wait for the `Retry-After` interval or raise the limit |
 | `Unknown tool: check_services` | Admin tools are off. Set `MCP_ADMIN_TOOLS=true` for local testing only |
+
+## Platform architecture
+
+This repo is one of nine in the SujeethFoundation org. The architecture docs live in the website repo's `architecture/` folder: [platform architecture](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/platform-architecture.md), [data model and portal](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/platform-data-model-and-portal.md) and [business architecture](https://github.com/SujeethFoundation/sujeethfoundation.github.io/blob/main/architecture/business-architecture.md). This repo is the MCP server (the Sujeeth Foundation Graph). See "MCP server" in the platform architecture doc. Each repo's README is listed in the platform architecture doc under "Repo READMEs".
