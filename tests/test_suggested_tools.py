@@ -13,8 +13,8 @@ def tool(tool_id, name, url="https://example.org/" , **extra):
             "tool": {"url": url + tool_id, "kind": "app", "connect": f"Open {name}.", "fit_when": f"when using {name}", **extra}}
 
 
-def supports(tool_id, concept, weight=None, reason=None):
-    row = {"subject": tool_id, "predicate": "supports", "object": concept}
+def helps_with(tool_id, concept, weight=None, reason=None):
+    row = {"subject": tool_id, "predicate": "helps_with", "object": concept}
     if weight is not None:
         row["weight"] = weight
     if reason:
@@ -32,10 +32,10 @@ CATALOG = {
         {"id": "no_link", "category": "tool", "name": "No Link", "tool": {"kind": "app"}},
     ],
     "relationships": [
-        supports("youspot", "networking", 0.9, "Research the people behind posts before you write to them."),
-        supports("teal", "resume_resource", 0.8), supports("teal", "networking", 0.3),
-        supports("indeed", "career_development", 0.6), supports("foundation_mcp", "career_development", 0.5),
-        supports("no_link", "networking", 1.0), supports("ghost_tool", "networking", 1.0),
+        helps_with("youspot", "networking", 0.9, "Research the people behind posts before you write to them."),
+        helps_with("teal", "resume_resource", 0.8), helps_with("teal", "networking", 0.3),
+        helps_with("indeed", "career_development", 0.6), helps_with("foundation_mcp", "career_development", 0.5),
+        helps_with("no_link", "networking", 1.0), helps_with("ghost_tool", "networking", 1.0),
     ],
     "domains": [],
 }

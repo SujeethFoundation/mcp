@@ -1171,7 +1171,7 @@ def suggest_tools(catalog, concepts, tool_intent):
 
     A tool is a class with category "tool" (name, definition and a `tool` object with url, kind, connect, fit_when and,
     for a tool that has one, mcp_url and available_in).
-    A relationship `tool --supports--> skill` (optional `weight` 0 to 1 and `reason`) says what it helps with. Nothing is
+    A relationship `tool --helps_with--> skill` (optional `weight` 0 to 1 and `reason`) says what it helps with. Nothing is
     added to the search: this only decides which tools the agent may offer, and the agent is told to offer one only
     when it fits the question."""
     if tool_intent not in ("asked", "fits") or not SUGGESTED_TOOLS_MAX or not concepts:
@@ -1184,7 +1184,7 @@ def suggest_tools(catalog, concepts, tool_intent):
     matched = set(concepts)
     found = {}
     for rel in catalog.get("relationships", []):
-        if not isinstance(rel, dict) or str(rel.get("predicate", "")).lower() != "supports":
+        if not isinstance(rel, dict) or str(rel.get("predicate", "")).lower() != "helps_with":
             continue
         tool_id, concept = str(rel.get("subject")), rel.get("object")
         if tool_id not in tools or concept not in matched:
