@@ -58,6 +58,8 @@ QUESTIONS = [
 NO_ANSWER = []  # (seconds since the run started, kind) for every request that got no HTTP answer
 _no_answer_lock = threading.Lock()
 RUN_START = [time.perf_counter()]
+KEEPALIVE = [False]
+_LOCAL = threading.local()
 PHASES = []  # (seconds into the run it finished, connect s, wait-for-first-byte s, read s, got an answer)
 
 
@@ -85,25 +87,50 @@ class Client:
             self.headers[key_header] = key
         self.next_id = 0
 
+    def _open(self):
+        parts = urlparse(self.url)
+        cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+        conn = cls(parts.hostname, parts.port, timeout=self.timeout)
+        conn.connect()
+        return conn
+
     def post(self, body):
         """One request. Returns (status, seconds, parsed_json_or_None). Also records where the time went:
-        connecting (TCP + TLS), waiting for the first byte of the reply, and reading the rest."""
+        connecting (TCP + TLS), waiting for the first byte of the reply, and reading the rest.
+        With --keepalive each worker thread keeps its connection open and reuses it, as most real clients do."""
         data = json.dumps(body).encode()
         began = time.perf_counter()
+        parts = urlparse(self.url)
+        target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
         connected = sent = first_byte = None
         conn = None
+        reused = False
         try:
-            parts = urlparse(self.url)
-            cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
-            conn = cls(parts.hostname, parts.port, timeout=self.timeout)
-            conn.connect()
-            connected = time.perf_counter()
-            conn.request("POST", (parts.path or "/") + (f"?{parts.query}" if parts.query else ""), body=data, headers=self.headers)
-            sent = time.perf_counter()
-            response = conn.getresponse()
-            first_byte = time.perf_counter()
-            raw = response.read().decode("utf-8", "replace")
-            status, ctype = response.status, response.getheader("content-type", "")
+            if KEEPALIVE[0]:
+                conn = getattr(_LOCAL, "conn", None)
+                reused = conn is not None
+                _LOCAL.conn = None
+            for attempt in (0, 1):
+                try:
+                    if conn is None:
+                        conn = self._open()
+                        reused = False
+                    connected = time.perf_counter()
+                    conn.request("POST", target, body=data, headers=self.headers)
+                    sent = time.perf_counter()
+                    response = conn.getresponse()
+                    first_byte = time.perf_counter()
+                    raw = response.read().decode("utf-8", "replace")
+                    status, ctype = response.status, response.getheader("content-type", "")
+                    break
+                except (http.client.RemoteDisconnected, http.client.BadStatusLine, ConnectionResetError, BrokenPipeError):
+                    # an idle kept-alive connection the server closed: open a fresh one once
+                    if not reused or attempt:
+                        raise
+                    conn.close()
+                    conn, reused, connected = None, False, None
+            if KEEPALIVE[0] and not response.will_close:
+                _LOCAL.conn, conn = conn, None
         except Exception as exc:
             note_no_answer(exc, connecting=connected is None)
             self._phase(began, connected, sent, first_byte, ok=False)
@@ -112,13 +139,13 @@ class Client:
             if conn is not None:
                 conn.close()
         done = time.perf_counter()
-        self._phase(began, connected, sent, first_byte, ok=True, done=done)
+        self._phase(began, None if reused else connected, sent, first_byte, ok=True, done=done, reused=reused)
         return status, done - began, (parse_body(raw, ctype) if status < 400 else None)
 
     @staticmethod
-    def _phase(began, connected, sent, first_byte, ok, done=None):
+    def _phase(began, connected, sent, first_byte, ok, done=None, reused=False):
         end = done or time.perf_counter()
-        connect = (connected or end) - began
+        connect = 0.0 if reused else (connected or end) - began
         wait = (first_byte - sent) if (first_byte and sent) else 0.0
         read = (end - first_byte) if first_byte else 0.0
         with _no_answer_lock:
@@ -211,6 +238,8 @@ def main():
     ap.add_argument("--vary-share", type=float, default=0.0,
                     help="share of searches (0 to 1) sent as questions nobody asked before, so caches cannot answer them. "
                          "1 is the worst case for the app; 0.7 is a plausible mix; 0 asks the same 40 questions (caches answer most)")
+    ap.add_argument("--keepalive", action="store_true", help="each worker keeps its connection open and reuses it, so the run "
+                    "pays for far fewer TCP+TLS handshakes (most real clients do this). Compare with and without to see whether the limit is new connections per second")
     ap.add_argument("--handshake", action="store_true", help="send initialize, initialized and tools/list before each call")
     ap.add_argument("--rate", type=float, default=0.0, help="fixed-rate mode: searches per second (ignores --visitors/--calls/--ramp/--think)")
     ap.add_argument("--duration", type=float, default=60.0, help="fixed-rate mode: seconds to keep sending")
@@ -222,6 +251,7 @@ def main():
     ap.add_argument("--max-requests", type=int, default=600, help="stop after this many HTTP requests")
     ap.add_argument("--timeout", type=float, default=60.0)
     args = ap.parse_args()
+    KEEPALIVE[0] = args.keepalive
     if urlparse(args.url).scheme not in ("http", "https"):
         sys.exit("--url must start with http:// or https://")
     if args.rate > 0:
