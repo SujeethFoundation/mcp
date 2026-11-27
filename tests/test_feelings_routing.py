@@ -191,3 +191,35 @@ def test_unavailable_feelings_api_returns_a_clear_degraded_route(monkeypatch):
 
     assert plan["resolution"]["matched_concepts"] == ["nervous"]
     assert plan["resolution"]["feelings_route"]["degraded"] is True
+
+
+def test_degraded_feelings_route_is_not_cached(monkeypatch):
+    calls = []
+
+    def post(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("offline")
+        return {"frameworks": []}
+
+    server.clear_ontology_plan_cache()
+    monkeypatch.setattr(server, "ONTOLOGY_PLAN_CACHE_SECONDS", 300)
+    monkeypatch.setattr(server, "ontology_model_context", lambda query, data: (data, None))
+    monkeypatch.setattr(server, "call_ontology_model", lambda query, data: model_result(
+        ["nervous"], ["nervous"], "regulation"))
+    monkeypatch.setattr(server, "post_json", post)
+    route_catalog = {**catalog(), "ontology_version": "feelings-degraded-cache"}
+    first = resolve_plan("I am nervous", route_catalog)
+    second = resolve_plan("I am nervous", route_catalog)
+
+    assert first["resolution"]["feelings_route"]["degraded"] is True
+    assert second["resolution"]["feelings_route"]["status"] == "resolved"
+    assert len(calls) == 2
+
+
+def test_resolution_summary_returns_the_feelings_route():
+    route = {"status": "resolved", "frameworks": [{"framework_id": "x", "guardrail": "no diagnosis"}]}
+    summary = server.resolution_summary({"status": "matched", "feelings_route": route})
+
+    assert summary["feelings_route"] == route
+    assert "feelings_route" not in server.resolution_summary({"status": "matched"})
