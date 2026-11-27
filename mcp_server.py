@@ -831,6 +831,23 @@ ONTOLOGY_PLAN_SCHEMA = {
 }
 
 
+ONTOLOGY_DOMAINS_RETRY_SECONDS = 30   # how soon to ask again when the catalog has no domains and the ontology app would not give them
+
+
+def fetch_search_domains(timeout):
+    """The search-enabled domains and the concepts each is associated with, from the ontology app. Raises when it does
+    not answer with a list, so a bad answer never stands in for the domains."""
+    response = requests.get(f"{ONTOLOGY_URL}/api/ontology/domains?search_enabled=true", headers=auth(ONTOLOGY_KEY),
+                            timeout=timeout)
+    response.raise_for_status()
+    rows = (response.json() or {}).get("domains")
+    if not isinstance(rows, list):
+        raise ValueError("not a list of domains")
+    return [{"domain": row["domain"], "search_enabled": True,
+             "associated_concepts": [c for c in row.get("associated_concepts") or [] if isinstance(c, str)]}
+            for row in rows if isinstance(row, dict) and row.get("domain")]
+
+
 def ontology_catalog() -> dict | None:
     """Load the public ontology catalog used by the AI resolver and domain authorization."""
     global _ontology_catalog, _ontology_catalog_loaded_at
@@ -838,7 +855,20 @@ def ontology_catalog() -> dict | None:
     if _ontology_catalog is not None and _ontology_catalog_loaded_at is not None and now - _ontology_catalog_loaded_at < ONTOLOGY_CATALOG_REFRESH_SECONDS:
         return _ontology_catalog
     try:
-        _ontology_catalog, _ontology_catalog_loaded_at = fetch_ontology_json(min(5, TIMEOUT)), now
+        catalog, loaded_at = fetch_ontology_json(min(5, TIMEOUT)), now
+        if "domains" not in catalog:
+            # The slim catalog leaves the domains out, and without them no concept resolves to a search domain, so the
+            # website search never runs. Ask the ontology app for the search-enabled ones.
+            try:
+                catalog = {**catalog, "domains": fetch_search_domains(min(5, TIMEOUT))}
+            except Exception as exc:
+                previous = (_ontology_catalog or {}).get("domains")
+                catalog = {**catalog, "domains": previous or []}
+                print(f"ontology_domains_unavailable {type(exc).__name__}: using {'the last known' if previous else 'no'} "
+                      "domains", file=sys.stderr, flush=True)
+                if not previous:
+                    loaded_at = now - ONTOLOGY_CATALOG_REFRESH_SECONDS + ONTOLOGY_DOMAINS_RETRY_SECONDS
+        _ontology_catalog, _ontology_catalog_loaded_at = catalog, loaded_at
     except Exception:
         pass  # A failed catalog read cannot turn an unknown question into an in-scope one.
     return _ontology_catalog

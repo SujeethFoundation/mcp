@@ -103,6 +103,8 @@ Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`.
 | `WEBSEARCH_URL`, `WIKISEARCH_URL`, `ONTOLOGY_URL` | the deployed apps | Base URLs |
 | `MCP_ONTOLOGY_URL` | not set | A raw ontology file URL. When set, it is the only source of the ontology for MCP's resolver and relationship checks. When not set, MCP reads the slim catalog from `ONTOLOGY_URL` (`/api/ontology/catalog`, sent with `ONTOLOGY_FUNCTION_KEY`) and falls back to the file on the `main` branch of `SujeethFoundation/ontology` if the app does not answer |
 | `MCP_ONTOLOGY_CATALOG` | `true` | Set to `false` to skip the slim catalog and read the GitHub file |
+
+The slim catalog does not carry the search domains. When the catalog has no `domains`, MCP also reads `/api/ontology/domains?search_enabled=true` (once per catalog refresh, five minutes) and keeps each domain with its associated concepts. If that read fails, MCP keeps the last known domains, or none, and asks again in about 30 seconds.
 | `MCP_ONTOLOGY_MODEL_ENDPOINT` | empty (required) | Azure OpenAI / Foundry resource endpoint. Accepts a resource base URL, `/openai/v1` base, or full `/openai/v1/responses` URL; MCP normalizes it to the Responses endpoint |
 | `MCP_ONTOLOGY_MODEL_API_KEY` | empty (required) | Secret key for the Azure model endpoint. Store it as a Function App setting or in ignored local settings; never commit it |
 | `MCP_ONTOLOGY_MODEL_NAME` | `gpt-6-luna` | Deployed Azure model name used for ontology resolution and query generation |
