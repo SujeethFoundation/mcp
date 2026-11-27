@@ -226,6 +226,6 @@ def test_the_combined_search_completes_when_the_first_try_hits_a_loading_instanc
 
 def test_the_combined_search_is_partial_when_the_instance_never_loads(monkeypatch):
     routed(monkeypatch, [reply(503, {"Retry-After": "1"})])
-    result = server.search_sujeeth_foundation.sync("career circle", full_documents=False)
+    result = server.search_sujeeth_foundation.sync("career circle")
     assert result["status"] == "partial"
     assert result["service_errors"] == [{"service": "websearch", "error": "Service returned HTTP 503."}]

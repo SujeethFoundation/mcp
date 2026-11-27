@@ -680,6 +680,10 @@ def resolution_summary(data):
         "domains": data.get("domains", []),
         "message": data.get("message"),
     }
+    route = data.get("feelings_route")
+    if route:
+        # Framework guardrails and the degraded flag come from the Feelings API; the agent needs them to respond safely.
+        summary["feelings_route"] = route
     if VERBOSE_ONTOLOGY:
         summary["concept_matches"] = data.get("concept_matches", [])
         summary["query_plan"] = data.get("query_plan", {})
@@ -1258,7 +1262,9 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
             model_result = call_ontology_model(query, model_context)
         plan = validate_ontology_plan(model_result, query, catalog, allowed_ids, retrieval_context)
         plan = add_feelings_frameworks(plan, catalog)
-        _ontology_plan_cache_put(key, plan)
+        # A degraded route is a transient failure of the Feelings API: do not pin it for the cache window.
+        if not (plan.get("resolution", {}).get("feelings_route") or {}).get("degraded"):
+            _ontology_plan_cache_put(key, plan)
         shared.set_result(plan)
         return plan
     except BaseException as exc:
