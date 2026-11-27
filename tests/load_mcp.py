@@ -27,6 +27,7 @@ Some clients do this on every call in stateless mode. It matters for the per-min
 how many requests a real chat might cost. Press Ctrl+C to stop early; what finished is still reported.
 """
 import argparse
+import http.client
 import json
 import math
 import os
@@ -36,8 +37,6 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-import urllib.error
-import urllib.request
 from urllib.parse import urlparse
 
 QUESTIONS = [
@@ -59,19 +58,14 @@ QUESTIONS = [
 NO_ANSWER = []  # (seconds since the run started, kind) for every request that got no HTTP answer
 _no_answer_lock = threading.Lock()
 RUN_START = [time.perf_counter()]
+PHASES = []  # (seconds into the run it finished, connect s, wait-for-first-byte s, read s, got an answer)
 
 
-def note_no_answer(exc):
-    """Remember what kind of failure it was (reset, timeout, refused, TLS...) and when, so a few can be explained."""
-    reason = getattr(exc, "reason", None)  # urllib wraps the real error in URLError.reason
-    inner = reason if isinstance(reason, BaseException) else exc
-    kind = type(inner).__name__
-    if kind in ("URLError", "error") and reason is not None and not isinstance(reason, BaseException):
-        kind = f"URLError({str(reason)[:40]})"
-    # urllib wraps a failure to CONNECT (including the TLS handshake) in URLError and lets a failure while
-    # WAITING FOR THE REPLY through unwrapped. That tells a path that never opened (this machine, the network or
-    # the platform's front end) from a server that accepted the request and never answered.
-    kind = ("while connecting: " if isinstance(exc, urllib.error.URLError) else "after connecting, waiting for the reply: ") + kind
+def note_no_answer(exc, connecting=False):
+    """Remember what kind of failure it was (reset, timeout, refused, TLS...) and when, so a few can be explained.
+    connecting is True when the failure came before the connection (TCP + TLS) was open."""
+    kind = type(exc).__name__
+    kind = ("while connecting: " if connecting else "after connecting, waiting for the reply: ") + kind
     with _no_answer_lock:
         NO_ANSWER.append((time.perf_counter() - RUN_START[0], kind))
 
@@ -92,19 +86,43 @@ class Client:
         self.next_id = 0
 
     def post(self, body):
-        """One request. Returns (status, seconds, parsed_json_or_None)."""
+        """One request. Returns (status, seconds, parsed_json_or_None). Also records where the time went:
+        connecting (TCP + TLS), waiting for the first byte of the reply, and reading the rest."""
         data = json.dumps(body).encode()
-        request = urllib.request.Request(self.url, data=data, headers=self.headers, method="POST")
         began = time.perf_counter()
+        connected = sent = first_byte = None
+        conn = None
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                status, raw, ctype = response.status, response.read().decode("utf-8", "replace"), response.headers.get("content-type", "")
-        except urllib.error.HTTPError as exc:
-            return exc.code, time.perf_counter() - began, None
+            parts = urlparse(self.url)
+            cls = http.client.HTTPSConnection if parts.scheme == "https" else http.client.HTTPConnection
+            conn = cls(parts.hostname, parts.port, timeout=self.timeout)
+            conn.connect()
+            connected = time.perf_counter()
+            conn.request("POST", (parts.path or "/") + (f"?{parts.query}" if parts.query else ""), body=data, headers=self.headers)
+            sent = time.perf_counter()
+            response = conn.getresponse()
+            first_byte = time.perf_counter()
+            raw = response.read().decode("utf-8", "replace")
+            status, ctype = response.status, response.getheader("content-type", "")
         except Exception as exc:
-            note_no_answer(exc)
+            note_no_answer(exc, connecting=connected is None)
+            self._phase(began, connected, sent, first_byte, ok=False)
             return "error", time.perf_counter() - began, None
-        return status, time.perf_counter() - began, parse_body(raw, ctype)
+        finally:
+            if conn is not None:
+                conn.close()
+        done = time.perf_counter()
+        self._phase(began, connected, sent, first_byte, ok=True, done=done)
+        return status, done - began, (parse_body(raw, ctype) if status < 400 else None)
+
+    @staticmethod
+    def _phase(began, connected, sent, first_byte, ok, done=None):
+        end = done or time.perf_counter()
+        connect = (connected or end) - began
+        wait = (first_byte - sent) if (first_byte and sent) else 0.0
+        read = (end - first_byte) if first_byte else 0.0
+        with _no_answer_lock:
+            PHASES.append((end - RUN_START[0], connect, wait, read, ok))
 
     def rpc(self, method, params=None, notify=False):
         body = {"jsonrpc": "2.0", "method": method}
@@ -481,6 +499,20 @@ def main():
         print(f"  {tool_failed} tool calls returned HTTP 200 but reported an error (a backend app failed or timed out).")
     calls = state["calls"]
     minutes = max(wall / 60, 1e-9)
+    if PHASES:
+        print("Where each request's time went (all requests, by when they finished; medians, p95 in brackets):")
+        print("  seconds    n   connect (TCP+TLS)    wait for first byte    read body    no answer")
+        width = 30
+        for lo in range(0, int(max(p[0] for p in PHASES)) + 1, width):
+            rows = [p for p in PHASES if lo <= p[0] < lo + width]
+            if not rows:
+                continue
+            def cell(i):
+                vals = [r[i] for r in rows]
+                return f"{statistics.median(vals):6.2f} ({percentile(vals, 95):6.2f})"
+            print(f"  {lo:3d}-{lo + width:<4d} {len(rows):5d}   {cell(1)}    {cell(2)}    {cell(3)}   {sum(1 for r in rows if not r[4]):5d}")
+        print("  If 'connect' is large, requests queue before the app (this machine, the network or the platform's front end). "
+              "If 'wait for first byte' is large, the app (or the platform's routing) held the request.")
     print(f"Requests per search call: {len(done) / calls:.1f}" if calls else "No search calls were sent.")
     print(f"Request rate: {len(done) / minutes:.0f} requests a minute over the whole run (peak minute is higher).")
     if by_status.get("error"):
