@@ -107,11 +107,6 @@ RETRY_ATTEMPTS = max(1, int(setting("MCP_RETRY_ATTEMPTS", "4") or 4))           
 RETRY_DEFAULT_WAIT = float(setting("MCP_RETRY_DEFAULT_WAIT_SECONDS", "3") or 3)       # wait when the 503 has no Retry-After
 RETRY_MAX_WAIT = float(setting("MCP_RETRY_MAX_WAIT_SECONDS", "8") or 8)               # longest single wait, whatever Retry-After says
 RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)         # a retry is made only if this long is left after the wait
-# One try may take at most this long, so a request stuck on a busy or not-ready instance is given up and tried again
-# (the platform may route the next try to another instance) instead of using the whole MCP_REQUEST_TIMEOUT.
-ATTEMPT_TIMEOUT = max(1.0, float(setting("MCP_ATTEMPT_TIMEOUT_SECONDS", "10") or 10))
-# Wait before retrying a try that timed out. It already waited ATTEMPT_TIMEOUT, so the default is none.
-RETRY_TIMEOUT_WAIT = max(0.0, float(setting("MCP_RETRY_TIMEOUT_WAIT_SECONDS", "0") or 0))
 
 # Search diversity settings.
 # SEARCH_RESULT_COUNT: ordinary results returned (best bets and spotlights come on top of these).
@@ -474,9 +469,7 @@ def _retry_wait(exc):
         if response is not None and response.status_code == 503:
             return min(_retry_after_seconds(response), RETRY_MAX_WAIT)
         return None
-    if isinstance(exc, requests.Timeout):
-        return min(RETRY_TIMEOUT_WAIT, RETRY_MAX_WAIT)
-    if isinstance(exc, requests.ConnectionError):
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
         return min(RETRY_DEFAULT_WAIT, RETRY_MAX_WAIT)
     return None
 
@@ -490,8 +483,7 @@ def _why(exc):
 def post_json_with_retry(url, payload, key="", attempts=None):
     """post_json, tried again when the search app is still loading or briefly unreachable.
 
-    All tries together take at most MCP_REQUEST_TIMEOUT seconds: each try is given only the time that is left (and
-    never more than MCP_ATTEMPT_TIMEOUT_SECONDS, so a stuck try is dropped and retried), and a
+    All tries together take at most MCP_REQUEST_TIMEOUT seconds: each try is given only the time that is left, and a
     retry is made only if at least MCP_RETRY_MIN_ATTEMPT_SECONDS would remain after the wait. The last failure is
     raised as before, so callers handle it exactly as they did without retries. Every try is counted in the downstream
     numbers, and each retry also in "retries"."""
@@ -501,7 +493,7 @@ def post_json_with_retry(url, payload, key="", attempts=None):
     while True:
         attempt += 1
         try:
-            return post_json(url, payload, key, timeout=max(1.0, min(float(TIMEOUT), ATTEMPT_TIMEOUT, deadline - _clock())))
+            return post_json(url, payload, key, timeout=max(1.0, min(float(TIMEOUT), deadline - _clock())))
         except Exception as exc:
             wait = _retry_wait(exc) if attempt < attempts else None
             if wait is None:

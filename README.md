@@ -146,8 +146,6 @@ The slim catalog does not carry the search domains. When the catalog has no `dom
 | `MCP_RETRY_DEFAULT_WAIT_SECONDS` | `3` | Wait before a retry when the 503 has no `Retry-After` header, and after a connection error |
 | `MCP_RETRY_MAX_WAIT_SECONDS` | `8` | Longest single wait, whatever `Retry-After` says |
 | `MCP_RETRY_MIN_ATTEMPT_SECONDS` | `4` | A retry is made only if at least this much of the timeout would be left after the wait |
-| `MCP_ATTEMPT_TIMEOUT_SECONDS` | `10` | Longest one try to the website search or wiki app may take. A try that reaches it is dropped and retried, within `MCP_REQUEST_TIMEOUT` in all, so a request stuck on a busy or not-ready instance does not use the whole timeout |
-| `MCP_RETRY_TIMEOUT_WAIT_SECONDS` | `0` | Wait before retrying a try that timed out (it has already waited `MCP_ATTEMPT_TIMEOUT_SECONDS`) |
 | `WIKI_EXCLUDE_TITLE_PATTERN` | circle-session pattern | Wiki pages to drop from results |
 | `LOCAL_SETTINGS_PATH` | `local.settings.json` | Optional settings file |
 
