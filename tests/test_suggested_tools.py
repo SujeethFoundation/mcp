@@ -123,10 +123,14 @@ def quality(intent):
 def test_the_response_lists_the_tools_and_tells_the_agent_how_to_offer_them():
     asked = quality("asked")
     assert names(asked["suggested_tools"]) == ["youspot", "teal"]
-    assert "suggested_tools are optional" in asked["agent_instructions"] and "they asked for tools" in asked["agent_instructions"]
+    assert "suggested_tools are optional" in asked["agent_instructions"] and "The visitor asked for a tool" in asked["agent_instructions"]
+    assert "answer from the Foundation's guidance first" not in asked["agent_instructions"]
     assert "Never present a tool as required" in asked["agent_instructions"]
     fits = quality("fits")
-    assert "answer first and mention at most one at the end" in fits["agent_instructions"]
+    assert "answer from the Foundation's guidance first, then close with the tool" in fits["agent_instructions"]
+    assert "The visitor asked for a tool" not in fits["agent_instructions"]
+    for text in (asked["agent_instructions"], fits["agent_instructions"]):
+        assert "use `why`" in text and "use `connect` as written" in text and "no filler" in text
 
 
 def test_no_tools_means_no_field_and_no_instruction():

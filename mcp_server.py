@@ -1592,6 +1592,18 @@ NO_RESULTS_INSTRUCTIONS = (
 )
 
 
+# How the agent places a tool among the Foundation's own guidance. Tools support the guidance; they do not replace it.
+TOOLS_ASKED_INSTRUCTIONS = (
+    "The visitor asked for a tool, so open by answering that directly with the tool, then give the Foundation's guidance "
+    "from the results as how to get the most from it (for example, \"Pair it with the Foundation's Week 3 advice to...\"). "
+    "If the results hold no Foundation guidance on the topic, the tool alone is the answer."
+)
+TOOLS_FITS_INSTRUCTIONS = (
+    "The visitor did not ask for a tool, so answer from the Foundation's guidance first, then close with the tool as an "
+    "optional next step in a separate short paragraph."
+)
+
+
 def assess_quality(resolution, results, errors):
     """Decide whether the question is out of scope, ambiguous, or fine.
 
@@ -1682,12 +1694,12 @@ def assess_quality(resolution, results, errors):
     tools = resolution.get("suggested_tools") or []
     if tools:
         instructions += (
-            " suggested_tools are optional tools the student connects or opens themselves. Mention one only when it fits "
-            "what the visitor asked, as an option with its link and why it helps"
-            + (" (they asked for tools, so lead with the one that fits best)" if resolution.get("tool_intent") == "asked"
-               else " (they did not ask for tools, so answer first and mention at most one at the end)")
-            + ". Never present a tool as required, as the whole answer, or as something you used or can run for them. "
-            "Use the connect text as written."
+            " suggested_tools are optional tools the student connects or opens themselves. Offer at most one or two, only "
+            "those that fit what the visitor asked, never all of them. Write each in one or two plain sentences: its name "
+            "as a link, what it does for this task (use `why`), and how to start (use `connect` as written). Add nothing "
+            "about what the tool contains or does beyond `why`, and no filler such as \"explore its tools\". "
+            + (TOOLS_ASKED_INSTRUCTIONS if resolution.get("tool_intent") == "asked" else TOOLS_FITS_INSTRUCTIONS)
+            + " Never present a tool as required, as the whole answer, or as something you used or can run for them."
         )
     if service_degraded:
         instructions += (
