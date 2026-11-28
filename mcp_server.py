@@ -851,6 +851,11 @@ similar_plans = SimilarPlans(max(10, int(setting("MCP_PLAN_SIMILARITY_ENTRIES", 
 shared_vectors = SharedVectors(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
                                setting("MCP_PLAN_VECTOR_TABLE", "mcpplanvectors") or "mcpplanvectors", PLAN_STORE_SECONDS)
 _plan_embed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="plan-embed")
+# Shared answers: the website search an earlier question already paid for. Keyed by the plan (concepts, domains, the plan's
+# own queries), not by the wording of the question, so variants that share a plan share the answer. 0 = off.
+ANSWER_STORE_SECONDS = max(0, int(setting("MCP_ANSWER_STORE_SECONDS", "0") or 0))
+answer_store = PlanStore(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
+                         setting("MCP_ANSWER_STORE_TABLE", "mcpanswers") or "mcpanswers", ANSWER_STORE_SECONDS)
 ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "500") or 500))
 _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
 _ontology_plan_cache_lock = threading.Lock()
@@ -2457,6 +2462,15 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
+def _answer_key(query, queries, concepts, domains, resolution, limit):
+    """What identifies a website search by its plan. The plan's own queries stand for the question; when the plan adds none
+    (an obvious question answered without the model) the question itself is the key, so different questions never collide."""
+    own = " ".join(query.lower().split())
+    extras = [" ".join(q.lower().split()) for q in queries if " ".join(q.lower().split()) != own]
+    return ("answer", resolution.get("ontology_version"), tuple(sorted(concepts)), tuple(sorted(domains)),
+            tuple(extras) if extras else (own,), CANDIDATE_POOL, limit)
+
+
 def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000,
                _plan=None, _request_started=None, _include_documents=True, _ontology_resolution_ms=None,
                _retrieval_context=None):
@@ -2545,12 +2559,20 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     if concepts and domains:
         web_started = time.perf_counter()
         try:
-            website = post_json_with_retry(
-                f"{WEBSEARCH_URL}/api/search",
-                {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
-                 "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
-                WEBSEARCH_KEY,
-            )
+            answer_key = _answer_key(query, queries, concepts, domains, resolution, limit)
+            website = answer_store.get(answer_key) if answer_store.enabled else None
+            if website is not None:
+                timings["answer_shared"] = True
+            else:
+                website = post_json_with_retry(
+                    f"{WEBSEARCH_URL}/api/search",
+                    {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
+                     "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
+                    WEBSEARCH_KEY,
+                )
+                if website.get("search_mode") != "keyword_only" and not website.get("partial") and website.get("results") \
+                        and website.get("queries_sent", len(queries)) >= len(queries):   # a shrunk retry is not the plan's answer
+                    answer_store.put(answer_key, website)
             # MCP's authorization decision remains authoritative; Websearch only reports/filter-searches results.
             website["resolution"] = resolution
         except Exception as exc:
