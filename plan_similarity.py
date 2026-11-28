@@ -9,9 +9,13 @@ A similarity is a distance, not a probability. Run in shadow first (MCP_PLAN_REU
 the model logs its nearest earlier question's similarity and whether the model chose the same concepts, which shows what
 agreement a given similarity really buys. Reuse switches on only when a threshold is set.
 """
+import hashlib
+import json
 import math
 import threading
 import time
+from array import array
+from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
@@ -91,3 +95,116 @@ def reusable(plan):
                 and not resolution.get("needs_clarification")
                 and not (resolution.get("feelings_route") or {}).get("degraded")
                 and not (plan or {}).get("clarification"))
+
+
+class SharedVectors:
+    """The embeddings of recent questions in a table every MCP instance reads, so similar questions match across instances.
+
+    One small row per question (its 256-number vector and a pointer to its plan in the plan table), in one partition per
+    scope (ontology version, model, conversation context). An instance reads a scope's partition at most once every
+    `refresh` seconds and compares in memory; the plan itself is fetched by a point read only when a row is close enough
+    to use. A slow or failing table is skipped for a while. Off without a storage connection or with a lifetime of 0."""
+
+    def __init__(self, connection, table_name, ttl_seconds, refresh=60.0, max_rows=1000, timeout=1.0, cooldown=30.0, table=None):
+        self._connection, self._name, self._ttl = connection, table_name, ttl_seconds
+        self._refresh, self._max_rows, self._timeout, self._cooldown, self._table = refresh, max_rows, timeout, cooldown, table
+        self._lock = threading.Lock()
+        self._down_until, self._loaded, self._writer = 0.0, {}, None
+        self.stats = {"loads": 0, "load_rows": 0, "errors": 0, "writes": 0, "write_errors": 0}
+
+    @property
+    def enabled(self):
+        return self._ttl > 0 and bool(self._table is not None or self._connection)
+
+    @staticmethod
+    def partition_for(scope):
+        return hashlib.sha256(json.dumps(list(scope), default=str).encode("utf-8")).hexdigest()[:16]
+
+    def _client(self):
+        if self._table is None:
+            from azure.core.exceptions import ResourceExistsError
+            from azure.data.tables import TableServiceClient
+            service = TableServiceClient.from_connection_string(
+                self._connection, connection_timeout=self._timeout, read_timeout=self._timeout, retry_total=1)
+            table = service.get_table_client(self._name)
+            try:
+                table.create_table()
+            except ResourceExistsError:
+                pass
+            self._table = table
+        return self._table
+
+    def _fail(self):
+        with self._lock:
+            self.stats["errors"] += 1
+            self._down_until = time.monotonic() + self._cooldown
+
+    def rows(self, scope):
+        """[(vector, (partition, row))] for this scope: what other instances stored, read at most once per refresh."""
+        if not self.enabled:
+            return []
+        part = self.partition_for(scope)
+        now = time.monotonic()
+        with self._lock:
+            loaded = self._loaded.get(part)
+            if loaded and now - loaded[0] < self._refresh:
+                return loaded[1]
+            if now < self._down_until:
+                return loaded[1] if loaded else []
+        try:
+            found = []
+            cutoff = time.time() - self._ttl
+            for entity in self._client().query_entities(f"PartitionKey eq '{part}'"):
+                if float(entity.get("ts") or 0) < cutoff:
+                    continue
+                raw = entity.get("vec")
+                raw = bytes(getattr(raw, "value", raw) or b"")
+                vector = array("f")
+                vector.frombytes(raw)
+                ref = str(entity.get("ref") or "").split("|")
+                if len(vector) == DIMS and len(ref) == 2:
+                    found.append((float(entity.get("ts") or 0), list(vector), (ref[0], ref[1])))
+            found.sort(key=lambda row: -row[0])
+            rows = [(vector, ref) for _, vector, ref in found[: self._max_rows]]
+        except Exception:
+            self._fail()
+            return loaded[1] if loaded else []
+        with self._lock:
+            self._loaded[part] = (now, rows)
+            self.stats["loads"] += 1
+            self.stats["load_rows"] = len(rows)
+        return rows
+
+    def nearest(self, scope, vector):
+        """(similarity, (partition, row)) of the closest stored question in this scope, or (0.0, None)."""
+        best, ref = 0.0, None
+        for stored, stored_ref in self.rows(scope):
+            similarity = cosine(vector, stored)
+            if similarity > best:
+                best, ref = similarity, stored_ref
+        return best, ref
+
+    def _write(self, scope, vector, plan_ref):
+        try:
+            part = self.partition_for(scope)
+            row = hashlib.sha256("|".join(plan_ref).encode("utf-8")).hexdigest()[:32]
+            self._client().upsert_entity({"PartitionKey": part, "RowKey": row, "vec": array("f", vector).tobytes(),
+                                          "ref": "|".join(plan_ref), "ts": int(time.time())}, mode="replace")
+            with self._lock:
+                self.stats["writes"] += 1
+        except Exception:
+            with self._lock:
+                self.stats["write_errors"] += 1
+            self._fail()
+
+    def put(self, scope, vector, plan_ref, wait=False):
+        """Remember a question's vector and where its plan is stored, in the background unless wait=True."""
+        if not self.enabled or time.monotonic() < self._down_until:
+            return
+        if wait:
+            self._write(scope, vector, plan_ref)
+            return
+        with self._lock:
+            if self._writer is None:
+                self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="plan-vectors")
+        self._writer.submit(self._write, scope, vector, plan_ref)

@@ -100,3 +100,63 @@ def test_reuse_borrows_a_close_plan_and_keeps_the_new_wording_first(monkeypatch,
     assert len(calls) == expect_calls
     if expect_calls == 1:
         assert plan["resolution"]["resolved_by"] == "similar" and plan["queries"][0] == "how to network"
+
+
+class FakeVectorTable:
+    def __init__(self):
+        self.rows = {}
+
+    def upsert_entity(self, entity, mode=None):
+        self.rows[(entity["PartitionKey"], entity["RowKey"])] = dict(entity)
+
+    def query_entities(self, query_filter):
+        part = query_filter.split("'")[1]
+        return [dict(v) for (p, _), v in self.rows.items() if p == part]
+
+
+def test_a_vector_stored_by_one_instance_is_found_by_another():
+    from plan_similarity import DIMS, SharedVectors
+    table = FakeVectorTable()
+    scope = ("v1", "m", ())
+    near = prefix_unit([1.0, 0.1] + [0.0] * (DIMS - 2))
+    SharedVectors("x", "t", 600, table=table).put(scope, prefix_unit([1.0, 0.0] + [0.0] * (DIMS - 2)), ("pk", "rk"), wait=True)
+    reader = SharedVectors("x", "t", 600, table=table)
+    similarity, ref = reader.nearest(scope, near)
+    assert similarity > 0.99 and ref == ("pk", "rk")
+    assert reader.nearest(("v2", "m", ()), near) == (0.0, None)          # another scope is another partition
+    assert not SharedVectors("x", "t", 0).enabled
+
+
+def test_a_failing_table_gives_no_rows_instead_of_an_error():
+    from plan_similarity import SharedVectors
+
+    class Down:
+        def query_entities(self, query_filter):
+            raise RuntimeError("down")
+    reader = SharedVectors("x", "t", 600, table=Down())
+    assert reader.rows(("v1", "m", ())) == [] and reader.stats["errors"] == 1
+
+
+def test_reuse_finds_a_plan_another_instance_stored(monkeypatch):
+    from plan_similarity import DIMS, SharedVectors
+    from plan_store import PlanStore
+    from test_plan_store import FakeTable as FakePlanTable
+    calls = []
+    catalog = setup_model(monkeypatch, calls)
+    plans, vectors = FakePlanTable(), FakeVectorTable()
+    base = prefix_unit([1.0, 0.0] + [0.0] * (DIMS - 2))
+    close = prefix_unit([1.0, 0.1] + [0.0] * (DIMS - 2))
+    monkeypatch.setattr(server, "plan_embedder", FakeEmbedder({"how do i network": base, "how to network": close}))
+    monkeypatch.setattr(server, "PLAN_REUSE_SIMILARITY", 0.95)
+    monkeypatch.setattr(server, "plan_store", PlanStore("x", "t", 600, table=plans))
+    monkeypatch.setattr(server, "shared_vectors", SharedVectors("x", "t", 600, refresh=0, table=vectors))
+    resolve_plan("how do i network", catalog)
+    for _ in range(100):
+        if vectors.rows and plans.rows:
+            break
+        import time
+        time.sleep(0.02)
+    monkeypatch.setattr(server, "similar_plans", SimilarPlans())          # a different instance: nothing in its memory
+    server.clear_ontology_plan_cache()
+    plan = resolve_plan("how to network", catalog)
+    assert calls == ["how do i network"] and plan["resolution"]["resolved_by"] == "similar"

@@ -59,13 +59,16 @@ class PlanStore:
 
     def get(self, key):
         """The plan stored for this key, or None (absent, too old, unreadable, or the table is down)."""
+        return self.get_by_row(*row_key_for(key))
+
+    def get_by_row(self, partition, row):
+        """The plan stored at this partition and row (what row_key_for gives for its key), or None."""
         if not self.enabled:
             return None
         if time.monotonic() < self._down_until:
             with self._lock:
                 self.stats["skipped"] += 1
             return None
-        partition, row = row_key_for(key)
         with self._lock:
             self.stats["reads"] += 1
         try:

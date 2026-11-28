@@ -30,7 +30,7 @@ import requests  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 from mcp.types import CallToolResult, ToolAnnotations  # noqa: E402
 
-from plan_similarity import Embedder, SimilarPlans, reusable  # noqa: E402
+from plan_similarity import Embedder, SharedVectors, SimilarPlans, reusable  # noqa: E402
 from plan_store import PlanStore  # noqa: E402
 from rate_limit import RateLimitMiddleware, TrustedRanges  # noqa: E402
 
@@ -848,6 +848,8 @@ plan_embedder = Embedder(setting("AZURE_OPENAI_ENDPOINT"), setting("AZURE_OPENAI
                          float(setting("MCP_PLAN_EMBED_TIMEOUT_SECONDS", "2") or 2))
 PLAN_REUSE_SIMILARITY = max(0.0, min(1.0, float(setting("MCP_PLAN_REUSE_SIMILARITY", "0") or 0)))
 similar_plans = SimilarPlans(max(10, int(setting("MCP_PLAN_SIMILARITY_ENTRIES", "1000") or 1000)))
+shared_vectors = SharedVectors(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
+                               setting("MCP_PLAN_VECTOR_TABLE", "mcpplanvectors") or "mcpplanvectors", PLAN_STORE_SECONDS)
 _plan_embed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="plan-embed")
 ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "500") or 500))
 _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
@@ -1643,7 +1645,7 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
             _ontology_plan_cache_put(key, plan)
             plan_store.put(key, plan)
         if plan_embedder.enabled:
-            _note_plan_vector(scope, vector, pending, plan)
+            _note_plan_vector(scope, vector, pending, plan, key)
         shared.set_result(plan)
         return plan
     except BaseException as exc:
@@ -1654,11 +1656,29 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
             _ontology_plan_inflight.pop(key, None)
 
 
+def _plan_ref(key):
+    """Where plan_store keeps the plan for this key: (partition, row)."""
+    from plan_store import row_key_for
+    return row_key_for(key)
+
+
+def _nearest_plan(scope, vector):
+    """(similarity, plan) of the closest earlier question, from this instance's memory or the shared table."""
+    similarity, near = similar_plans.nearest(scope, vector)
+    if shared_vectors.enabled:
+        shared_similarity, ref = shared_vectors.nearest(scope, vector)
+        if ref is not None and shared_similarity > similarity:
+            stored = plan_store.get_by_row(*ref)
+            if stored is not None:
+                return shared_similarity, stored
+    return similarity, near
+
+
 def _similar_plan(query, key, scope, vector):
     """The plan of an earlier, similar question when it is close enough to borrow, else None."""
     if vector is None:
         return None
-    similarity, near = similar_plans.nearest(scope, vector)
+    similarity, near = _nearest_plan(scope, vector)
     if near is None or similarity < PLAN_REUSE_SIMILARITY or not reusable(near):
         return None
     plan = copy.deepcopy(near)
@@ -1672,14 +1692,14 @@ def _similar_plan(query, key, scope, vector):
     return plan
 
 
-def _note_plan_vector(scope, vector, pending, plan):
+def _note_plan_vector(scope, vector, pending, plan, key=None):
     """After the model built a plan: log how its nearest earlier question compares (measuring), and remember this one."""
     try:
         if vector is None and pending is not None:
             vector = pending.result(timeout=1.0)
         if vector is None:
             return
-        similarity, near = similar_plans.nearest(scope, vector)
+        similarity, near = _nearest_plan(scope, vector)
         if near is not None and similarity >= 0.8:
             mine = set((plan.get("resolution") or {}).get("matched_concepts") or [])
             theirs = set((near.get("resolution") or {}).get("matched_concepts") or [])
@@ -1687,6 +1707,8 @@ def _note_plan_vector(scope, vector, pending, plan):
                   f"reusable={str(reusable(near)).lower()}", file=sys.stderr, flush=True)
         if reusable(plan):
             similar_plans.add(scope, vector, copy.deepcopy(plan))
+            if key is not None:
+                shared_vectors.put(scope, vector, _plan_ref(key))   # the plan itself went to plan_store with the same key
     except Exception:
         pass   # measuring must never fail a search
 
