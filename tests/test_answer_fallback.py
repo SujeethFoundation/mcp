@@ -41,7 +41,8 @@ def setup(monkeypatch, near_vector, mine, answer=True):
     monkeypatch.setattr(server, "similar_plans", plans)
     monkeypatch.setattr(server, "plan_embedder", FakeEmbedder({"how to network": mine}))
     if answer:
-        store.put(server._answer_key("how do i network", EARLIER["queries"], ["explore"], ["sujeeth.org"], RES,
+        sent = server._queries_to_search("how do i network", EARLIER["queries"], EARLIER)
+        store.put(server._answer_key(sent[0], sent, ["explore"], ["sujeeth.org"], RES,
                                      server.RESULT_COUNT), {"status": "completed", "results": [HIT]}, wait=True)
     plan = {"resolution": RES, "queries": ["how to network"], "error": None}
     monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: plan)

@@ -16,6 +16,15 @@ RESOLVED = {"status": "resolved", "ontology_version": "1.10.0", "matched_concept
 HIT = {"title": "Volunteer", "url": "https://sujeeth.org/volunteer", "snippet": "Become a mentor.",
        "source": "website", "domain": "sujeeth.org", "chunk_id": "v-0"}
 
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.fixture(autouse=True)
+def _every_variant(monkeypatch):
+    """These tests cover sending several query variants: MCP_TOPIC_QUERIES 0 (every query, the earlier behavior)."""
+    monkeypatch.setattr(server, "TOPIC_QUERIES", 0)
+
+
 
 def reply(body, status=200):
     response = requests.Response()

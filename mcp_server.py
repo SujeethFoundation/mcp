@@ -132,6 +132,10 @@ CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "20") or 20)   # the Searc
 MAX_PER_DOMAIN = int(setting("MAX_RESULTS_PER_DOMAIN", "2") or 2)
 # A universal search uses three topic queries and may add one feeling query.
 MAX_QUERIES = max(4, min(int(setting("SEARCH_MAX_QUERIES", "4") or 4), 5))   # searches one tool call may combine (query + more_queries)
+# Topic queries sent to the search apps per search, plus the feeling query when the plan has one. The model's first rewrite
+# comes first (it is usually a better search than the visitor's own sentence), then the question, then the other rewrites and
+# the agent's more_queries. Each one is a full ranking pass on the search app, so fewer is faster. 0 = everything, as before.
+TOPIC_QUERIES = max(0, int(setting("MCP_TOPIC_QUERIES", "1") or 0))
 WIKI_POOL = MAX_PER_DOMAIN + 2  # the wiki counts as one source, so it needs only a few candidates
 # When the best wiki result is an overview that links to the pages that answer the question ("weekly agendas" -> Weekly Content,
 # which links Week 1 to Week 6), the wiki app returns those pages with it (hub_pages / hub_of). They are kept together, outside the
@@ -1998,7 +2002,7 @@ SEARCH_DESCRIPTION = (
     "includes agent_instructions and, only when two readings of the question could conflict, a "
     "suggested_question to ask. If the response has out_of_scope true, the question is not about the Foundation: "
     "relay its message and do not answer from other sources. "
-    + (f"You may pass same-topic wording variants in more_queries (up to {MAX_QUERIES} queries in one search request). " if MAX_QUERIES > 1 else "")
+    + (f"You may pass same-topic wording variants in more_queries (up to {MAX_QUERIES} queries in one search request). " if MAX_QUERIES > 1 and TOPIC_QUERIES != 1 else "")
     + "For separate topics, call this tool separately. A chat client may pass one compact retrieval_context with an "
     "active feeling and career context; MCP decides whether it remains relevant. Do not request page text here; use "
     "get_documents only when the excerpts are insufficient."
@@ -2033,7 +2037,8 @@ SERVER_INSTRUCTIONS = (
     "Knowledge about the Sujeeth Foundation: its Career Circles student mentorship program, mentoring, "
     "volunteering, donating and partnering. Start with search_sujeeth_foundation; it searches the "
     "website and the wiki together"
-    + (", and sends three career-topic queries plus an optional career-contextual feeling query together in one search request. " if MAX_QUERIES > 1 else ". ")
+    + (", and sends the best career-topic wording of the question plus an optional career-contextual feeling query in one search request. " if TOPIC_QUERIES == 1
+       else ", and sends several career-topic queries plus an optional career-contextual feeling query together in one search request. " if MAX_QUERIES > 1 else ". ")
     + "Results are excerpts. "
     + f"If the excerpts do not answer the question, call get_documents once with the urls you need "
     f"(at most {MAX_BATCH_DOCUMENTS}). Cite the url for every claim. " + STATS_RULE
@@ -2535,6 +2540,23 @@ def _one_flight(key, fetch):
             _answer_inflight.pop(key, None)
 
 
+def _queries_to_search(query, queries, plan):
+    """The queries actually sent to the search apps: MCP_TOPIC_QUERIES topic wordings (the model's rewrites first, then the
+    question, then the rest), plus the plan's feeling query. With MCP_TOPIC_QUERIES 0, every query, as before."""
+    if TOPIC_QUERIES <= 0:
+        return list(queries)
+    plan_queries = ((plan or {}).get("resolution") or {}).get("query_plan") or {}
+    norm = lambda text: " ".join(str(text or "").casefold().split())
+    feeling = plan_queries.get("feeling_query") if isinstance(plan_queries.get("feeling_query"), str) else None
+    rewrites = [q for q in plan_queries.get("topic_queries") or [] if isinstance(q, str) and norm(q) != norm(query)]
+    picked, seen = [], {norm(feeling)} if feeling else set()
+    for text in rewrites + [query] + list(queries):
+        if isinstance(text, str) and text.strip() and norm(text) not in seen:
+            seen.add(norm(text))
+            picked.append(text.strip())
+    return picked[:TOPIC_QUERIES] + ([feeling] if feeling else [])
+
+
 def _answer_key(query, queries, concepts, domains, resolution, limit):
     """What identifies a website search by its plan. The plan's own queries stand for the question; when the plan adds none
     (an obvious question answered without the model) the question itself is the key, so different questions never collide."""
@@ -2563,6 +2585,7 @@ def _similar_answer(query, limit, retrieval_context, failures, state):
     resolution = near.get("resolution") or {}
     if not near_queries:
         return None
+    near_queries = _queries_to_search(near_queries[0], near_queries, near)
     stored = answer_store.get(_answer_key(near_queries[0], near_queries, search_concepts(resolution),
                                           resolution.get("domains") or [], resolution, limit))
     if stored is None:
@@ -2608,6 +2631,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         else round((time.perf_counter() - ontology_started) * 1000)
     )
     queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
+    queries = _queries_to_search(query, queries, _plan)   # the first one leads each search app's request
     full_documents = bool(full_documents and _include_documents)
     cache_key = _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries,
                                   _retrieval_context)
@@ -2649,7 +2673,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         sibling_queries = queries[1:]
         def timed_wiki_search():
             began = time.perf_counter()
-            value = run_wiki_search(query, full_documents, document_max_chars,
+            value = run_wiki_search(queries[0], full_documents, document_max_chars,
                                     concepts, domains, sibling_queries, include_documents=_include_documents)
             return value, round((time.perf_counter() - began) * 1000)
         wiki_future = wiki_pool.submit(timed_wiki_search)
@@ -2660,7 +2684,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     if concepts and domains:
         web_started = time.perf_counter()
         try:
-            answer_key = _answer_key(query, queries, concepts, domains, resolution, limit)
+            answer_key = _answer_key(queries[0], queries, concepts, domains, resolution, limit)
 
             def fetch_website():
                 stored = answer_store.get(answer_key) if answer_store.enabled else None
@@ -2670,7 +2694,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                 fallback_state = {}
                 fresh = post_json_with_retry(
                     f"{WEBSEARCH_URL}/api/search",
-                    {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
+                    {"query": queries[0], "queries": queries, "concepts": concepts, "domains": domains,
                      "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
                     WEBSEARCH_KEY,
                     on_failure=lambda attempt, exc: _similar_answer(query, limit, _retrieval_context, attempt, fallback_state),

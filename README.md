@@ -107,7 +107,8 @@ working for a caller that has left.
 | Layer | Limit | What happens at the limit |
 |---|---|---|
 | Agent tool call | the agent's own limit (keep above 30 s) | the agent answers without the tool |
-| MCP, one backend call in all | `MCP_REQUEST_TIMEOUT` 30 s | MCP answers with what it has (`status: partial`) |
+| MCP, one backend call in all | `MCP_TOPIC_QUERIES` | `1` | Topic wordings sent to the search apps per search, plus the plan's feeling query when it has one. The model's first rewrite goes first (usually a better search than the visitor's own sentence), then the question, then the other rewrites and the agent's `more_queries`. Each query is a full ranking pass on the website search app, so `1` is about 3-4x less work there than before. `0` sends every query, as before. The response's `queries` lists what was searched |
+| `MCP_REQUEST_TIMEOUT` 30 s | MCP answers with what it has (`status: partial`) |
 | MCP, one try | `MCP_TRY_TIMEOUT_SECONDS` 20 s, or the time left | sends `X-Request-Budget-Ms` = this less 1 s |
 | Search app, one request | `SEARCH_DEADLINE_SECONDS` 20 s, or the caller's budget if shorter | stops between stages, 503 `search_deadline` |
 | Search app, wait for a slot | `SEARCH_QUEUE_TIMEOUT_SECONDS` 5 s, or the budget if shorter | 503 `search_queue_timeout` |

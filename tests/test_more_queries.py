@@ -9,6 +9,15 @@ os.environ.setdefault("MCP_TRUSTED_RANGE_URLS", "none")
 import mcp_server as server  # noqa: E402
 
 
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.fixture(autouse=True)
+def _every_variant(monkeypatch):
+    """These tests cover sending several query variants: MCP_TOPIC_QUERIES 0 (every query, the earlier behavior)."""
+    monkeypatch.setattr(server, "TOPIC_QUERIES", 0)
+
+
 def resolved(*concepts):
     return {"status": "resolved", "ontology_version": "test", "matched_concepts": list(concepts),
             "concept_matches": [{"concept_id": c, "name": c.title(), "confidence": 1.0} for c in concepts],
@@ -126,7 +135,7 @@ def test_a_true_no_match_keeps_the_exact_refusal_without_searching(monkeypatch):
 
 def test_agent_guidance_keeps_separate_topics_as_separate_tool_calls():
     assert "For separate topics" in server.SEARCH_DESCRIPTION
-    assert "one search request" in server.SEARCH_DESCRIPTION
+    assert "one search request" in server.SERVER_INSTRUCTIONS
     assert "separate parts" not in server.SERVER_INSTRUCTIONS
 
 
