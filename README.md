@@ -144,6 +144,7 @@ The slim catalog does not carry the search domains. When the catalog has no `dom
 | `MCP_REQUEST_TIMEOUT` | `30` | Seconds to wait for a backend |
 | `MCP_RETRY_ATTEMPTS` | `4` | Tries in all (the first included) for a call to the website search app that is refused with HTTP 503 (an instance still loading its index, when `LOCAL_INDEX_FAIL_FAST` is on there) or cannot be reached. `1` turns retries off. All tries together stay within `MCP_REQUEST_TIMEOUT` |
 | `MCP_RETRY_DEFAULT_WAIT_SECONDS` | `3` | Wait before a retry when the 503 has no `Retry-After` header, and after a connection error |
+| `MCP_RETRY_SHRINK_QUERIES` | `true` | When the search app refuses because it is overloaded (`search_queue_timeout` or `search_deadline`) or a try times out, the retry sends one query fewer (the last, so the feeling query goes first), down to the question alone. Each query is a full search on the search app, so a lighter request is cheaper for it. A 503 for a still-loading index is retried unchanged. The result's `queries` lists what the last try carried |
 | `MCP_RETRY_MAX_WAIT_SECONDS` | `8` | Longest single wait, whatever `Retry-After` says |
 | `MCP_RETRY_MIN_ATTEMPT_SECONDS` | `4` | A retry is made only if at least this much of the timeout would be left after the wait |
 | `WIKI_EXCLUDE_TITLE_PATTERN` | circle-session pattern | Wiki pages to drop from results |

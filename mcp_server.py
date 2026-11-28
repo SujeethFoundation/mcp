@@ -104,6 +104,7 @@ TIMEOUT = int(setting("MCP_REQUEST_TIMEOUT", "30"))
 # in a moment instead of waiting on a busy instance. Connection errors are retried too. Every attempt together stays
 # within MCP_REQUEST_TIMEOUT, so a caller never waits longer than it did without retries.
 RETRY_ATTEMPTS = max(1, int(setting("MCP_RETRY_ATTEMPTS", "4") or 4))                 # tries in all, the first included; 1 = no retry
+RETRY_SHRINK_QUERIES = str(setting("MCP_RETRY_SHRINK_QUERIES", "true")).lower() not in ("0", "false", "no", "off")   # retry an overloaded search app with one query fewer
 RETRY_DEFAULT_WAIT = float(setting("MCP_RETRY_DEFAULT_WAIT_SECONDS", "3") or 3)       # wait when the 503 has no Retry-After
 RETRY_MAX_WAIT = float(setting("MCP_RETRY_MAX_WAIT_SECONDS", "8") or 8)               # longest single wait, whatever Retry-After says
 RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)         # a retry is made only if this long is left after the wait
@@ -474,6 +475,28 @@ def _retry_wait(exc):
     return None
 
 
+def _overloaded(exc):
+    """True when the search app was too busy (it refused after queueing or past its time limit, or the try timed out), as
+    opposed to still loading its index: a lighter request helps the first, and changes nothing for the second."""
+    if isinstance(exc, requests.Timeout):
+        return True
+    if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 503:
+        try:
+            return (exc.response.json() or {}).get("stage") in ("search_queue_timeout", "search_deadline")
+        except Exception:
+            return False
+    return False
+
+
+def _one_fewer_query(payload):
+    """The payload with its last extra query dropped (never below one query), or the same payload when it has no more to
+    drop. The queries run in order: the question, the topic wordings, then the feeling query, so the feeling goes first."""
+    queries = payload.get("queries") if isinstance(payload, dict) else None
+    if not isinstance(queries, list) or len(queries) <= 1:
+        return payload
+    return {**payload, "queries": queries[:-1]}
+
+
 def _why(exc):
     if isinstance(exc, requests.HTTPError) and exc.response is not None:
         return f"HTTP {exc.response.status_code}"
@@ -490,10 +513,14 @@ def post_json_with_retry(url, payload, key="", attempts=None):
     attempts = RETRY_ATTEMPTS if attempts is None else max(1, int(attempts))
     deadline = _clock() + TIMEOUT
     attempt = 0
+    first = len(payload["queries"]) if isinstance(payload, dict) and isinstance(payload.get("queries"), list) else None
     while True:
         attempt += 1
         try:
-            return post_json(url, payload, key, timeout=max(1.0, min(float(TIMEOUT), deadline - _clock())))
+            data = post_json(url, payload, key, timeout=max(1.0, min(float(TIMEOUT), deadline - _clock())))
+            if first and isinstance(data, dict) and len(payload["queries"]) < first:
+                data["queries_sent"] = len(payload["queries"])   # a retry shrank the request: say so
+            return data
         except Exception as exc:
             wait = _retry_wait(exc) if attempt < attempts else None
             if wait is None:
@@ -502,8 +529,11 @@ def post_json_with_retry(url, payload, key="", attempts=None):
             if deadline - _clock() - wait < RETRY_MIN_ATTEMPT:
                 raise
             _note_retry(url)
-            print(f"retry service={_service_of(url)} attempt={attempt} reason={_why(exc)} wait_s={wait:.1f}",
-                  file=sys.stderr, flush=True)
+            if RETRY_SHRINK_QUERIES and _overloaded(exc):
+                payload = _one_fewer_query(payload)
+            sent = len(payload["queries"]) if isinstance(payload, dict) and isinstance(payload.get("queries"), list) else None
+            print(f"retry service={_service_of(url)} attempt={attempt} reason={_why(exc)} wait_s={wait:.1f}"
+                  + (f" queries={sent}" if sent else ""), file=sys.stderr, flush=True)
             _sleep(wait)
 
 
@@ -2183,6 +2213,7 @@ def search_website(
             {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
              "ontology_version": resolution.get("ontology_version"), "purpose": "search",
              "limit": max(1, min(int(limit), 5))}, WEBSEARCH_KEY)
+        queries = queries[:payload.get("queries_sent") or len(queries)]   # what the search app was last asked, after any retry that shrank it
         items, seen = [], set()
         for item in payload.get("results", []) or []:
             identity = page_identity(item)
@@ -2263,6 +2294,7 @@ def search_wiki(
             params = {"query": query, "queries": queries, "limit": max(1, min(int(limit), 10)),
                       "concepts": concepts, "domains": domains, "full_text": False}
             payload = post_json_with_retry(f"{WIKISEARCH_URL}/api/search", params, WIKISEARCH_KEY)
+            queries = queries[:payload.get("queries_sent") or len(queries)]
         items, seen = [], set()
         for item in drop_excluded_wiki(normalize_results(payload, "wiki")):
             if item.get("source") not in {"wiki", None, ""}:

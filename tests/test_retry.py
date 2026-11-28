@@ -229,3 +229,57 @@ def test_the_combined_search_is_partial_when_the_instance_never_loads(monkeypatc
     result = server.search_sujeeth_foundation.sync("career circle")
     assert result["status"] == "partial"
     assert result["service_errors"] == [{"service": "websearch", "error": "Service returned HTTP 503."}]
+
+
+def busy(stage="search_queue_timeout"):
+    return reply(503, {"Retry-After": "1"}, ('{"stage": "%s"}' % stage).encode())
+
+
+def batch_call(queries):
+    return server.post_json_with_retry(URL, {"query": queries[0], "queries": queries}, "key")
+
+
+def sent_queries(fake_calls):
+    return [len(c) for c in fake_calls]
+
+
+def test_an_overloaded_search_app_is_retried_with_one_query_fewer_down_to_one(monkeypatch):
+    fake = Fake(monkeypatch, [busy(), busy("search_deadline"), busy(), reply()])
+    seen = []
+    original = fake.post
+    monkeypatch.setattr(server.http, "post", lambda url, headers=None, json=None, timeout=None:
+                        (seen.append(list(json["queries"])), original(url, headers, json, timeout))[1])
+    out = batch_call(["a", "b", "c", "d"])
+    assert [len(q) for q in seen] == [4, 3, 2, 1]
+    assert out["queries_sent"] == 1 and seen[-1] == ["a"]
+
+
+def test_a_search_app_that_is_still_loading_keeps_every_query(monkeypatch):
+    fake = Fake(monkeypatch, [busy("index_loading"), reply()])
+    seen = []
+    original = fake.post
+    monkeypatch.setattr(server.http, "post", lambda url, headers=None, json=None, timeout=None:
+                        (seen.append(list(json["queries"])), original(url, headers, json, timeout))[1])
+    out = batch_call(["a", "b", "c"])
+    assert [len(q) for q in seen] == [3, 3] and "queries_sent" not in out
+
+
+def test_a_timeout_also_shrinks_the_request(monkeypatch):
+    fake = Fake(monkeypatch, [requests.Timeout(), reply()])
+    seen = []
+    original = fake.post
+    monkeypatch.setattr(server.http, "post", lambda url, headers=None, json=None, timeout=None:
+                        (seen.append(list(json["queries"])), original(url, headers, json, timeout))[1])
+    batch_call(["a", "b", "c"])
+    assert [len(q) for q in seen] == [3, 2]
+
+
+def test_shrinking_can_be_turned_off(monkeypatch):
+    monkeypatch.setattr(server, "RETRY_SHRINK_QUERIES", False)
+    fake = Fake(monkeypatch, [busy(), reply()])
+    seen = []
+    original = fake.post
+    monkeypatch.setattr(server.http, "post", lambda url, headers=None, json=None, timeout=None:
+                        (seen.append(list(json["queries"])), original(url, headers, json, timeout))[1])
+    batch_call(["a", "b", "c"])
+    assert [len(q) for q in seen] == [3, 3]
