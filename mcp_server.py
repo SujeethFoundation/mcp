@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import functools
 import hashlib
@@ -113,7 +114,11 @@ RETRY_ATTEMPTS = max(1, int(setting("MCP_RETRY_ATTEMPTS", "4") or 4))           
 RETRY_SHRINK_QUERIES = str(setting("MCP_RETRY_SHRINK_QUERIES", "true")).lower() not in ("0", "false", "no", "off")   # retry an overloaded search app with one query fewer
 RETRY_DEFAULT_WAIT = float(setting("MCP_RETRY_DEFAULT_WAIT_SECONDS", "3") or 3)       # wait when the 503 has no Retry-After
 RETRY_MAX_WAIT = float(setting("MCP_RETRY_MAX_WAIT_SECONDS", "8") or 8)               # longest single wait, whatever Retry-After says
-WEBSEARCH_TRY_TIMEOUT = float(setting("MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS", "10") or 10)   # one try of a search app call; MCP_REQUEST_TIMEOUT still caps all tries together
+# One try of a backend call: at most this long, and never more than what is left of MCP_REQUEST_TIMEOUT. Each try tells the
+# backend how long it has (X-Request-Budget-Ms, this less a second), so the search app stops and answers before MCP gives up.
+# Match it to the search app's SEARCH_DEADLINE_SECONDS. (MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS is the older name.)
+TRY_TIMEOUT = float(setting("MCP_TRY_TIMEOUT_SECONDS", "") or setting("MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS", "20") or 20)
+BUDGET_MARGIN = 1.0   # seconds kept back from the budget a backend is told, for the reply to travel back
 RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)         # a retry is made only if this long is left after the wait
 
 # Search diversity settings.
@@ -373,12 +378,17 @@ def _get_json_raw(url, key="", params=None):
     return data if isinstance(data, dict) else {"data": data}
 
 
+_budget_ms = contextvars.ContextVar("budget_ms", default=None)   # set by post_json_with_retry for the try in progress
+
+
 def _post_json_raw(url, payload, key="", timeout=None):
+    budget = _budget_ms.get()
     response = http.post(
         url,
         headers={
             **auth(key),
             "Content-Type": "application/json",
+            **({"X-Request-Budget-Ms": str(budget)} if budget is not None else {}),
         },
         json=payload,
         timeout=TIMEOUT if timeout is None else timeout,
@@ -470,23 +480,28 @@ def _retry_after_seconds(response):
 def _retry_wait(exc):
     """Seconds to wait before trying again, or None when this failure is not worth another try.
 
-    Retried: HTTP 503 (the search app is still loading its index) and connection errors or timeouts. Not retried: any
-    other HTTP status, which a second try would not change (a 502 is a real failure in the search itself)."""
+    Retried: HTTP 503 (the backend is still loading, or refused because it was busy or out of time) and connection errors,
+    which never reached it. Not retried: a read timeout, since the backend got the request and may still be working on it (a
+    second copy only adds to its load), and any other HTTP status, which a second try would not change."""
     if isinstance(exc, requests.HTTPError):
         response = exc.response
         if response is not None and response.status_code == 503:
             return min(_retry_after_seconds(response), RETRY_MAX_WAIT)
         return None
-    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+    if isinstance(exc, requests.ConnectionError):   # includes ConnectTimeout: the request never arrived
         return min(RETRY_DEFAULT_WAIT, RETRY_MAX_WAIT)
     return None
 
 
+def _unavailable(exc):
+    """True for a failure that means the backend could not answer now (503, unreachable, or out of time): the cases where an
+    answer stored for a similar question is worth more than an error."""
+    return _retry_wait(exc) is not None or isinstance(exc, requests.Timeout)
+
+
 def _overloaded(exc):
-    """True when the search app was too busy (it refused after queueing or past its time limit, or the try timed out), as
-    opposed to still loading its index: a lighter request helps the first, and changes nothing for the second."""
-    if isinstance(exc, requests.Timeout):
-        return True
+    """True when the search app refused because it was busy or out of time, as opposed to still loading its index: a lighter
+    request helps the first, and changes nothing for the second."""
     if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 503:
         try:
             return (exc.response.json() or {}).get("stage") in ("search_queue_timeout", "search_deadline")
@@ -510,7 +525,7 @@ def _why(exc):
     return type(exc).__name__
 
 
-def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None, try_timeout=None):
+def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None):
     """post_json, tried again when the search app is still loading or briefly unreachable.
 
     All tries together take at most MCP_REQUEST_TIMEOUT seconds: each try is given only the time that is left, and a
@@ -520,7 +535,7 @@ def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None, t
 
     on_failure(attempt, exc), when given, is asked after each failure that a retry could cure (busy, loading, unreachable): a
     value it returns is used as the answer, so the search app is not called again. None means carry on with the retry.
-    try_timeout caps one try (still within the overall time left), so a slow first try leaves room for a retry or the fallback."""
+    Each try lasts at most MCP_TRY_TIMEOUT_SECONDS and tells the backend its budget (X-Request-Budget-Ms)."""
     attempts = RETRY_ATTEMPTS if attempts is None else max(1, int(attempts))
     deadline = _clock() + TIMEOUT
     attempt = 0
@@ -528,12 +543,17 @@ def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None, t
     while True:
         attempt += 1
         try:
-            data = post_json(url, payload, key, timeout=max(1.0, min(float(try_timeout or TIMEOUT), deadline - _clock())))
+            this_try = max(1.0, min(TRY_TIMEOUT, float(TIMEOUT), deadline - _clock()))
+            token = _budget_ms.set(int(max(0.0, this_try - BUDGET_MARGIN) * 1000))
+            try:
+                data = post_json(url, payload, key, timeout=this_try)
+            finally:
+                _budget_ms.reset(token)
             if first and isinstance(data, dict) and len(payload["queries"]) < first:
                 data["queries_sent"] = len(payload["queries"])   # a retry shrank the request: say so
             return data
         except Exception as exc:
-            if on_failure is not None and _retry_wait(exc) is not None:
+            if on_failure is not None and _unavailable(exc):
                 try:
                     stand_in = on_failure(attempt, exc)
                 except Exception:
@@ -2618,7 +2638,6 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                     {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
                      "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
                     WEBSEARCH_KEY,
-                    try_timeout=WEBSEARCH_TRY_TIMEOUT,
                     on_failure=lambda attempt, exc: _similar_answer(query, limit, _retrieval_context, attempt, fallback_state),
                 )
                 if website.get("answer_from_similar") is not None:

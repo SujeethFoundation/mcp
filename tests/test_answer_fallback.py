@@ -82,7 +82,7 @@ def test_one_try_of_the_search_app_call_is_capped_but_not_the_overall_budget(mon
     clock = iter(range(0, 1000, 8))                      # each look at the clock is 8 s later
     monkeypatch.setattr(server, "_clock", lambda: next(clock))
     try:
-        server.post_json_with_retry("https://x/api/search", {"queries": ["a"]}, try_timeout=10)
+        server.post_json_with_retry("https://x/api/search", {"queries": ["a"]})
     except requests.Timeout:
         pass
-    assert seen and max(seen) == 10 and server.WEBSEARCH_TRY_TIMEOUT == 10
+    assert seen == [20] and server.TRY_TIMEOUT == 20      # capped, and a read timeout is not sent again
