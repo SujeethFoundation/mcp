@@ -129,7 +129,8 @@ Caches: each thing is kept in memory on the instance, in front of one shared tab
 | Website search answer | `SEARCH_CACHE_SECONDS` 3600, 2,000 (whole tool response) | `mcpanswers`, `MCP_ANSWER_STORE_SECONDS` 3600 | the plan, not the wording |
 | Page text (`get_documents`) | `DOCUMENT_CACHE_SECONDS` 900, 300 | none | url |
 
-The search app keeps only a per-instance answer cache (cleared when its index changes) and its 30-day question-embedding
+Each website search request also carries `best_bet_domains` (the selected domains the ontology marks `manual_only`), so the
+search app's search path never calls the ontology app. The search app keeps only a per-instance answer cache (cleared when its index changes) and its 30-day question-embedding
 cache; answers shared between instances live here, keyed by plan. Expired table rows are swept in the background.
 
 ## Settings

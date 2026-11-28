@@ -941,7 +941,7 @@ def fetch_search_domains(timeout):
     rows = (response.json() or {}).get("domains")
     if not isinstance(rows, list):
         raise ValueError("not a list of domains")
-    return [{"domain": row["domain"], "search_enabled": True,
+    return [{"domain": row["domain"], "search_enabled": True, "manual_only": bool(row.get("manual_only")),
              "associated_concepts": [c for c in row.get("associated_concepts") or [] if isinstance(c, str)]}
             for row in rows if isinstance(row, dict) and row.get("domain")]
 
@@ -2540,6 +2540,22 @@ def _one_flight(key, fetch):
             _answer_inflight.pop(key, None)
 
 
+_NO_CATALOG = object()
+
+
+def best_bet_domains(domains, catalog=_NO_CATALOG):
+    """Which of these domains the ontology marks manual_only (they hold hand-added pages, searched as best bets). The search
+    app gets this with each request so it never has to ask the ontology app. None when the catalog does not say (an older
+    catalog without the field): the search app then looks it up itself, as before."""
+    catalog = ontology_catalog() if catalog is _NO_CATALOG else catalog
+    rows = [row for row in (catalog or {}).get("domains") or [] if isinstance(row, dict) and row.get("domain")]
+    if not rows or not any("manual_only" in row for row in rows):
+        return None
+    wanted = {str(d).lower() for d in domains or []}
+    return sorted({str(row["domain"]).lower() for row in rows if row.get("manual_only") is True
+                   and str(row["domain"]).lower() in wanted})
+
+
 def _queries_to_search(query, queries, plan):
     """The queries actually sent to the search apps: MCP_TOPIC_QUERIES topic wordings (the model's rewrites first, then the
     question, then the rest), plus the plan's feeling query. With MCP_TOPIC_QUERIES 0, every query, as before."""
@@ -2695,7 +2711,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                 fresh = post_json_with_retry(
                     f"{WEBSEARCH_URL}/api/search",
                     {"query": queries[0], "queries": queries, "concepts": concepts, "domains": domains,
-                     "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
+                     "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL,
+                     **({"best_bet_domains": bets} if (bets := best_bet_domains(domains)) is not None else {})},
                     WEBSEARCH_KEY,
                     on_failure=lambda attempt, exc: _similar_answer(query, limit, _retrieval_context, attempt, fallback_state),
                 )

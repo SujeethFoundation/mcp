@@ -58,7 +58,7 @@ def test_a_catalog_without_domains_gets_them_from_the_ontology_app(monkeypatch):
     assert [url for url, _ in calls] == [server.ONTOLOGY_CATALOG_URL, DOMAINS_URL]
     assert calls[1][1] == {"x-functions-key": "k"}
     assert plan_domains(catalog) == ["tealhq.com", "sujeeth.org"]
-    assert catalog["domains"][0] == {"domain": "tealhq.com", "search_enabled": True,
+    assert catalog["domains"][0] == {"domain": "tealhq.com", "search_enabled": True, "manual_only": False,
                                      "associated_concepts": ["resume_resource", "interviewing"]}   # crawl policy not kept
 
 
