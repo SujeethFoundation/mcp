@@ -5,6 +5,7 @@ import copy
 import functools
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -32,6 +33,9 @@ from mcp.types import CallToolResult, ToolAnnotations  # noqa: E402
 
 from plan_similarity import Embedder, SharedVectors, SimilarPlans, reusable  # noqa: E402
 from plan_store import PlanStore  # noqa: E402
+
+# The Azure SDK logs every Table Storage call (about ten lines, at Error level in this host), and a plan-table miss is a normal 404.
+logging.getLogger("azure").setLevel(logging.WARNING)
 from rate_limit import RateLimitMiddleware, TrustedRanges  # noqa: E402
 
 
