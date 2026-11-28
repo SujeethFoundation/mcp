@@ -41,7 +41,8 @@ def setup(monkeypatch, near_vector, mine, answer=True):
     monkeypatch.setattr(server, "similar_plans", plans)
     monkeypatch.setattr(server, "plan_embedder", FakeEmbedder({"how to network": mine}))
     if answer:
-        store.put(server._answer_key("how do i network", EARLIER["queries"], ["explore"], ["sujeeth.org"], RES,
+        sent = server._queries_to_search("how do i network", EARLIER["queries"], EARLIER)
+        store.put(server._answer_key(sent[0], sent, ["explore"], ["sujeeth.org"], RES,
                                      server.RESULT_COUNT), {"status": "completed", "results": [HIT]}, wait=True)
     plan = {"resolution": RES, "queries": ["how to network"], "error": None}
     monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: plan)
@@ -82,7 +83,13 @@ def test_one_try_of_the_search_app_call_is_capped_but_not_the_overall_budget(mon
     clock = iter(range(0, 1000, 8))                      # each look at the clock is 8 s later
     monkeypatch.setattr(server, "_clock", lambda: next(clock))
     try:
-        server.post_json_with_retry("https://x/api/search", {"queries": ["a"]}, try_timeout=10)
+        server.post_json_with_retry("https://x/api/search", {"queries": ["a"]})
     except requests.Timeout:
         pass
-    assert seen and max(seen) == 10 and server.WEBSEARCH_TRY_TIMEOUT == 10
+    assert seen == [20] and server.TRY_TIMEOUT == 20      # capped, and a read timeout is not sent again
+
+
+def test_the_agent_is_told_when_the_answer_was_borrowed(monkeypatch):
+    setup(monkeypatch, e(1.0, 0.0), e(1.0, 0.3))
+    out = server.search_sujeeth_foundation.sync("how to network")
+    assert "closely related earlier question" in out["agent_instructions"]

@@ -57,3 +57,60 @@ def test_nothing_is_stored_when_off_or_when_the_search_failed(monkeypatch):
     server.search_sujeeth_foundation.sync("what is career circles")
     flush(server.answer_store)
     assert not table.rows
+
+
+def test_identical_searches_at_the_same_time_make_one_call(monkeypatch):
+    import threading
+    import time as _time
+    use_store(monkeypatch)
+    started, release, calls = threading.Event(), threading.Event(), []
+
+    def fetch():
+        calls.append(1)
+        started.set()
+        release.wait(2)
+        return {"results": [HIT]}
+
+    out = []
+    first = threading.Thread(target=lambda: out.append(server._one_flight(("k",), fetch)))
+    first.start()
+    started.wait(2)
+    second = threading.Thread(target=lambda: out.append(server._one_flight(("k",), fetch)))
+    second.start()
+    _time.sleep(0.05)
+    release.set()
+    first.join(); second.join()
+    assert len(calls) == 1 and sorted(joined for _, joined in out) == [False, True]
+    assert out[0][0] is not out[1][0]                    # each caller gets its own copy
+
+
+def test_a_failure_is_shared_too_and_the_next_caller_tries_again():
+    import pytest
+    def boom():
+        raise RuntimeError("down")
+    with pytest.raises(RuntimeError):
+        server._one_flight(("k2",), boom)
+    assert server._one_flight(("k2",), lambda: {"ok": 1}) == ({"ok": 1}, False)
+
+
+def test_the_search_apps_stage_times_reach_the_timings_but_not_the_table(monkeypatch):
+    table = use_store(monkeypatch)
+    calls = []
+
+    class Reply:
+        status_code = 200
+        headers = {"X-Stage-Ms": '{"rank":12,"embed":30}'}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"status": "completed", "resolution": RESOLVED, "results": [HIT]}
+
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
+    monkeypatch.setattr(server.http, "post", lambda url, headers=None, json=None, timeout=None: calls.append(url) or Reply())
+    monkeypatch.setattr(server, "TIMINGS", True)
+    out = server.search_sujeeth_foundation.sync("what is career circles")
+    flush(server.answer_store)
+    assert out["timings_ms"]["websearch_stage_ms"] == {"rank": 12, "embed": 30}
+    assert table.rows and all("_stage_ms" not in str(row) for row in table.rows.values())

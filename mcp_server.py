@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import functools
 import hashlib
@@ -88,7 +89,7 @@ ONTOLOGY_MODEL_TIMEOUT = max(5, int(setting("MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS"
 ONTOLOGY_REASONING_EFFORT = str(setting("MCP_ONTOLOGY_REASONING_EFFORT", "low") or "low").strip().lower()
 if ONTOLOGY_REASONING_EFFORT not in {"low", "medium", "high", "xhigh", "max"}:
     ONTOLOGY_REASONING_EFFORT = "low"
-ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS = max(100, int(setting("MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS", "400") or 400))
+ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS = max(100, int(setting("MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS", "600") or 600))   # 400 cut some plans off mid-JSON
 ONTOLOGY_MODEL_MAX_CONCURRENCY = max(1, int(setting("MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY", "4") or 4))
 ONTOLOGY_MODEL_RETRY_ATTEMPTS = max(1, int(setting("MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS", "3") or 3))
 ONTOLOGY_MODEL_RETRY_MAX_WAIT = max(0.25, float(setting("MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS", "5") or 5))
@@ -113,7 +114,11 @@ RETRY_ATTEMPTS = max(1, int(setting("MCP_RETRY_ATTEMPTS", "4") or 4))           
 RETRY_SHRINK_QUERIES = str(setting("MCP_RETRY_SHRINK_QUERIES", "true")).lower() not in ("0", "false", "no", "off")   # retry an overloaded search app with one query fewer
 RETRY_DEFAULT_WAIT = float(setting("MCP_RETRY_DEFAULT_WAIT_SECONDS", "3") or 3)       # wait when the 503 has no Retry-After
 RETRY_MAX_WAIT = float(setting("MCP_RETRY_MAX_WAIT_SECONDS", "8") or 8)               # longest single wait, whatever Retry-After says
-WEBSEARCH_TRY_TIMEOUT = float(setting("MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS", "10") or 10)   # one try of a search app call; MCP_REQUEST_TIMEOUT still caps all tries together
+# One try of a backend call: at most this long, and never more than what is left of MCP_REQUEST_TIMEOUT. Each try tells the
+# backend how long it has (X-Request-Budget-Ms, this less a second), so the search app stops and answers before MCP gives up.
+# Match it to the search app's SEARCH_DEADLINE_SECONDS. (MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS is the older name.)
+TRY_TIMEOUT = float(setting("MCP_TRY_TIMEOUT_SECONDS", "") or setting("MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS", "20") or 20)
+BUDGET_MARGIN = 1.0   # seconds kept back from the budget a backend is told, for the reply to travel back
 RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)         # a retry is made only if this long is left after the wait
 
 # Search diversity settings.
@@ -127,6 +132,10 @@ CANDIDATE_POOL = int(setting("SEARCH_CANDIDATE_POOL", "20") or 20)   # the Searc
 MAX_PER_DOMAIN = int(setting("MAX_RESULTS_PER_DOMAIN", "2") or 2)
 # A universal search uses three topic queries and may add one feeling query.
 MAX_QUERIES = max(4, min(int(setting("SEARCH_MAX_QUERIES", "4") or 4), 5))   # searches one tool call may combine (query + more_queries)
+# Topic queries sent to the search apps per search, plus the feeling query when the plan has one. The model's first rewrite
+# comes first (it is usually a better search than the visitor's own sentence), then the question, then the other rewrites and
+# the agent's more_queries. Each one is a full ranking pass on the search app, so fewer is faster. 0 = everything, as before.
+TOPIC_QUERIES = max(0, int(setting("MCP_TOPIC_QUERIES", "1") or 0))
 WIKI_POOL = MAX_PER_DOMAIN + 2  # the wiki counts as one source, so it needs only a few candidates
 # When the best wiki result is an overview that links to the pages that answer the question ("weekly agendas" -> Weekly Content,
 # which links Week 1 to Week 6), the wiki app returns those pages with it (hub_pages / hub_of). They are kept together, outside the
@@ -373,19 +382,31 @@ def _get_json_raw(url, key="", params=None):
     return data if isinstance(data, dict) else {"data": data}
 
 
+_budget_ms = contextvars.ContextVar("budget_ms", default=None)   # set by post_json_with_retry for the try in progress
+
+
 def _post_json_raw(url, payload, key="", timeout=None):
+    budget = _budget_ms.get()
     response = http.post(
         url,
         headers={
             **auth(key),
             "Content-Type": "application/json",
+            **({"X-Request-Budget-Ms": str(budget)} if budget is not None else {}),
         },
         json=payload,
         timeout=TIMEOUT if timeout is None else timeout,
     )
     response.raise_for_status()
     data = response.json()
-    return data if isinstance(data, dict) else {"data": data}
+    data = data if isinstance(data, dict) else {"data": data}
+    stages = getattr(response, "headers", {}).get("X-Stage-Ms") if hasattr(response, "headers") else None
+    if stages and url.endswith("/api/search"):
+        try:
+            data["_stage_ms"] = json.loads(stages)   # the search app's own breakdown, for the timings log line
+        except ValueError:
+            pass
+    return data
 
 
 _downstream = {}   # service -> {"calls", "errors", "recent": [(finished at, seconds)]}
@@ -470,23 +491,28 @@ def _retry_after_seconds(response):
 def _retry_wait(exc):
     """Seconds to wait before trying again, or None when this failure is not worth another try.
 
-    Retried: HTTP 503 (the search app is still loading its index) and connection errors or timeouts. Not retried: any
-    other HTTP status, which a second try would not change (a 502 is a real failure in the search itself)."""
+    Retried: HTTP 503 (the backend is still loading, or refused because it was busy or out of time) and connection errors,
+    which never reached it. Not retried: a read timeout, since the backend got the request and may still be working on it (a
+    second copy only adds to its load), and any other HTTP status, which a second try would not change."""
     if isinstance(exc, requests.HTTPError):
         response = exc.response
         if response is not None and response.status_code == 503:
             return min(_retry_after_seconds(response), RETRY_MAX_WAIT)
         return None
-    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+    if isinstance(exc, requests.ConnectionError):   # includes ConnectTimeout: the request never arrived
         return min(RETRY_DEFAULT_WAIT, RETRY_MAX_WAIT)
     return None
 
 
+def _unavailable(exc):
+    """True for a failure that means the backend could not answer now (503, unreachable, or out of time): the cases where an
+    answer stored for a similar question is worth more than an error."""
+    return _retry_wait(exc) is not None or isinstance(exc, requests.Timeout)
+
+
 def _overloaded(exc):
-    """True when the search app was too busy (it refused after queueing or past its time limit, or the try timed out), as
-    opposed to still loading its index: a lighter request helps the first, and changes nothing for the second."""
-    if isinstance(exc, requests.Timeout):
-        return True
+    """True when the search app refused because it was busy or out of time, as opposed to still loading its index: a lighter
+    request helps the first, and changes nothing for the second."""
     if isinstance(exc, requests.HTTPError) and exc.response is not None and exc.response.status_code == 503:
         try:
             return (exc.response.json() or {}).get("stage") in ("search_queue_timeout", "search_deadline")
@@ -510,7 +536,7 @@ def _why(exc):
     return type(exc).__name__
 
 
-def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None, try_timeout=None):
+def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None):
     """post_json, tried again when the search app is still loading or briefly unreachable.
 
     All tries together take at most MCP_REQUEST_TIMEOUT seconds: each try is given only the time that is left, and a
@@ -520,7 +546,7 @@ def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None, t
 
     on_failure(attempt, exc), when given, is asked after each failure that a retry could cure (busy, loading, unreachable): a
     value it returns is used as the answer, so the search app is not called again. None means carry on with the retry.
-    try_timeout caps one try (still within the overall time left), so a slow first try leaves room for a retry or the fallback."""
+    Each try lasts at most MCP_TRY_TIMEOUT_SECONDS and tells the backend its budget (X-Request-Budget-Ms)."""
     attempts = RETRY_ATTEMPTS if attempts is None else max(1, int(attempts))
     deadline = _clock() + TIMEOUT
     attempt = 0
@@ -528,12 +554,17 @@ def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None, t
     while True:
         attempt += 1
         try:
-            data = post_json(url, payload, key, timeout=max(1.0, min(float(try_timeout or TIMEOUT), deadline - _clock())))
+            this_try = max(1.0, min(TRY_TIMEOUT, float(TIMEOUT), deadline - _clock()))
+            token = _budget_ms.set(int(max(0.0, this_try - BUDGET_MARGIN) * 1000))
+            try:
+                data = post_json(url, payload, key, timeout=this_try)
+            finally:
+                _budget_ms.reset(token)
             if first and isinstance(data, dict) and len(payload["queries"]) < first:
                 data["queries_sent"] = len(payload["queries"])   # a retry shrank the request: say so
             return data
         except Exception as exc:
-            if on_failure is not None and _retry_wait(exc) is not None:
+            if on_failure is not None and _unavailable(exc):
                 try:
                     stand_in = on_failure(attempt, exc)
                 except Exception:
@@ -917,7 +948,7 @@ def fetch_search_domains(timeout):
     rows = (response.json() or {}).get("domains")
     if not isinstance(rows, list):
         raise ValueError("not a list of domains")
-    return [{"domain": row["domain"], "search_enabled": True,
+    return [{"domain": row["domain"], "search_enabled": True, "manual_only": bool(row.get("manual_only")),
              "associated_concepts": [c for c in row.get("associated_concepts") or [] if isinstance(c, str)]}
             for row in rows if isinstance(row, dict) and row.get("domain")]
 
@@ -1737,6 +1768,13 @@ def _note_plan_vector(scope, vector, pending, plan, key=None):
     except Exception:
         pass   # measuring must never fail a search
 
+# The website results were borrowed from a close earlier question because the search app could not answer in time.
+SIMILAR_ANSWER_INSTRUCTIONS = (
+    " The website results answer a closely related earlier question, because the live search was unavailable. Use them only "
+    "where they fit what the visitor asked, say nothing more certain than they support, and do not mention how they were found."
+)
+
+
 NO_RESULTS_INSTRUCTIONS = (
     " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
     "Do not answer from general knowledge and do not ask a clarifying question."
@@ -1971,7 +2009,7 @@ SEARCH_DESCRIPTION = (
     "includes agent_instructions and, only when two readings of the question could conflict, a "
     "suggested_question to ask. If the response has out_of_scope true, the question is not about the Foundation: "
     "relay its message and do not answer from other sources. "
-    + (f"You may pass same-topic wording variants in more_queries (up to {MAX_QUERIES} queries in one search request). " if MAX_QUERIES > 1 else "")
+    + (f"You may pass same-topic wording variants in more_queries (up to {MAX_QUERIES} queries in one search request). " if MAX_QUERIES > 1 and TOPIC_QUERIES != 1 else "")
     + "For separate topics, call this tool separately. A chat client may pass one compact retrieval_context with an "
     "active feeling and career context; MCP decides whether it remains relevant. Do not request page text here; use "
     "get_documents only when the excerpts are insufficient."
@@ -2006,7 +2044,8 @@ SERVER_INSTRUCTIONS = (
     "Knowledge about the Sujeeth Foundation: its Career Circles student mentorship program, mentoring, "
     "volunteering, donating and partnering. Start with search_sujeeth_foundation; it searches the "
     "website and the wiki together"
-    + (", and sends three career-topic queries plus an optional career-contextual feeling query together in one search request. " if MAX_QUERIES > 1 else ". ")
+    + (", and sends the best career-topic wording of the question plus an optional career-contextual feeling query in one search request. " if TOPIC_QUERIES == 1
+       else ", and sends several career-topic queries plus an optional career-contextual feeling query together in one search request. " if MAX_QUERIES > 1 else ". ")
     + "Results are excerpts. "
     + f"If the excerpts do not answer the question, call get_documents once with the urls you need "
     f"(at most {MAX_BATCH_DOCUMENTS}). Cite the url for every claim. " + STATS_RULE
@@ -2482,6 +2521,65 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
+_answer_inflight = {}   # answer key -> Future of the website search already running for it on this instance
+_answer_inflight_lock = threading.Lock()
+
+
+def _one_flight(key, fetch):
+    """Run fetch() once for every caller that asks for the same key at the same time; the others wait for its answer (or
+    its error) instead of sending the search app a second copy. Returns (a copy of the answer, whether this caller joined)."""
+    with _answer_inflight_lock:
+        running = _answer_inflight.get(key)
+        leader = running is None
+        if leader:
+            running = _answer_inflight[key] = Future()
+    if not leader:
+        return copy.deepcopy(running.result(timeout=TIMEOUT + 5)), True
+    try:
+        answer = fetch()
+        running.set_result(answer)
+        return copy.deepcopy(answer), False
+    except BaseException as exc:
+        running.set_exception(exc)
+        raise
+    finally:
+        with _answer_inflight_lock:
+            _answer_inflight.pop(key, None)
+
+
+_NO_CATALOG = object()
+
+
+def best_bet_domains(domains, catalog=_NO_CATALOG):
+    """Which of these domains the ontology marks manual_only (they hold hand-added pages, searched as best bets). The search
+    app gets this with each request so it never has to ask the ontology app. None when the catalog does not say (an older
+    catalog without the field): the search app then looks it up itself, as before."""
+    catalog = ontology_catalog() if catalog is _NO_CATALOG else catalog
+    rows = [row for row in (catalog or {}).get("domains") or [] if isinstance(row, dict) and row.get("domain")]
+    if not rows or not any("manual_only" in row for row in rows):
+        return None
+    wanted = {str(d).lower() for d in domains or []}
+    return sorted({str(row["domain"]).lower() for row in rows if row.get("manual_only") is True
+                   and str(row["domain"]).lower() in wanted})
+
+
+def _queries_to_search(query, queries, plan):
+    """The queries actually sent to the search apps: MCP_TOPIC_QUERIES topic wordings (the model's rewrites first, then the
+    question, then the rest), plus the plan's feeling query. With MCP_TOPIC_QUERIES 0, every query, as before."""
+    if TOPIC_QUERIES <= 0:
+        return list(queries)
+    plan_queries = ((plan or {}).get("resolution") or {}).get("query_plan") or {}
+    norm = lambda text: " ".join(str(text or "").casefold().split())
+    feeling = plan_queries.get("feeling_query") if isinstance(plan_queries.get("feeling_query"), str) else None
+    rewrites = [q for q in plan_queries.get("topic_queries") or [] if isinstance(q, str) and norm(q) != norm(query)]
+    picked, seen = [], {norm(feeling)} if feeling else set()
+    for text in rewrites + [query] + list(queries):
+        if isinstance(text, str) and text.strip() and norm(text) not in seen:
+            seen.add(norm(text))
+            picked.append(text.strip())
+    return picked[:TOPIC_QUERIES] + ([feeling] if feeling else [])
+
+
 def _answer_key(query, queries, concepts, domains, resolution, limit):
     """What identifies a website search by its plan. The plan's own queries stand for the question; when the plan adds none
     (an obvious question answered without the model) the question itself is the key, so different questions never collide."""
@@ -2510,6 +2608,7 @@ def _similar_answer(query, limit, retrieval_context, failures, state):
     resolution = near.get("resolution") or {}
     if not near_queries:
         return None
+    near_queries = _queries_to_search(near_queries[0], near_queries, near)
     stored = answer_store.get(_answer_key(near_queries[0], near_queries, search_concepts(resolution),
                                           resolution.get("domains") or [], resolution, limit))
     if stored is None:
@@ -2555,6 +2654,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         else round((time.perf_counter() - ontology_started) * 1000)
     )
     queries = _clean_queries(query, [q for q in _plan.get("queries", []) if q.casefold() != query.casefold()])
+    queries = _queries_to_search(query, queries, _plan)   # the first one leads each search app's request
     full_documents = bool(full_documents and _include_documents)
     cache_key = _search_cache_key(query, limit, full_documents, max_documents, document_max_chars, queries,
                                   _retrieval_context)
@@ -2596,7 +2696,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         sibling_queries = queries[1:]
         def timed_wiki_search():
             began = time.perf_counter()
-            value = run_wiki_search(query, full_documents, document_max_chars,
+            value = run_wiki_search(queries[0], full_documents, document_max_chars,
                                     concepts, domains, sibling_queries, include_documents=_include_documents)
             return value, round((time.perf_counter() - began) * 1000)
         wiki_future = wiki_pool.submit(timed_wiki_search)
@@ -2607,25 +2707,40 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     if concepts and domains:
         web_started = time.perf_counter()
         try:
-            answer_key = _answer_key(query, queries, concepts, domains, resolution, limit)
-            website = answer_store.get(answer_key) if answer_store.enabled else None
-            if website is not None:
-                timings["answer_shared"] = True
-            else:
+            answer_key = _answer_key(queries[0], queries, concepts, domains, resolution, limit)
+
+            def fetch_website():
+                stored = answer_store.get(answer_key) if answer_store.enabled else None
+                if stored is not None:
+                    stored["_answer_shared"] = True
+                    return stored
                 fallback_state = {}
-                website = post_json_with_retry(
+                fresh = post_json_with_retry(
                     f"{WEBSEARCH_URL}/api/search",
-                    {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
-                     "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
+                    {"query": queries[0], "queries": queries, "concepts": concepts, "domains": domains,
+                     "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL,
+                     **({"best_bet_domains": bets} if (bets := best_bet_domains(domains)) is not None else {})},
                     WEBSEARCH_KEY,
-                    try_timeout=WEBSEARCH_TRY_TIMEOUT,
                     on_failure=lambda attempt, exc: _similar_answer(query, limit, _retrieval_context, attempt, fallback_state),
                 )
-                if website.get("answer_from_similar") is not None:
-                    timings["answer_from_similar"] = website["answer_from_similar"]
-                elif website.get("search_mode") != "keyword_only" and not website.get("partial") and website.get("results") \
-                        and website.get("queries_sent", len(queries)) >= len(queries):   # a shrunk retry is not the plan's answer
-                    answer_store.put(answer_key, website)
+                if fresh.get("answer_from_similar") is None and fresh.get("search_mode") != "keyword_only" \
+                        and not fresh.get("partial") and fresh.get("results") \
+                        and fresh.get("queries_sent", len(queries)) >= len(queries):   # a shrunk retry is not the plan's answer
+                    stages = fresh.pop("_stage_ms", None)          # this search's own timings are not part of the answer
+                    answer_store.put(answer_key, fresh)
+                    if stages is not None:
+                        fresh["_stage_ms"] = stages
+                return fresh
+
+            website, joined = _one_flight(answer_key, fetch_website)
+            if joined:
+                timings["answer_joined"] = True
+            if website.pop("_answer_shared", False):
+                timings["answer_shared"] = True
+            if website.get("answer_from_similar") is not None:
+                timings["answer_from_similar"] = website["answer_from_similar"]
+            if isinstance(website.get("_stage_ms"), dict):
+                timings["websearch_stage_ms"] = website.pop("_stage_ms")
             # MCP's authorization decision remains authoritative; Websearch only reports/filter-searches results.
             website["resolution"] = resolution
         except Exception as exc:
@@ -2667,6 +2782,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         results, best_bet_count, spotlight_count = [], 0, 0
     if best_bet_count or spotlight_count:
         quality["agent_instructions"] += PRIORITY_INSTRUCTIONS
+    if website.get("answer_from_similar") is not None and not out_of_scope:
+        quality["agent_instructions"] += SIMILAR_ANSWER_INSTRUCTIONS
     if spotlight_count:
         quality["agent_instructions"] += SPOTLIGHT_INSTRUCTIONS
 

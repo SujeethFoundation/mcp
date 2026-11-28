@@ -16,6 +16,15 @@ RESOLVED = {"status": "resolved", "ontology_version": "1.10.0", "matched_concept
 HIT = {"title": "Volunteer", "url": "https://sujeeth.org/volunteer", "snippet": "Become a mentor.",
        "source": "website", "domain": "sujeeth.org", "chunk_id": "v-0"}
 
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.fixture(autouse=True)
+def _every_variant(monkeypatch):
+    """These tests cover sending several query variants: MCP_TOPIC_QUERIES 0 (every query, the earlier behavior)."""
+    monkeypatch.setattr(server, "TOPIC_QUERIES", 0)
+
+
 
 def reply(body, status=200):
     response = requests.Response()
@@ -170,11 +179,11 @@ def test_mcp_sends_every_model_generated_query_with_the_same_approved_filters(mo
     monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: plan)
     wiki_calls = []
     post_json = server.post_json_with_retry
-    def record_wiki(url, payload, key="", attempts=None, on_failure=None, try_timeout=None):
+    def record_wiki(url, payload, key="", attempts=None, on_failure=None):
         if url.startswith(server.WIKISEARCH_URL):
             wiki_calls.append((url, dict(payload)))
             return {"results": []}
-        return post_json(url, payload, key, attempts, on_failure, try_timeout)
+        return post_json(url, payload, key, attempts, on_failure)
     monkeypatch.setattr(server, "post_json_with_retry", record_wiki)
     resolutions = []
     monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: resolutions.append(query) or plan)

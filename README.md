@@ -99,6 +99,40 @@ python .\mcp_server.py
 
 Check that the port is listening with `Test-NetConnection 127.0.0.1 -Port 8000`. Connect an MCP inspector (for example `npx @mcpjam/inspector@latest` or `npx @modelcontextprotocol/inspector`) to `http://127.0.0.1:8000/mcp`.
 
+## Timeouts and caches
+
+One budget, passed down, so every layer hears back from the one below it before it gives up, and no backend keeps
+working for a caller that has left.
+
+| Layer | Limit | What happens at the limit |
+|---|---|---|
+| Agent tool call | the agent's own limit (keep above 30 s) | the agent answers without the tool |
+| MCP, one backend call in all | `MCP_TOPIC_QUERIES` | `1` | Topic wordings sent to the search apps per search, plus the plan's feeling query when it has one. The model's first rewrite goes first (usually a better search than the visitor's own sentence), then the question, then the other rewrites and the agent's `more_queries`. Each query is a full ranking pass on the website search app, so `1` is about 3-4x less work there than before. `0` sends every query, as before. The response's `queries` lists what was searched |
+| `MCP_REQUEST_TIMEOUT` 30 s | MCP answers with what it has (`status: partial`) |
+| MCP, one try | `MCP_TRY_TIMEOUT_SECONDS` 20 s, or the time left | sends `X-Request-Budget-Ms` = this less 1 s |
+| Search app, one request | `SEARCH_DEADLINE_SECONDS` 20 s, or the caller's budget if shorter | stops between stages, 503 `search_deadline` |
+| Search app, wait for a slot | `SEARCH_QUEUE_TIMEOUT_SECONDS` 5 s, or the budget if shorter | 503 `search_queue_timeout` |
+
+Retries (`MCP_RETRY_*`): a 503 for loading is tried again with the same request; a 503 for busy or out of time is tried
+again with one query fewer; a connection that never arrived is tried again. A read timeout is not sent again: the backend
+got the request, so a second copy only adds load. After any of these failures, before a retry, MCP first looks for the
+stored answer of a similar question (`MCP_ANSWER_FALLBACK_SIMILARITY`, 0.90 then 0.85), and tells the agent the results
+answer a closely related question. Identical searches that arrive at the same time on one instance share one call to the
+search app (`answer_joined` in the timings).
+
+Caches: each thing is kept in memory on the instance, in front of one shared table, for an hour.
+
+| What | Memory (per instance) | Shared table | Keyed by |
+|---|---|---|---|
+| Ontology plan | `MCP_ONTOLOGY_PLAN_CACHE_SECONDS` 3600, 10,000 | `mcpplans`, `MCP_PLAN_STORE_SECONDS` 3600 | question, ontology version, model, context |
+| Question embedding (similar plans) | `MCP_PLAN_SIMILARITY_ENTRIES` 10,000 | `mcpplanvectors`, same lifetime | ontology version, model, context |
+| Website search answer | `SEARCH_CACHE_SECONDS` 3600, 2,000 (whole tool response) | `mcpanswers`, `MCP_ANSWER_STORE_SECONDS` 3600 | the plan, not the wording |
+| Page text (`get_documents`) | `DOCUMENT_CACHE_SECONDS` 900, 300 | none | url |
+
+Each website search request also carries `best_bet_domains` (the selected domains the ontology marks `manual_only`), so the
+search app's search path never calls the ontology app. The search app keeps only a per-instance answer cache (cleared when its index changes) and its 30-day question-embedding
+cache; answers shared between instances live here, keyed by plan. Expired table rows are swept in the background.
+
 ## Settings
 
 | Variable | Default | Purpose |
@@ -114,7 +148,7 @@ The slim catalog does not carry the search domains. When the catalog has no `dom
 | `MCP_ONTOLOGY_MODEL_NAME` | `gpt-6-luna` | Deployed Azure model name used for ontology resolution and query generation |
 | `MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS` | `25` | Maximum wait for one ontology-resolution request |
 | `MCP_ONTOLOGY_REASONING_EFFORT` | `low` | Azure Responses API reasoning effort for ontology routing (`low`, `medium`, `high`, `xhigh`, or `max`); keep the value supported by the deployed model |
-| `MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS` | `400` | Output-token ceiling for the structured ontology plan |
+| `MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS` | `600` | Output-token ceiling for the structured ontology plan. At 400 some plans were cut off mid-JSON (`JSONDecodeError: Unterminated string`) and the search ran without a plan |
 | `MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY` | `4` | Maximum simultaneous Luna calls per MCP instance; excess resolutions wait |
 | `MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS` | `3` | Total attempts for a Luna HTTP 429, subject to the model timeout |
 | `MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS` | `5` | Maximum wait before one Luna retry; MCP honors `retry-after-ms` and adds jitter |
@@ -141,8 +175,8 @@ The slim catalog does not carry the search domains. When the catalog has no `dom
 | `MCP_TRUSTED_KEY` | empty (off) | Shared secret. A caller that sends it in the header below counts as trusted. Use it for the Foundry project |
 | `MCP_TRUSTED_KEY_HEADER` | `x-mcp-client-key` | Name of the header that carries that secret |
 | `MCP_TRUSTED_USER_AGENTS` | empty (off) | Optional regular expression. A matching User-Agent counts as trusted. It can be faked, so it only picks the bucket |
-| `MCP_REQUEST_TIMEOUT` | `30` | Seconds to wait for a backend |
-| `MCP_RETRY_ATTEMPTS` | `4` | Tries in all (the first included) for a call to the website search app that is refused with HTTP 503 (an instance still loading its index, when `LOCAL_INDEX_FAIL_FAST` is on there) or cannot be reached. `1` turns retries off. All tries together stay within `MCP_REQUEST_TIMEOUT` |
+| `MCP_REQUEST_TIMEOUT` | `30` | Seconds MCP gives one backend call in all, retries included. Keep it under the agent's own tool timeout |
+| `MCP_RETRY_ATTEMPTS` | `4` | Tries in all (the first included) for a call to the website search app that is refused with HTTP 503 (an instance still loading its index, when `LOCAL_INDEX_FAIL_FAST` is on there), busy or out of time, or cannot be reached. A read timeout is not retried. `1` turns retries off. All tries together stay within `MCP_REQUEST_TIMEOUT` |
 | `MCP_RETRY_DEFAULT_WAIT_SECONDS` | `3` | Wait before a retry when the 503 has no `Retry-After` header, and after a connection error |
 | `MCP_PLAN_STORE_SECONDS`, `MCP_PLAN_STORE_TABLE`, `MCP_PLAN_STORE_CONNECTION` | `3600`, `mcpplans`, `AzureWebJobsStorage` | A Table Storage table shared by every MCP instance that keeps the ontology plans the model built, so a repeat or retry of a question that lands on another instance does not call the model again (the per-instance memory cache still comes first). `0` seconds turns it off. It is off too when there is no storage connection string: an app that uses an identity-based `AzureWebJobsStorage__accountName` setting needs `MCP_PLAN_STORE_CONNECTION` set. A slow or failing table is skipped for 30 s. `/status` counts plans served from it as `shared` |
 | `AZURE_OPENAI_ENDPOINT`, `AZURE_OPENAI_API_KEY`, `AZURE_OPENAI_EMBEDDING_DEPLOYMENT`, `AZURE_OPENAI_EMBEDDING_DIMENSIONS`, `MCP_PLAN_EMBED_TIMEOUT_SECONDS` | none, none, `sf-embeddings`, `1536`, `2` | The embedding deployment, the same one the search app uses. Without endpoint and key, similar-plan matching is off |
@@ -150,7 +184,7 @@ The slim catalog does not carry the search domains. When the catalog has no `dom
 | `MCP_PLAN_VECTOR_TABLE` | `mcpplanvectors` | The table that shares question embeddings between MCP instances, so similar-question matching works across instances. One small row per question (its 256-number vector and where its plan is in the plan table), one partition per ontology version, model and conversation context. An instance reads a partition at most once a minute and compares in memory; the plan is fetched only when a row is close enough to use. Uses `MCP_PLAN_STORE_CONNECTION` and `MCP_PLAN_STORE_SECONDS`. A failing table is skipped for 30 s |
 | `MCP_ANSWER_STORE_SECONDS`, `MCP_ANSWER_STORE_TABLE` | `3600`, `mcpanswers` | A Table Storage table that shares finished website searches between MCP instances and between questions that share an ontology plan. The row key is the plan (ontology version, concepts, domains, the plan's own queries, limit), not the question's wording, so two phrasings that resolve to the same plan reuse one search; a plan that adds no queries of its own is keyed by the question. Keyword-only, partial, empty and shrunk-retry answers are not stored; answers over about 60 KB are dropped. Uses `MCP_PLAN_STORE_CONNECTION`; expired rows are swept like the plan table. A hit shows `answer_shared` in the timings |
 | `MCP_ANSWER_FALLBACK_SIMILARITY` | `0.90,0.85` | When the search app fails (busy, still loading, unreachable), MCP answers from the stored search of the nearest earlier question instead of calling it again. One similarity per failure, the last repeating: `0.90` after the first failure, `0.85` after the second. It embeds the question (not a search app call), finds the nearest earlier question's plan, and reads that plan's stored answer from the answer table; no stored answer or nothing close enough means the usual retries. The response carries `retrieval.answer_from_similar` (the similarity), the log line `answer_fallback sim=…`, and is never written back to the answer table. Needs the embedding settings, the plan-similarity tables and `MCP_ANSWER_STORE_SECONDS`. Empty or `0` turns it off |
-| `MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS` | `10` | The longest one try of a search app call may take. `MCP_REQUEST_TIMEOUT` (30 s) still caps all tries together, so a slow first try now leaves room for a retry (with one query fewer if the search app is overloaded) or for the similar-answer fallback instead of using up the whole budget |
+| `MCP_TRY_TIMEOUT_SECONDS` | `20` | The longest one try of a backend call may take, never more than what is left of `MCP_REQUEST_TIMEOUT`. Each try sends `X-Request-Budget-Ms` (this less a second) so the search app stops and answers before MCP gives up. Match it to the search app's `SEARCH_DEADLINE_SECONDS`. `MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS` is the older name and still works |
 | `MCP_RETRY_SHRINK_QUERIES` | `true` | When the search app refuses because it is overloaded (`search_queue_timeout` or `search_deadline`) or a try times out, the retry sends one query fewer (the last, so the feeling query goes first), down to the question alone. Each query is a full search on the search app, so a lighter request is cheaper for it. A 503 for a still-loading index is retried unchanged. The result's `queries` lists what the last try carried |
 | `MCP_RETRY_MAX_WAIT_SECONDS` | `8` | Longest single wait, whatever `Retry-After` says |
 | `MCP_RETRY_MIN_ATTEMPT_SECONDS` | `4` | A retry is made only if at least this much of the timeout would be left after the wait |

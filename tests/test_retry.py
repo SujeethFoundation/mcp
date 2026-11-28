@@ -141,7 +141,7 @@ def test_each_try_is_given_only_the_time_that_is_left(monkeypatch):
     fake = Fake(monkeypatch, [reply(503, {"Retry-After": "8"})])
     with pytest.raises(requests.HTTPError):
         call(attempts=10)
-    assert fake.timeouts == [30, 22, 14, 6]
+    assert fake.timeouts == [20, 20, 14, 6]          # one try at most MCP_TRY_TIMEOUT_SECONDS (20), never more than is left
     assert all(t <= server.TIMEOUT for t in fake.timeouts)
 
 
@@ -264,14 +264,29 @@ def test_a_search_app_that_is_still_loading_keeps_every_query(monkeypatch):
     assert [len(q) for q in seen] == [3, 3] and "queries_sent" not in out
 
 
-def test_a_timeout_also_shrinks_the_request(monkeypatch):
-    fake = Fake(monkeypatch, [requests.Timeout(), reply()])
-    seen = []
+def test_a_read_timeout_is_not_sent_again(monkeypatch):
+    fake = Fake(monkeypatch, [requests.ReadTimeout(), reply()])
+    with pytest.raises(requests.ReadTimeout):
+        batch_call(["a", "b", "c"])
+    assert fake.calls == 1                             # the backend may still be working on it: a second copy only adds load
+
+
+def test_a_connection_that_never_arrived_is_tried_again(monkeypatch):
+    fake = Fake(monkeypatch, [requests.ConnectTimeout(), reply()])
+    batch_call(["a", "b", "c"])
+    assert fake.calls == 2
+
+
+def test_each_try_tells_the_backend_its_budget(monkeypatch):
+    monkeypatch.setattr(server, "TIMEOUT", 30)
+    fake = Fake(monkeypatch, [reply(503, {"Retry-After": "8"})])
+    sent = []
     original = fake.post
     monkeypatch.setattr(server.http, "post", lambda url, headers=None, json=None, timeout=None:
-                        (seen.append(list(json["queries"])), original(url, headers, json, timeout))[1])
-    batch_call(["a", "b", "c"])
-    assert [len(q) for q in seen] == [3, 2]
+                        (sent.append(headers.get("X-Request-Budget-Ms")), original(url, headers, json, timeout))[1])
+    with pytest.raises(requests.HTTPError):
+        call(attempts=10)
+    assert sent == ["19000", "19000", "13000", "5000"]   # each try's limit less a second for the reply
 
 
 def test_shrinking_can_be_turned_off(monkeypatch):
