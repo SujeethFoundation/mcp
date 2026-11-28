@@ -399,7 +399,14 @@ def _post_json_raw(url, payload, key="", timeout=None):
     )
     response.raise_for_status()
     data = response.json()
-    return data if isinstance(data, dict) else {"data": data}
+    data = data if isinstance(data, dict) else {"data": data}
+    stages = getattr(response, "headers", {}).get("X-Stage-Ms") if hasattr(response, "headers") else None
+    if stages and url.endswith("/api/search"):
+        try:
+            data["_stage_ms"] = json.loads(stages)   # the search app's own breakdown, for the timings log line
+        except ValueError:
+            pass
+    return data
 
 
 _downstream = {}   # service -> {"calls", "errors", "recent": [(finished at, seconds)]}
@@ -2719,7 +2726,10 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                 if fresh.get("answer_from_similar") is None and fresh.get("search_mode") != "keyword_only" \
                         and not fresh.get("partial") and fresh.get("results") \
                         and fresh.get("queries_sent", len(queries)) >= len(queries):   # a shrunk retry is not the plan's answer
+                    stages = fresh.pop("_stage_ms", None)          # this search's own timings are not part of the answer
                     answer_store.put(answer_key, fresh)
+                    if stages is not None:
+                        fresh["_stage_ms"] = stages
                 return fresh
 
             website, joined = _one_flight(answer_key, fetch_website)
@@ -2729,6 +2739,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                 timings["answer_shared"] = True
             if website.get("answer_from_similar") is not None:
                 timings["answer_from_similar"] = website["answer_from_similar"]
+            if isinstance(website.get("_stage_ms"), dict):
+                timings["websearch_stage_ms"] = website.pop("_stage_ms")
             # MCP's authorization decision remains authoritative; Websearch only reports/filter-searches results.
             website["resolution"] = resolution
         except Exception as exc:

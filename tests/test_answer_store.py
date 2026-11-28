@@ -91,3 +91,26 @@ def test_a_failure_is_shared_too_and_the_next_caller_tries_again():
     with pytest.raises(RuntimeError):
         server._one_flight(("k2",), boom)
     assert server._one_flight(("k2",), lambda: {"ok": 1}) == ({"ok": 1}, False)
+
+
+def test_the_search_apps_stage_times_reach_the_timings_but_not_the_table(monkeypatch):
+    table = use_store(monkeypatch)
+    calls = []
+
+    class Reply:
+        status_code = 200
+        headers = {"X-Stage-Ms": '{"rank":12,"embed":30}'}
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"status": "completed", "resolution": RESOLVED, "results": [HIT]}
+
+    wire(monkeypatch, {"status": "completed", "resolution": RESOLVED, "results": [HIT]})
+    monkeypatch.setattr(server.http, "post", lambda url, headers=None, json=None, timeout=None: calls.append(url) or Reply())
+    monkeypatch.setattr(server, "TIMINGS", True)
+    out = server.search_sujeeth_foundation.sync("what is career circles")
+    flush(server.answer_store)
+    assert out["timings_ms"]["websearch_stage_ms"] == {"rank": 12, "embed": 30}
+    assert table.rows and all("_stage_ms" not in str(row) for row in table.rows.values())
