@@ -170,11 +170,11 @@ def test_mcp_sends_every_model_generated_query_with_the_same_approved_filters(mo
     monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: plan)
     wiki_calls = []
     post_json = server.post_json_with_retry
-    def record_wiki(url, payload, key="", attempts=None):
+    def record_wiki(url, payload, key="", attempts=None, on_failure=None):
         if url.startswith(server.WIKISEARCH_URL):
             wiki_calls.append((url, dict(payload)))
             return {"results": []}
-        return post_json(url, payload, key, attempts)
+        return post_json(url, payload, key, attempts, on_failure)
     monkeypatch.setattr(server, "post_json_with_retry", record_wiki)
     resolutions = []
     monkeypatch.setattr(server, "resolve_ontology_plan", lambda query: resolutions.append(query) or plan)
