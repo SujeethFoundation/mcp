@@ -113,6 +113,7 @@ RETRY_ATTEMPTS = max(1, int(setting("MCP_RETRY_ATTEMPTS", "4") or 4))           
 RETRY_SHRINK_QUERIES = str(setting("MCP_RETRY_SHRINK_QUERIES", "true")).lower() not in ("0", "false", "no", "off")   # retry an overloaded search app with one query fewer
 RETRY_DEFAULT_WAIT = float(setting("MCP_RETRY_DEFAULT_WAIT_SECONDS", "3") or 3)       # wait when the 503 has no Retry-After
 RETRY_MAX_WAIT = float(setting("MCP_RETRY_MAX_WAIT_SECONDS", "8") or 8)               # longest single wait, whatever Retry-After says
+WEBSEARCH_TRY_TIMEOUT = float(setting("MCP_WEBSEARCH_TRY_TIMEOUT_SECONDS", "10") or 10)   # one try of a search app call; MCP_REQUEST_TIMEOUT still caps all tries together
 RETRY_MIN_ATTEMPT = float(setting("MCP_RETRY_MIN_ATTEMPT_SECONDS", "4") or 4)         # a retry is made only if this long is left after the wait
 
 # Search diversity settings.
@@ -509,7 +510,7 @@ def _why(exc):
     return type(exc).__name__
 
 
-def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None):
+def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None, try_timeout=None):
     """post_json, tried again when the search app is still loading or briefly unreachable.
 
     All tries together take at most MCP_REQUEST_TIMEOUT seconds: each try is given only the time that is left, and a
@@ -518,7 +519,8 @@ def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None):
     numbers, and each retry also in "retries".
 
     on_failure(attempt, exc), when given, is asked after each failure that a retry could cure (busy, loading, unreachable): a
-    value it returns is used as the answer, so the search app is not called again. None means carry on with the retry."""
+    value it returns is used as the answer, so the search app is not called again. None means carry on with the retry.
+    try_timeout caps one try (still within the overall time left), so a slow first try leaves room for a retry or the fallback."""
     attempts = RETRY_ATTEMPTS if attempts is None else max(1, int(attempts))
     deadline = _clock() + TIMEOUT
     attempt = 0
@@ -526,7 +528,7 @@ def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None):
     while True:
         attempt += 1
         try:
-            data = post_json(url, payload, key, timeout=max(1.0, min(float(TIMEOUT), deadline - _clock())))
+            data = post_json(url, payload, key, timeout=max(1.0, min(float(try_timeout or TIMEOUT), deadline - _clock())))
             if first and isinstance(data, dict) and len(payload["queries"]) < first:
                 data["queries_sent"] = len(payload["queries"])   # a retry shrank the request: say so
             return data
@@ -2616,6 +2618,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
                     {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
                      "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
                     WEBSEARCH_KEY,
+                    try_timeout=WEBSEARCH_TRY_TIMEOUT,
                     on_failure=lambda attempt, exc: _similar_answer(query, limit, _retrieval_context, attempt, fallback_state),
                 )
                 if website.get("answer_from_similar") is not None:

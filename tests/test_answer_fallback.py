@@ -68,3 +68,21 @@ def test_too_far_or_nothing_stored_means_the_usual_retries_and_failure(monkeypat
     calls = setup(monkeypatch, e(1.0, 0.0), e(1.0, 0.3), answer=False)
     out = server.search_sujeeth_foundation.sync("how to network")
     assert len(calls) > 2 and not out["results"]
+
+
+def test_one_try_of_the_search_app_call_is_capped_but_not_the_overall_budget(monkeypatch):
+    seen = []
+
+    def post(url, payload, key="", timeout=None):
+        seen.append(round(timeout))
+        raise requests.Timeout("slow")
+
+    monkeypatch.setattr(server, "post_json", post)
+    monkeypatch.setattr(server, "_sleep", lambda s: None)
+    clock = iter(range(0, 1000, 8))                      # each look at the clock is 8 s later
+    monkeypatch.setattr(server, "_clock", lambda: next(clock))
+    try:
+        server.post_json_with_retry("https://x/api/search", {"queries": ["a"]}, try_timeout=10)
+    except requests.Timeout:
+        pass
+    assert seen and max(seen) == 10 and server.WEBSEARCH_TRY_TIMEOUT == 10
