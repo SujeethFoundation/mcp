@@ -19,6 +19,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import requests
 
+from plan_store import SweepMixin
+
 DIMS = 256
 
 
@@ -97,7 +99,7 @@ def reusable(plan):
                 and not (plan or {}).get("clarification"))
 
 
-class SharedVectors:
+class SharedVectors(SweepMixin):
     """The embeddings of recent questions in a table every MCP instance reads, so similar questions match across instances.
 
     One small row per question (its 256-number vector and a pointer to its plan in the plan table), in one partition per
@@ -134,7 +136,7 @@ class SharedVectors:
             self._table = table
         return self._table
 
-    def _fail(self):
+    def _fail(self, exc=None):
         with self._lock:
             self.stats["errors"] += 1
             self._down_until = time.monotonic() + self._cooldown
@@ -208,3 +210,4 @@ class SharedVectors:
             if self._writer is None:
                 self._writer = ThreadPoolExecutor(max_workers=1, thread_name_prefix="plan-vectors")
         self._writer.submit(self._write, scope, vector, plan_ref)
+        self._maybe_sweep(self._writer)
