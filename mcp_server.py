@@ -196,8 +196,8 @@ DOCUMENT_CACHE_MAX = max(10, int(setting("DOCUMENT_CACHE_MAX_ENTRIES", "300") or
 # Finished search answers are kept in memory by query, so a repeat of a common question ("what is Career Circles")
 # skips the search apps. SEARCH_CACHE_SECONDS=0 turns this off. Only complete answers are kept (never a partial one
 # after a service error). Each instance keeps its own copy, and a changed page shows up within this time.
-SEARCH_CACHE_SECONDS = max(0, int(setting("SEARCH_CACHE_SECONDS", "300") or 0))
-SEARCH_CACHE_MAX = max(10, int(setting("SEARCH_CACHE_MAX_ENTRIES", "200") or 200))
+SEARCH_CACHE_SECONDS = max(0, int(setting("SEARCH_CACHE_SECONDS", "3600") or 0))
+SEARCH_CACHE_MAX = max(10, int(setting("SEARCH_CACHE_MAX_ENTRIES", "2000") or 2000))
 
 # The wiki is the Foundation's own content and is searched for every question the ontology recognizes as being about the
 # Foundation, whatever domains it approved: a concept with no approved domain ("week") used to leave the wiki out and the
@@ -835,8 +835,8 @@ OUT_OF_SCOPE_INSTRUCTIONS = (
 _ontology_catalog: dict | None = None
 _ontology_catalog_loaded_at: float | None = None
 ONTOLOGY_CATALOG_REFRESH_SECONDS = 300
-ONTOLOGY_PLAN_CACHE_SECONDS = max(0, int(setting("MCP_ONTOLOGY_PLAN_CACHE_SECONDS", "300") or 0))
-PLAN_STORE_SECONDS = max(0, int(setting("MCP_PLAN_STORE_SECONDS", "1800") or 0))   # how long a plan in the shared table is used; 0 = off
+ONTOLOGY_PLAN_CACHE_SECONDS = max(0, int(setting("MCP_ONTOLOGY_PLAN_CACHE_SECONDS", "3600") or 0))
+PLAN_STORE_SECONDS = max(0, int(setting("MCP_PLAN_STORE_SECONDS", "3600") or 0))   # how long a plan in the shared table is used; 0 = off
 plan_store = PlanStore(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
                        setting("MCP_PLAN_STORE_TABLE", "mcpplans") or "mcpplans", PLAN_STORE_SECONDS)
 # Similar-question plan reuse (plan_similarity.py). Needs the same Azure OpenAI embedding settings the search app uses; without
@@ -847,16 +847,16 @@ plan_embedder = Embedder(setting("AZURE_OPENAI_ENDPOINT"), setting("AZURE_OPENAI
                          int(setting("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1536") or 1536),
                          float(setting("MCP_PLAN_EMBED_TIMEOUT_SECONDS", "2") or 2))
 PLAN_REUSE_SIMILARITY = max(0.0, min(1.0, float(setting("MCP_PLAN_REUSE_SIMILARITY", "0") or 0)))
-similar_plans = SimilarPlans(max(10, int(setting("MCP_PLAN_SIMILARITY_ENTRIES", "1000") or 1000)))
+similar_plans = SimilarPlans(max(10, int(setting("MCP_PLAN_SIMILARITY_ENTRIES", "10000") or 10000)))
 shared_vectors = SharedVectors(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
                                setting("MCP_PLAN_VECTOR_TABLE", "mcpplanvectors") or "mcpplanvectors", PLAN_STORE_SECONDS)
 _plan_embed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="plan-embed")
 # Shared answers: the website search an earlier question already paid for. Keyed by the plan (concepts, domains, the plan's
 # own queries), not by the wording of the question, so variants that share a plan share the answer. 0 = off.
-ANSWER_STORE_SECONDS = max(0, int(setting("MCP_ANSWER_STORE_SECONDS", "0") or 0))
+ANSWER_STORE_SECONDS = max(0, int(setting("MCP_ANSWER_STORE_SECONDS", "3600") or 0))
 answer_store = PlanStore(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
                          setting("MCP_ANSWER_STORE_TABLE", "mcpanswers") or "mcpanswers", ANSWER_STORE_SECONDS)
-ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "500") or 500))
+ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "10000") or 10000))
 _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
 _ontology_plan_cache_lock = threading.Lock()
 _ontology_plan_inflight: dict[tuple[str, Any, str], Future] = {}
