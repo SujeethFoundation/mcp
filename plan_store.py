@@ -11,6 +11,7 @@ is skipped for a while, so a search never waits on it for long, and with no stor
 import base64
 import hashlib
 import json
+import random
 import threading
 import time
 import zlib
@@ -18,6 +19,43 @@ from concurrent.futures import ThreadPoolExecutor
 
 MAX_PLAN_CHARS = 60000          # one Table Storage string property holds at most 64 KB of UTF-16
 MAX_PENDING_WRITES = 100
+SWEEP_INTERVAL_SECONDS = 6 * 3600     # each instance looks for expired rows about this often (a little random, so they do not all at once)
+SWEEP_MAX_ROWS = 500                  # rows removed per sweep: a big backlog is cleared over several sweeps
+
+
+def sweep_expired(table, ttl_seconds, max_rows=SWEEP_MAX_ROWS, grace_seconds=3600):
+    """Delete up to max_rows rows older than ttl_seconds (plus a grace period) from a table whose rows carry an integer `ts`.
+    Returns how many were removed. Several instances may sweep at once: deleting a row that is already gone is fine."""
+    cutoff = int(time.time() - ttl_seconds - grace_seconds)
+    removed = 0
+    for entity in table.query_entities(f"ts lt {cutoff}", select=["PartitionKey", "RowKey"]):
+        try:
+            table.delete_entity(entity["PartitionKey"], entity["RowKey"])
+            removed += 1
+        except Exception as exc:
+            if exc.__class__.__name__ != "ResourceNotFoundError":
+                raise
+        if removed >= max_rows:
+            break
+    return removed
+
+
+class SweepMixin:
+    """Gives a store a background sweep of expired rows, started by a write when one is due."""
+    _next_sweep = 0.0
+
+    def _maybe_sweep(self, pool):
+        now = time.monotonic()
+        if now < self._next_sweep or not self.enabled:
+            return
+        self._next_sweep = now + SWEEP_INTERVAL_SECONDS * random.uniform(0.8, 1.2)
+        pool.submit(self._sweep_now)
+
+    def _sweep_now(self):
+        try:
+            self.stats["swept"] = self.stats.get("swept", 0) + sweep_expired(self._client(), self._ttl)
+        except Exception:
+            self.stats["sweep_errors"] = self.stats.get("sweep_errors", 0) + 1   # never blocks reads or writes
 
 
 def row_key_for(key):
@@ -25,7 +63,7 @@ def row_key_for(key):
     return digest[:2], digest[2:]
 
 
-class PlanStore:
+class PlanStore(SweepMixin):
     def __init__(self, connection, table_name, ttl_seconds, timeout=1.0, cooldown=30.0, table=None):
         self._connection, self._name, self._ttl = connection, table_name, ttl_seconds
         self._timeout, self._cooldown, self._table = timeout, cooldown, table
@@ -59,13 +97,16 @@ class PlanStore:
 
     def get(self, key):
         """The plan stored for this key, or None (absent, too old, unreadable, or the table is down)."""
+        return self.get_by_row(*row_key_for(key))
+
+    def get_by_row(self, partition, row):
+        """The plan stored at this partition and row (what row_key_for gives for its key), or None."""
         if not self.enabled:
             return None
         if time.monotonic() < self._down_until:
             with self._lock:
                 self.stats["skipped"] += 1
             return None
-        partition, row = row_key_for(key)
         with self._lock:
             self.stats["reads"] += 1
         try:
@@ -122,3 +163,4 @@ class PlanStore:
             self._write(key, packed)
         else:
             self._writer.submit(self._write, key, packed)
+            self._maybe_sweep(self._writer)

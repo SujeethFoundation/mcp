@@ -30,6 +30,7 @@ import requests  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 from mcp.types import CallToolResult, ToolAnnotations  # noqa: E402
 
+from plan_similarity import Embedder, SharedVectors, SimilarPlans, reusable  # noqa: E402
 from plan_store import PlanStore  # noqa: E402
 from rate_limit import RateLimitMiddleware, TrustedRanges  # noqa: E402
 
@@ -195,8 +196,8 @@ DOCUMENT_CACHE_MAX = max(10, int(setting("DOCUMENT_CACHE_MAX_ENTRIES", "300") or
 # Finished search answers are kept in memory by query, so a repeat of a common question ("what is Career Circles")
 # skips the search apps. SEARCH_CACHE_SECONDS=0 turns this off. Only complete answers are kept (never a partial one
 # after a service error). Each instance keeps its own copy, and a changed page shows up within this time.
-SEARCH_CACHE_SECONDS = max(0, int(setting("SEARCH_CACHE_SECONDS", "300") or 0))
-SEARCH_CACHE_MAX = max(10, int(setting("SEARCH_CACHE_MAX_ENTRIES", "200") or 200))
+SEARCH_CACHE_SECONDS = max(0, int(setting("SEARCH_CACHE_SECONDS", "3600") or 0))
+SEARCH_CACHE_MAX = max(10, int(setting("SEARCH_CACHE_MAX_ENTRIES", "2000") or 2000))
 
 # The wiki is the Foundation's own content and is searched for every question the ontology recognizes as being about the
 # Foundation, whatever domains it approved: a concept with no approved domain ("week") used to leave the wiki out and the
@@ -834,11 +835,28 @@ OUT_OF_SCOPE_INSTRUCTIONS = (
 _ontology_catalog: dict | None = None
 _ontology_catalog_loaded_at: float | None = None
 ONTOLOGY_CATALOG_REFRESH_SECONDS = 300
-ONTOLOGY_PLAN_CACHE_SECONDS = max(0, int(setting("MCP_ONTOLOGY_PLAN_CACHE_SECONDS", "300") or 0))
-PLAN_STORE_SECONDS = max(0, int(setting("MCP_PLAN_STORE_SECONDS", "1800") or 0))   # how long a plan in the shared table is used; 0 = off
+ONTOLOGY_PLAN_CACHE_SECONDS = max(0, int(setting("MCP_ONTOLOGY_PLAN_CACHE_SECONDS", "3600") or 0))
+PLAN_STORE_SECONDS = max(0, int(setting("MCP_PLAN_STORE_SECONDS", "3600") or 0))   # how long a plan in the shared table is used; 0 = off
 plan_store = PlanStore(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
                        setting("MCP_PLAN_STORE_TABLE", "mcpplans") or "mcpplans", PLAN_STORE_SECONDS)
-ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "500") or 500))
+# Similar-question plan reuse (plan_similarity.py). Needs the same Azure OpenAI embedding settings the search app uses; without
+# them it is off. MCP_PLAN_REUSE_SIMILARITY 0 only measures (a log line per model call); a value such as 0.95 reuses the plan
+# of the nearest earlier question at or above it. A similarity is a distance, not a probability: read the logs first.
+plan_embedder = Embedder(setting("AZURE_OPENAI_ENDPOINT"), setting("AZURE_OPENAI_API_KEY"),
+                         setting("AZURE_OPENAI_EMBEDDING_DEPLOYMENT", "sf-embeddings"),
+                         int(setting("AZURE_OPENAI_EMBEDDING_DIMENSIONS", "1536") or 1536),
+                         float(setting("MCP_PLAN_EMBED_TIMEOUT_SECONDS", "2") or 2))
+PLAN_REUSE_SIMILARITY = max(0.0, min(1.0, float(setting("MCP_PLAN_REUSE_SIMILARITY", "0") or 0)))
+similar_plans = SimilarPlans(max(10, int(setting("MCP_PLAN_SIMILARITY_ENTRIES", "10000") or 10000)))
+shared_vectors = SharedVectors(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
+                               setting("MCP_PLAN_VECTOR_TABLE", "mcpplanvectors") or "mcpplanvectors", PLAN_STORE_SECONDS)
+_plan_embed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="plan-embed")
+# Shared answers: the website search an earlier question already paid for. Keyed by the plan (concepts, domains, the plan's
+# own queries), not by the wording of the question, so variants that share a plan share the answer. 0 = off.
+ANSWER_STORE_SECONDS = max(0, int(setting("MCP_ANSWER_STORE_SECONDS", "3600") or 0))
+answer_store = PlanStore(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
+                         setting("MCP_ANSWER_STORE_TABLE", "mcpanswers") or "mcpanswers", ANSWER_STORE_SECONDS)
+ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "10000") or 10000))
 _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
 _ontology_plan_cache_lock = threading.Lock()
 _ontology_plan_inflight: dict[tuple[str, Any, str], Future] = {}
@@ -1403,7 +1421,7 @@ def add_feelings_frameworks(plan, catalog):
     return enriched
 
 
-_resolution_counts = {"ontology": 0, "model": 0, "shared": 0, "skipped": {}}   # for /status: how often the gate lets the model call go
+_resolution_counts = {"ontology": 0, "model": 0, "shared": 0, "similar": 0, "skipped": {}}   # for /status: how often the gate lets the model call go
 _resolution_counts_lock = threading.Lock()
 _STOP_WORDS = frozenset("""about after again also been before being could does from have into just like make more most much
 need only other over should some such than that their them then there these they this those very want what when where
@@ -1422,7 +1440,7 @@ def count_resolution(kind, reason=None):
 def resolution_counts():
     with _resolution_counts_lock:
         return {"ontology": _resolution_counts["ontology"], "model": _resolution_counts["model"],
-                "shared": _resolution_counts["shared"],
+                "shared": _resolution_counts["shared"], "similar": _resolution_counts["similar"],
                 "skipped": dict(_resolution_counts["skipped"])}
 
 
@@ -1608,6 +1626,15 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
     if not leader:
         return copy.deepcopy(shared.result())
     try:
+        scope, vector, pending = (key[1], key[2], key[3]), None, None
+        if plan_embedder.enabled and PLAN_REUSE_SIMILARITY > 0:
+            vector = plan_embedder.embed(query)   # needed now: it decides whether the model is called
+            reused = _similar_plan(query, key, scope, vector)
+            if reused is not None:
+                shared.set_result(reused)
+                return reused
+        elif plan_embedder.enabled:
+            pending = _plan_embed_pool.submit(plan_embedder.embed, query)   # measuring only: in step with the model call
         if retrieval_context:
             model_context, allowed_ids = ontology_model_context(query, catalog, retrieval_context)
             model_result = call_ontology_model(query, model_context, retrieval_context)
@@ -1622,6 +1649,8 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
         if not (plan.get("resolution", {}).get("feelings_route") or {}).get("degraded"):
             _ontology_plan_cache_put(key, plan)
             plan_store.put(key, plan)
+        if plan_embedder.enabled:
+            _note_plan_vector(scope, vector, pending, plan, key)
         shared.set_result(plan)
         return plan
     except BaseException as exc:
@@ -1630,6 +1659,63 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
     finally:
         with _ontology_plan_cache_lock:
             _ontology_plan_inflight.pop(key, None)
+
+
+def _plan_ref(key):
+    """Where plan_store keeps the plan for this key: (partition, row)."""
+    from plan_store import row_key_for
+    return row_key_for(key)
+
+
+def _nearest_plan(scope, vector):
+    """(similarity, plan) of the closest earlier question, from this instance's memory or the shared table."""
+    similarity, near = similar_plans.nearest(scope, vector)
+    if shared_vectors.enabled:
+        shared_similarity, ref = shared_vectors.nearest(scope, vector)
+        if ref is not None and shared_similarity > similarity:
+            stored = plan_store.get_by_row(*ref)
+            if stored is not None:
+                return shared_similarity, stored
+    return similarity, near
+
+
+def _similar_plan(query, key, scope, vector):
+    """The plan of an earlier, similar question when it is close enough to borrow, else None."""
+    if vector is None:
+        return None
+    similarity, near = _nearest_plan(scope, vector)
+    if near is None or similarity < PLAN_REUSE_SIMILARITY or not reusable(near):
+        return None
+    plan = copy.deepcopy(near)
+    normalized = key[0]
+    extras = [item for item in plan.get("queries", []) if " ".join(str(item).casefold().split()) != normalized]
+    plan["queries"] = _clean_queries(query, extras)
+    plan["resolution"]["resolved_by"] = "similar"
+    plan["resolution"]["similarity"] = round(similarity, 3)
+    count_resolution("similar")
+    print(f"plan_similarity reused sim={similarity:.3f}", file=sys.stderr, flush=True)
+    return plan
+
+
+def _note_plan_vector(scope, vector, pending, plan, key=None):
+    """After the model built a plan: log how its nearest earlier question compares (measuring), and remember this one."""
+    try:
+        if vector is None and pending is not None:
+            vector = pending.result(timeout=1.0)
+        if vector is None:
+            return
+        similarity, near = _nearest_plan(scope, vector)
+        if near is not None and similarity >= 0.8:
+            mine = set((plan.get("resolution") or {}).get("matched_concepts") or [])
+            theirs = set((near.get("resolution") or {}).get("matched_concepts") or [])
+            print(f"plan_similarity sim={similarity:.3f} same_concepts={str(mine == theirs).lower()} "
+                  f"reusable={str(reusable(near)).lower()}", file=sys.stderr, flush=True)
+        if reusable(plan):
+            similar_plans.add(scope, vector, copy.deepcopy(plan))
+            if key is not None:
+                shared_vectors.put(scope, vector, _plan_ref(key))   # the plan itself went to plan_store with the same key
+    except Exception:
+        pass   # measuring must never fail a search
 
 NO_RESULTS_INSTRUCTIONS = (
     " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
@@ -2376,6 +2462,15 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
+def _answer_key(query, queries, concepts, domains, resolution, limit):
+    """What identifies a website search by its plan. The plan's own queries stand for the question; when the plan adds none
+    (an obvious question answered without the model) the question itself is the key, so different questions never collide."""
+    own = " ".join(query.lower().split())
+    extras = [" ".join(q.lower().split()) for q in queries if " ".join(q.lower().split()) != own]
+    return ("answer", resolution.get("ontology_version"), tuple(sorted(concepts)), tuple(sorted(domains)),
+            tuple(extras) if extras else (own,), CANDIDATE_POOL, limit)
+
+
 def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000,
                _plan=None, _request_started=None, _include_documents=True, _ontology_resolution_ms=None,
                _retrieval_context=None):
@@ -2464,12 +2559,20 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
     if concepts and domains:
         web_started = time.perf_counter()
         try:
-            website = post_json_with_retry(
-                f"{WEBSEARCH_URL}/api/search",
-                {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
-                 "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
-                WEBSEARCH_KEY,
-            )
+            answer_key = _answer_key(query, queries, concepts, domains, resolution, limit)
+            website = answer_store.get(answer_key) if answer_store.enabled else None
+            if website is not None:
+                timings["answer_shared"] = True
+            else:
+                website = post_json_with_retry(
+                    f"{WEBSEARCH_URL}/api/search",
+                    {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
+                     "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
+                    WEBSEARCH_KEY,
+                )
+                if website.get("search_mode") != "keyword_only" and not website.get("partial") and website.get("results") \
+                        and website.get("queries_sent", len(queries)) >= len(queries):   # a shrunk retry is not the plan's answer
+                    answer_store.put(answer_key, website)
             # MCP's authorization decision remains authoritative; Websearch only reports/filter-searches results.
             website["resolution"] = resolution
         except Exception as exc:
