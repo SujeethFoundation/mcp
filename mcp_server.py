@@ -5,6 +5,7 @@ import copy
 import functools
 import hashlib
 import json
+import logging
 import os
 import random
 import re
@@ -32,6 +33,9 @@ from mcp.types import CallToolResult, ToolAnnotations  # noqa: E402
 
 from plan_similarity import Embedder, SharedVectors, SimilarPlans, reusable  # noqa: E402
 from plan_store import PlanStore  # noqa: E402
+
+# The Azure SDK logs every Table Storage call (about ten lines, at Error level in this host), and a plan-table miss is a normal 404.
+logging.getLogger("azure").setLevel(logging.WARNING)
 from rate_limit import RateLimitMiddleware, TrustedRanges  # noqa: E402
 
 
@@ -505,13 +509,16 @@ def _why(exc):
     return type(exc).__name__
 
 
-def post_json_with_retry(url, payload, key="", attempts=None):
+def post_json_with_retry(url, payload, key="", attempts=None, on_failure=None):
     """post_json, tried again when the search app is still loading or briefly unreachable.
 
     All tries together take at most MCP_REQUEST_TIMEOUT seconds: each try is given only the time that is left, and a
     retry is made only if at least MCP_RETRY_MIN_ATTEMPT_SECONDS would remain after the wait. The last failure is
     raised as before, so callers handle it exactly as they did without retries. Every try is counted in the downstream
-    numbers, and each retry also in "retries"."""
+    numbers, and each retry also in "retries".
+
+    on_failure(attempt, exc), when given, is asked after each failure that a retry could cure (busy, loading, unreachable): a
+    value it returns is used as the answer, so the search app is not called again. None means carry on with the retry."""
     attempts = RETRY_ATTEMPTS if attempts is None else max(1, int(attempts))
     deadline = _clock() + TIMEOUT
     attempt = 0
@@ -524,6 +531,13 @@ def post_json_with_retry(url, payload, key="", attempts=None):
                 data["queries_sent"] = len(payload["queries"])   # a retry shrank the request: say so
             return data
         except Exception as exc:
+            if on_failure is not None and _retry_wait(exc) is not None:
+                try:
+                    stand_in = on_failure(attempt, exc)
+                except Exception:
+                    stand_in = None   # a fallback must never make the failure worse
+                if stand_in is not None:
+                    return stand_in
             wait = _retry_wait(exc) if attempt < attempts else None
             if wait is None:
                 raise
@@ -854,6 +868,10 @@ _plan_embed_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="plan-em
 # Shared answers: the website search an earlier question already paid for. Keyed by the plan (concepts, domains, the plan's
 # own queries), not by the wording of the question, so variants that share a plan share the answer. 0 = off.
 ANSWER_STORE_SECONDS = max(0, int(setting("MCP_ANSWER_STORE_SECONDS", "3600") or 0))
+# When the search app fails (busy, loading, unreachable), answer from the stored search of the nearest earlier question instead of
+# calling it again. One similarity per failure, the last repeating: 0.90 after the first, 0.85 after the second. Empty or 0 = off.
+ANSWER_FALLBACK_SIMILARITY = tuple(float(x) for x in (setting("MCP_ANSWER_FALLBACK_SIMILARITY", "0.90,0.85") or "").replace(
+    " ", "").split(",") if x and float(x) > 0)
 answer_store = PlanStore(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
                          setting("MCP_ANSWER_STORE_TABLE", "mcpanswers") or "mcpanswers", ANSWER_STORE_SECONDS)
 ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "10000") or 10000))
@@ -2471,6 +2489,34 @@ def _answer_key(query, queries, concepts, domains, resolution, limit):
             tuple(extras) if extras else (own,), CANDIDATE_POOL, limit)
 
 
+def _similar_answer(query, limit, retrieval_context, failures, state):
+    """The stored website search of the nearest earlier question, if it is close enough for this many failures so far, else
+    None. The question is embedded once per search (state holds it); the embedding call is not the search app."""
+    if not (ANSWER_FALLBACK_SIMILARITY and answer_store.enabled and plan_embedder.enabled):
+        return None
+    threshold = ANSWER_FALLBACK_SIMILARITY[min(failures, len(ANSWER_FALLBACK_SIMILARITY)) - 1]
+    if "vector" not in state:
+        catalog = ontology_catalog()
+        key = _ontology_plan_cache_key(query, catalog, clean_retrieval_context(retrieval_context, catalog))
+        state["scope"], state["vector"] = (key[1], key[2], key[3]), plan_embedder.embed(query)
+    if state["vector"] is None:
+        return None
+    similarity, near = _nearest_plan(state["scope"], state["vector"])
+    if near is None or similarity < threshold or not reusable(near):
+        return None
+    near_queries = near.get("queries") or []
+    resolution = near.get("resolution") or {}
+    if not near_queries:
+        return None
+    stored = answer_store.get(_answer_key(near_queries[0], near_queries, search_concepts(resolution),
+                                          resolution.get("domains") or [], resolution, limit))
+    if stored is None:
+        return None
+    stored["answer_from_similar"] = round(similarity, 3)
+    print(f"answer_fallback sim={similarity:.3f} threshold={threshold:.2f} failures={failures}", file=sys.stderr, flush=True)
+    return stored
+
+
 def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_documents=None, document_max_chars=12000,
                _plan=None, _request_started=None, _include_documents=True, _ontology_resolution_ms=None,
                _retrieval_context=None):
@@ -2564,13 +2610,17 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
             if website is not None:
                 timings["answer_shared"] = True
             else:
+                fallback_state = {}
                 website = post_json_with_retry(
                     f"{WEBSEARCH_URL}/api/search",
                     {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
                      "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
                     WEBSEARCH_KEY,
+                    on_failure=lambda attempt, exc: _similar_answer(query, limit, _retrieval_context, attempt, fallback_state),
                 )
-                if website.get("search_mode") != "keyword_only" and not website.get("partial") and website.get("results") \
+                if website.get("answer_from_similar") is not None:
+                    timings["answer_from_similar"] = website["answer_from_similar"]
+                elif website.get("search_mode") != "keyword_only" and not website.get("partial") and website.get("results") \
                         and website.get("queries_sent", len(queries)) >= len(queries):   # a shrunk retry is not the plan's answer
                     answer_store.put(answer_key, website)
             # MCP's authorization decision remains authoritative; Websearch only reports/filter-searches results.
@@ -2646,6 +2696,7 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
             "website_candidates": len(website.get("results", []) or []),
             "wiki_candidates": len(wiki_items),
             "search_mode": website.get("search_mode"),
+            **({"answer_from_similar": website["answer_from_similar"]} if website.get("answer_from_similar") is not None else {}),
             "query_plan": resolution.get("query_plan", {"topic_queries": queries, "feeling_query": None}),
             **({"domains": website.get("domains", domains)} if VERBOSE_ONTOLOGY else {}),
         },
