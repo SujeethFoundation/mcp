@@ -30,6 +30,7 @@ import requests  # noqa: E402
 from mcp.server.fastmcp import FastMCP  # noqa: E402
 from mcp.types import CallToolResult, ToolAnnotations  # noqa: E402
 
+from plan_store import PlanStore  # noqa: E402
 from rate_limit import RateLimitMiddleware, TrustedRanges  # noqa: E402
 
 
@@ -834,6 +835,9 @@ _ontology_catalog: dict | None = None
 _ontology_catalog_loaded_at: float | None = None
 ONTOLOGY_CATALOG_REFRESH_SECONDS = 300
 ONTOLOGY_PLAN_CACHE_SECONDS = max(0, int(setting("MCP_ONTOLOGY_PLAN_CACHE_SECONDS", "300") or 0))
+PLAN_STORE_SECONDS = max(0, int(setting("MCP_PLAN_STORE_SECONDS", "1800") or 0))   # how long a plan in the shared table is used; 0 = off
+plan_store = PlanStore(setting("MCP_PLAN_STORE_CONNECTION", "") or os.environ.get("AzureWebJobsStorage", ""),
+                       setting("MCP_PLAN_STORE_TABLE", "mcpplans") or "mcpplans", PLAN_STORE_SECONDS)
 ONTOLOGY_PLAN_CACHE_MAX = max(10, int(setting("MCP_ONTOLOGY_PLAN_CACHE_MAX_ENTRIES", "500") or 500))
 _ontology_plan_cache = {}  # (query, ontology version, model) -> (expires, validated plan)
 _ontology_plan_cache_lock = threading.Lock()
@@ -1399,7 +1403,7 @@ def add_feelings_frameworks(plan, catalog):
     return enriched
 
 
-_resolution_counts = {"ontology": 0, "model": 0, "skipped": {}}   # for /status: how often the gate lets the model call go
+_resolution_counts = {"ontology": 0, "model": 0, "shared": 0, "skipped": {}}   # for /status: how often the gate lets the model call go
 _resolution_counts_lock = threading.Lock()
 _STOP_WORDS = frozenset("""about after again also been before being could does from have into just like make more most much
 need only other over should some such than that their them then there these they this those very want what when where
@@ -1418,6 +1422,7 @@ def count_resolution(kind, reason=None):
 def resolution_counts():
     with _resolution_counts_lock:
         return {"ontology": _resolution_counts["ontology"], "model": _resolution_counts["model"],
+                "shared": _resolution_counts["shared"],
                 "skipped": dict(_resolution_counts["skipped"])}
 
 
@@ -1586,6 +1591,14 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
     local = local_ontology_plan(query, catalog, retrieval_context)
     if local is not None:
         return local
+    stored = plan_store.get(key)   # another instance may have asked the model already
+    if stored is not None:
+        _ontology_plan_cache_put(key, stored)
+        count_resolution("shared")
+        normalized = key[0]
+        extras = [item for item in stored.get("queries", []) if " ".join(str(item).casefold().split()) != normalized]
+        stored["queries"] = _clean_queries(query, extras)
+        return stored
     with _ontology_plan_cache_lock:
         shared = _ontology_plan_inflight.get(key)
         leader = shared is None
@@ -1608,6 +1621,7 @@ def resolve_ontology_plan(query, catalog=None, retrieval_context=None):
         # A degraded route is a transient failure of the Feelings API: do not pin it for the cache window.
         if not (plan.get("resolution", {}).get("feelings_route") or {}).get("degraded"):
             _ontology_plan_cache_put(key, plan)
+            plan_store.put(key, plan)
         shared.set_result(plan)
         return plan
     except BaseException as exc:
