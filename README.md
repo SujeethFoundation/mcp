@@ -115,7 +115,9 @@ working for a caller that has left.
 Retries (`MCP_RETRY_*`): a 503 for loading is tried again with the same request; a 503 for busy or out of time is tried
 again with one query fewer; a connection that never arrived is tried again. A read timeout is not sent again: the backend
 got the request, so a second copy only adds load. After any of these failures, before a retry, MCP first looks for the
-stored answer of a similar question (`MCP_ANSWER_FALLBACK_SIMILARITY`, 0.90 then 0.85).
+stored answer of a similar question (`MCP_ANSWER_FALLBACK_SIMILARITY`, 0.90 then 0.85), and tells the agent the results
+answer a closely related question. Identical searches that arrive at the same time on one instance share one call to the
+search app (`answer_joined` in the timings).
 
 Caches: each thing is kept in memory on the instance, in front of one shared table, for an hour.
 
@@ -144,7 +146,7 @@ The slim catalog does not carry the search domains. When the catalog has no `dom
 | `MCP_ONTOLOGY_MODEL_NAME` | `gpt-6-luna` | Deployed Azure model name used for ontology resolution and query generation |
 | `MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS` | `25` | Maximum wait for one ontology-resolution request |
 | `MCP_ONTOLOGY_REASONING_EFFORT` | `low` | Azure Responses API reasoning effort for ontology routing (`low`, `medium`, `high`, `xhigh`, or `max`); keep the value supported by the deployed model |
-| `MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS` | `400` | Output-token ceiling for the structured ontology plan |
+| `MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS` | `600` | Output-token ceiling for the structured ontology plan. At 400 some plans were cut off mid-JSON (`JSONDecodeError: Unterminated string`) and the search ran without a plan |
 | `MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY` | `4` | Maximum simultaneous Luna calls per MCP instance; excess resolutions wait |
 | `MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS` | `3` | Total attempts for a Luna HTTP 429, subject to the model timeout |
 | `MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS` | `5` | Maximum wait before one Luna retry; MCP honors `retry-after-ms` and adds jitter |

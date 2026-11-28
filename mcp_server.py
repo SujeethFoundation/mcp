@@ -89,7 +89,7 @@ ONTOLOGY_MODEL_TIMEOUT = max(5, int(setting("MCP_ONTOLOGY_MODEL_TIMEOUT_SECONDS"
 ONTOLOGY_REASONING_EFFORT = str(setting("MCP_ONTOLOGY_REASONING_EFFORT", "low") or "low").strip().lower()
 if ONTOLOGY_REASONING_EFFORT not in {"low", "medium", "high", "xhigh", "max"}:
     ONTOLOGY_REASONING_EFFORT = "low"
-ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS = max(100, int(setting("MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS", "400") or 400))
+ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS = max(100, int(setting("MCP_ONTOLOGY_MODEL_MAX_OUTPUT_TOKENS", "600") or 600))   # 400 cut some plans off mid-JSON
 ONTOLOGY_MODEL_MAX_CONCURRENCY = max(1, int(setting("MCP_ONTOLOGY_MODEL_MAX_CONCURRENCY", "4") or 4))
 ONTOLOGY_MODEL_RETRY_ATTEMPTS = max(1, int(setting("MCP_ONTOLOGY_MODEL_RETRY_ATTEMPTS", "3") or 3))
 ONTOLOGY_MODEL_RETRY_MAX_WAIT = max(0.25, float(setting("MCP_ONTOLOGY_MODEL_RETRY_MAX_WAIT_SECONDS", "5") or 5))
@@ -1757,6 +1757,13 @@ def _note_plan_vector(scope, vector, pending, plan, key=None):
     except Exception:
         pass   # measuring must never fail a search
 
+# The website results were borrowed from a close earlier question because the search app could not answer in time.
+SIMILAR_ANSWER_INSTRUCTIONS = (
+    " The website results answer a closely related earlier question, because the live search was unavailable. Use them only "
+    "where they fit what the visitor asked, say nothing more certain than they support, and do not mention how they were found."
+)
+
+
 NO_RESULTS_INSTRUCTIONS = (
     " The Foundation's pages returned nothing that answers this. Say so plainly and point the person to sujeeth.org. "
     "Do not answer from general knowledge and do not ask a clarifying question."
@@ -2502,6 +2509,32 @@ def _search_cache_put(key, response):
                 _search_cache.pop(old, None)
 
 
+_answer_inflight = {}   # answer key -> Future of the website search already running for it on this instance
+_answer_inflight_lock = threading.Lock()
+
+
+def _one_flight(key, fetch):
+    """Run fetch() once for every caller that asks for the same key at the same time; the others wait for its answer (or
+    its error) instead of sending the search app a second copy. Returns (a copy of the answer, whether this caller joined)."""
+    with _answer_inflight_lock:
+        running = _answer_inflight.get(key)
+        leader = running is None
+        if leader:
+            running = _answer_inflight[key] = Future()
+    if not leader:
+        return copy.deepcopy(running.result(timeout=TIMEOUT + 5)), True
+    try:
+        answer = fetch()
+        running.set_result(answer)
+        return copy.deepcopy(answer), False
+    except BaseException as exc:
+        running.set_exception(exc)
+        raise
+    finally:
+        with _answer_inflight_lock:
+            _answer_inflight.pop(key, None)
+
+
 def _answer_key(query, queries, concepts, domains, resolution, limit):
     """What identifies a website search by its plan. The plan's own queries stand for the question; when the plan adds none
     (an obvious question answered without the model) the question itself is the key, so different questions never collide."""
@@ -2628,23 +2661,33 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         web_started = time.perf_counter()
         try:
             answer_key = _answer_key(query, queries, concepts, domains, resolution, limit)
-            website = answer_store.get(answer_key) if answer_store.enabled else None
-            if website is not None:
-                timings["answer_shared"] = True
-            else:
+
+            def fetch_website():
+                stored = answer_store.get(answer_key) if answer_store.enabled else None
+                if stored is not None:
+                    stored["_answer_shared"] = True
+                    return stored
                 fallback_state = {}
-                website = post_json_with_retry(
+                fresh = post_json_with_retry(
                     f"{WEBSEARCH_URL}/api/search",
                     {"query": query, "queries": queries, "concepts": concepts, "domains": domains,
                      "ontology_version": resolution.get("ontology_version"), "purpose": "search", "limit": CANDIDATE_POOL},
                     WEBSEARCH_KEY,
                     on_failure=lambda attempt, exc: _similar_answer(query, limit, _retrieval_context, attempt, fallback_state),
                 )
-                if website.get("answer_from_similar") is not None:
-                    timings["answer_from_similar"] = website["answer_from_similar"]
-                elif website.get("search_mode") != "keyword_only" and not website.get("partial") and website.get("results") \
-                        and website.get("queries_sent", len(queries)) >= len(queries):   # a shrunk retry is not the plan's answer
-                    answer_store.put(answer_key, website)
+                if fresh.get("answer_from_similar") is None and fresh.get("search_mode") != "keyword_only" \
+                        and not fresh.get("partial") and fresh.get("results") \
+                        and fresh.get("queries_sent", len(queries)) >= len(queries):   # a shrunk retry is not the plan's answer
+                    answer_store.put(answer_key, fresh)
+                return fresh
+
+            website, joined = _one_flight(answer_key, fetch_website)
+            if joined:
+                timings["answer_joined"] = True
+            if website.pop("_answer_shared", False):
+                timings["answer_shared"] = True
+            if website.get("answer_from_similar") is not None:
+                timings["answer_from_similar"] = website["answer_from_similar"]
             # MCP's authorization decision remains authoritative; Websearch only reports/filter-searches results.
             website["resolution"] = resolution
         except Exception as exc:
@@ -2686,6 +2729,8 @@ def search_one(query, limit=None, full_documents=FULL_DOCUMENTS_DEFAULT, max_doc
         results, best_bet_count, spotlight_count = [], 0, 0
     if best_bet_count or spotlight_count:
         quality["agent_instructions"] += PRIORITY_INSTRUCTIONS
+    if website.get("answer_from_similar") is not None and not out_of_scope:
+        quality["agent_instructions"] += SIMILAR_ANSWER_INSTRUCTIONS
     if spotlight_count:
         quality["agent_instructions"] += SPOTLIGHT_INSTRUCTIONS
 

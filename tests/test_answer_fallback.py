@@ -86,3 +86,9 @@ def test_one_try_of_the_search_app_call_is_capped_but_not_the_overall_budget(mon
     except requests.Timeout:
         pass
     assert seen == [20] and server.TRY_TIMEOUT == 20      # capped, and a read timeout is not sent again
+
+
+def test_the_agent_is_told_when_the_answer_was_borrowed(monkeypatch):
+    setup(monkeypatch, e(1.0, 0.0), e(1.0, 0.3))
+    out = server.search_sujeeth_foundation.sync("how to network")
+    assert "closely related earlier question" in out["agent_instructions"]
